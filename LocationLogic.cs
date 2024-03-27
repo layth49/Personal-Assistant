@@ -21,7 +21,6 @@ namespace Personal_Assistant.LocationLogic
                 {
                     System.Threading.Thread.Sleep(100); // Short delay for position acquisition
                 }
-
                 return watcher.Position.Location.Latitude;
             }
             catch (Exception ex)
@@ -102,6 +101,7 @@ namespace Personal_Assistant.LocationLogic
                 {
                     var village = jsonObject.address.village; // Access village property
                     var city = jsonObject.address.city; // Access city property
+                    var town = jsonObject.address.town; // Access town property
                     if (village != null) // Check if village property exists
                     {
                         return village; // Return village name
@@ -110,9 +110,13 @@ namespace Personal_Assistant.LocationLogic
                     {
                         return city;
                     }
+                    else if (town != null)
+                    {
+                        return town;
+                    }
                     else
                     {
-                        Console.WriteLine("Village/City information not found in the response.");
+                        Console.WriteLine("Village/City/Town information not found in the response.");
                     }
                 }
                 else

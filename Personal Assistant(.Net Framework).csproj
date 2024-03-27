@@ -71,8 +71,8 @@
     <Reference Include="Microsoft.Extensions.DependencyInjection, Version=8.0.0.0, Culture=neutral, PublicKeyToken=adb9793829ddae60, processorArchitecture=MSIL">
       <HintPath>packages\Microsoft.Extensions.DependencyInjection.8.0.0\lib\net462\Microsoft.Extensions.DependencyInjection.dll</HintPath>
     </Reference>
-    <Reference Include="Microsoft.Extensions.DependencyInjection.Abstractions, Version=8.0.0.0, Culture=neutral, PublicKeyToken=adb9793829ddae60, processorArchitecture=MSIL">
-      <HintPath>packages\Microsoft.Extensions.DependencyInjection.Abstractions.8.0.0\lib\net462\Microsoft.Extensions.DependencyInjection.Abstractions.dll</HintPath>
+    <Reference Include="Microsoft.Extensions.DependencyInjection.Abstractions, Version=8.0.0.1, Culture=neutral, PublicKeyToken=adb9793829ddae60, processorArchitecture=MSIL">
+      <HintPath>packages\Microsoft.Extensions.DependencyInjection.Abstractions.8.0.1\lib\net462\Microsoft.Extensions.DependencyInjection.Abstractions.dll</HintPath>
     </Reference>
     <Reference Include="Microsoft.Extensions.Http, Version=8.0.0.0, Culture=neutral, PublicKeyToken=adb9793829ddae60, processorArchitecture=MSIL">
       <HintPath>packages\Microsoft.Extensions.Http.8.0.0\lib\net462\Microsoft.Extensions.Http.dll</HintPath>
@@ -80,8 +80,11 @@
     <Reference Include="Microsoft.Extensions.Logging, Version=8.0.0.0, Culture=neutral, PublicKeyToken=adb9793829ddae60, processorArchitecture=MSIL">
       <HintPath>packages\Microsoft.Extensions.Logging.8.0.0\lib\net462\Microsoft.Extensions.Logging.dll</HintPath>
     </Reference>
-    <Reference Include="Microsoft.Extensions.Logging.Abstractions, Version=8.0.0.0, Culture=neutral, PublicKeyToken=adb9793829ddae60, processorArchitecture=MSIL">
-      <HintPath>packages\Microsoft.Extensions.Logging.Abstractions.8.0.0\lib\net462\Microsoft.Extensions.Logging.Abstractions.dll</HintPath>
+    <Reference Include="Microsoft.Extensions.Logging.Abstractions, Version=8.0.0.1, Culture=neutral, PublicKeyToken=adb9793829ddae60, processorArchitecture=MSIL">
+      <HintPath>packages\Microsoft.Extensions.Logging.Abstractions.8.0.1\lib\net462\Microsoft.Extensions.Logging.Abstractions.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.ObjectPool, Version=3.1.5.0, Culture=neutral, PublicKeyToken=adb9793829ddae60, processorArchitecture=MSIL">
+      <HintPath>packages\Microsoft.Extensions.ObjectPool.3.1.5\lib\netstandard2.0\Microsoft.Extensions.ObjectPool.dll</HintPath>
     </Reference>
     <Reference Include="Microsoft.Extensions.Options, Version=8.0.0.2, Culture=neutral, PublicKeyToken=adb9793829ddae60, processorArchitecture=MSIL">
       <HintPath>packages\Microsoft.Extensions.Options.8.0.2\lib\net462\Microsoft.Extensions.Options.dll</HintPath>
@@ -100,14 +103,11 @@
     <Reference Include="Newtonsoft.Json, Version=13.0.0.0, Culture=neutral, PublicKeyToken=30ad4fe6b2a6aeed, processorArchitecture=MSIL">
       <HintPath>packages\Newtonsoft.Json.13.0.3\lib\net45\Newtonsoft.Json.dll</HintPath>
     </Reference>
-    <Reference Include="OpenAI_API, Version=1.10.0.0, Culture=neutral, PublicKeyToken=1b0a4c0430762146, processorArchitecture=MSIL">
-      <HintPath>packages\OpenAI.1.10.0\lib\netstandard2.0\OpenAI_API.dll</HintPath>
+    <Reference Include="OpenAI_API, Version=1.11.0.0, Culture=neutral, PublicKeyToken=1b0a4c0430762146, processorArchitecture=MSIL">
+      <HintPath>packages\OpenAI.1.11.0\lib\netstandard2.0\OpenAI_API.dll</HintPath>
     </Reference>
     <Reference Include="OpenWeatherAPI, Version=1.0.2.0, Culture=neutral, processorArchitecture=MSIL">
       <HintPath>packages\OpenWeatherAPI.1.0.2\lib\net462\OpenWeatherAPI.dll</HintPath>
-    </Reference>
-    <Reference Include="OpenWeatherMap, Version=2.0.50.0, Culture=neutral, processorArchitecture=MSIL">
-      <HintPath>packages\OpenWeatherMap.API.2.0.50\lib\netstandard2.0\OpenWeatherMap.dll</HintPath>
     </Reference>
     <Reference Include="PrayTimes, Version=1.0.3.0, Culture=neutral, processorArchitecture=MSIL">
       <HintPath>packages\PrayTimes.1.0.3\lib\netstandard1.0\PrayTimes.dll</HintPath>
@@ -253,8 +253,8 @@
     <Reference Include="System.Text.Encodings.Web, Version=8.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
       <HintPath>packages\System.Text.Encodings.Web.8.0.0\lib\net462\System.Text.Encodings.Web.dll</HintPath>
     </Reference>
-    <Reference Include="System.Text.Json, Version=8.0.0.2, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
-      <HintPath>packages\System.Text.Json.8.0.2\lib\net462\System.Text.Json.dll</HintPath>
+    <Reference Include="System.Text.Json, Version=8.0.0.3, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
+      <HintPath>packages\System.Text.Json.8.0.3\lib\net462\System.Text.Json.dll</HintPath>
     </Reference>
     <Reference Include="System.Text.RegularExpressions, Version=4.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a, processorArchitecture=MSIL">
       <HintPath>packages\System.Text.RegularExpressions.4.3.1\lib\net463\System.Text.RegularExpressions.dll</HintPath>
@@ -279,7 +279,7 @@
       <Private>True</Private>
     </Reference>
     <Reference Include="UnitsNet, Version=5.0.0.0, Culture=neutral, PublicKeyToken=f8601875a1f041da, processorArchitecture=MSIL">
-      <HintPath>packages\UnitsNet.5.48.0\lib\netstandard2.0\UnitsNet.dll</HintPath>
+      <HintPath>packages\UnitsNet.5.49.0\lib\netstandard2.0\UnitsNet.dll</HintPath>
     </Reference>
     <Reference Include="WindowsInput, Version=1.0.4.0, Culture=neutral, PublicKeyToken=9b287f7dc5073cad, processorArchitecture=MSIL">
       <HintPath>packages\InputSimulator.1.0.4.0\lib\net20\WindowsInput.dll</HintPath>

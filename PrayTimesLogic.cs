@@ -32,8 +32,8 @@ namespace Personal_Assistant.PrayTimesLogic
             };
 
             return calc.GetPrayerTimes(date, TimeZoneOffset - 1);
-            //               ^
-            //    Daylight Saving Time
+            //                                                ^
+            //                                    Daylight Savings Time
         }
 
         public async Task AnnouncePrayerTimes(DateTime date)
@@ -46,8 +46,8 @@ namespace Personal_Assistant.PrayTimesLogic
                 new[] { "Fajr", "Dhuhr", "Asr", "Maghrib", "Isha" };
 
             string[] texts = dayOfWeek == "Friday" ?
-                new[] { "فَجْر", "جمعة", "عسر", "مغرب", "عشاع" } :
-                new[] { "فَجْر", "ظهر", "عسر", "مغرب", "عشاع" };
+                new[] { "فَجْر", "جمعة", "عسر", "مغرب", "عشع" } :
+                new[] { "فَجْر", "ظهر", "عسر", "مغرب", "عشع" };
 
             for (int i = 0; i < prayers.Length; i++)
             {
@@ -57,6 +57,7 @@ namespace Personal_Assistant.PrayTimesLogic
                 Console.WriteLine($"{prayerName} is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
 
                 await SynthesizeTextToSpeech("ar-SY-LaithNeural", prayerText); // Arabic text-to-speech
+
                 // English text-to-speech
                 await SynthesizeTextToSpeech("en-US-AndrewNeural", $"is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
             }
@@ -100,7 +101,7 @@ namespace Personal_Assistant.PrayTimesLogic
             string speechKey = Environment.GetEnvironmentVariable("SPEECH_KEY");
             string speechRegion = Environment.GetEnvironmentVariable("SPEECH_REGION");
 
-            // Creates an instance of a speech config with specified subscription key and service region. Replace this with the same style as other comments
+            // Creates an instance of a speech config with specified subscription key and service region.
             SpeechConfig config = SpeechConfig.FromSubscription(speechKey, speechRegion);
 
             // I liked this voice but you can look for others on https://bit.ly/3ttEGuH
@@ -111,12 +112,7 @@ namespace Personal_Assistant.PrayTimesLogic
             {
                 using (SpeechSynthesisResult result = await synthesizer.SpeakTextAsync(textToSynthesize))
                 {
-                    if (result.Reason == ResultReason.SynthesizingAudioCompleted)
-                    {
-                        // This was for testing but I decided to still keep it as commented anyway in case anyone else wanted it
-                        // Console.WriteLine($"Speech synthesized for text [{textToSynthesize}]");
-                    }
-                    else if (result.Reason == ResultReason.Canceled)
+                    if (result.Reason == ResultReason.Canceled)
                     {
                         SpeechSynthesisCancellationDetails cancellation = SpeechSynthesisCancellationDetails.FromResult(result);
                         Console.WriteLine($"CANCELED: Reason={cancellation.Reason}");

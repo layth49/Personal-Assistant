@@ -3,6 +3,7 @@ using System.Media;
 using System.Threading.Tasks;
 using System.Threading;
 using System.Diagnostics;
+using System.Timers;
 using OpenAI_API;
 using OpenAI_API.Models;
 using Microsoft.CognitiveServices.Speech;
@@ -10,6 +11,7 @@ using Microsoft.CognitiveServices.Speech.Audio;
 using Personal_Assistant.LocationLogic;
 using Personal_Assistant.PrayTimesLogic;
 using Personal_Assistant.WeatherLogic;
+using WindowsInput;
 
 namespace Personal_Assistant
 {
@@ -113,6 +115,7 @@ namespace Personal_Assistant
         // This method interacts with the OpenAI API to generate a response
         static async Task<string> GenerateOpenAIResponse(string inputText)
         {
+            
             OpenAIAPI api = new OpenAIAPI(openAIApiKey);
             // Create a new conversation with OpenAI
             OpenAI_API.Chat.Conversation chat = api.Chat.CreateConversation();
@@ -144,14 +147,20 @@ namespace Personal_Assistant
             SpeechConfig speechConfig = SpeechConfig.FromSubscription(speechKey, speechRegion);
             speechConfig.SpeechRecognitionLanguage = "en-US";
 
-
+            InputSimulator simulator = new InputSimulator();
             while (true)
             {
+
                 // Set up audio configuration using the default microphone input
-                var audioConfig = AudioConfig.FromDefaultMicrophoneInput();
+               AudioConfig audioConfig = AudioConfig.FromDefaultMicrophoneInput();
+
+               int hour = DateTime.Now.Hour;
 
                 // Gets the location of user using the LocationLogic class
                 GetLocation location = new GetLocation();
+
+                // Preloading the weather to get faster response time
+                GetWeather weather = new GetWeather(weatherAPIKey);
 
 
                 // Waits for keyword ("Hey Computer")
@@ -162,8 +171,22 @@ namespace Personal_Assistant
                 PlaySound();
                 Thread.Sleep(500);
 
-                Console.WriteLine("\nAssistant: Hello! What can I do for you?\n");
-                await SynthesizeTextToSpeech("en-US-AndrewNeural", "Hello! What can I do for you?");
+                if (hour < 12)
+                {
+                    Console.WriteLine("\nAssistant: Good Morning! What can I do for you?\n");
+                    await SynthesizeTextToSpeech("en-US-AndrewNeural", "Good Morning! What can I do for you?");
+                }
+                else if (hour >= 12 && hour < 16)
+                {
+                    Console.WriteLine("\nAssistant: Good Evening! What can I do for you?\n");
+                    await SynthesizeTextToSpeech("en-US-AndrewNeural", "Good Evening! What can I do for you?");
+                }
+                else
+                {
+                    Console.WriteLine("\nAssistant: Good Afternoon! What can I do for you?\n");
+                    await SynthesizeTextToSpeech("en-US-AndrewNeural", "Good Afternoon! What can I do for you?");
+                }
+                
 
                 // Create a speech recognizer
                 var speechRecognizer = new SpeechRecognizer(speechConfig, audioConfig);
@@ -175,9 +198,13 @@ namespace Personal_Assistant
                 // Use the recognized text
                 string recognizedText = speechRecognitionResult.Text.ToLower();
 
-
-                // If the recognized text detects exit. Then exit the loop.
-                if (recognizedText.Contains("exit"))
+                if (recognizedText == "who are you?" || recognizedText == "who made you?")
+                {
+                    Console.WriteLine("Assistant: Hi! I'm BOT49, your own personal assistant!");
+                    Console.WriteLine("Assistant: I was made by layth49!");
+                    await SynthesizeTextToSpeech("en-US-AndrewNeural", "hhi! I'm bot 49, your own personal assistant!.. I was made by layth49!");
+                }
+                else if (recognizedText.Contains("exit"))
                 {
                     Console.WriteLine("Exiting the program");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "Exiting the program");
@@ -186,13 +213,14 @@ namespace Personal_Assistant
                 else if (recognizedText.Contains("close"))
                 {
                     Console.WriteLine("Assistant: Ok! Closing current window now.\n");
-                    await SynthesizeTextToSpeech("en-US-AndrewNeural", "Ok! Closing current window now.");
+                    await SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Closing current window now.");
+                    Console.WriteLine(Process.GetCurrentProcess());
                     Process.GetCurrentProcess().Close();
                 }
                 else if (recognizedText == "what time is it?" || recognizedText == "what's the time?")
                 {
                     DateTime time = DateTime.Now.ToLocalTime();
-                    string response = $"It's {time.ToString("t")}\n";
+                    string response = $"It's {time:t}\n";
                     Console.WriteLine("Assistant: " + response);
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", response);
                     Thread.Sleep(500);
@@ -200,28 +228,73 @@ namespace Personal_Assistant
                 else if (recognizedText == "what day is it?")
                 {
                     DateTime today = DateTime.Now.Date;
-                    string response = $"It's {today.ToString("t")}\n";
+                    string response = $"It's {today:D}\n"; 
                     Console.WriteLine("Assistant: " + response);
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", response);
                     Thread.Sleep(500);
                 }
                 else if (recognizedText.StartsWith("search up") || recognizedText.StartsWith("google"))
                 {
-                    string query = recognizedText.Contains("search up") ? recognizedText.Remove("search up".Length) : recognizedText.Remove("google".Length);
-                    Console.WriteLine($"Assistant: Ok! Searching up {query.TrimEnd('.')} now\n");
+                    string query = recognizedText.Contains("search up") ? recognizedText.Remove(0, "search up".Length) : recognizedText.Remove(0, "google".Length);
+                    Console.WriteLine($"Assistant: Ok! Searching up{query.TrimEnd('.')} now\n");
                     SynthesizeTextToSpeech("en-US-AndrewNeural", $"Ok! Searching up {query.TrimEnd('.')} now");
                     Process.Start("https://www.google.com/search?q=" + query.TrimEnd('.'));
                 }
                 else if (recognizedText.Contains("youtube"))
                 {
-                    Console.WriteLine("Assistant: Ok! Opening YouTube now.\n");
-                    SynthesizeTextToSpeech("en-US-AndrewNeural", "Ok! Opening Youtube now.");
-                    Process.Start("https://www.youtube.com");
+                    Console.WriteLine("Assistant: Ok! Would you like a specific video or to just open it?\n");
+                    await SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Would you like a specific video or to just open it?");
+
+                    SpeechRecognizer confirmationSpeechRecognizer = new SpeechRecognizer(speechConfig, audioConfig);
+                    SpeechRecognitionResult confirmationResult = await confirmationSpeechRecognizer.RecognizeOnceAsync();
+                    ConvertSpeechToText(confirmationResult);
+                    string confirmation = confirmationResult.Text.ToLower();
+
+                    if (confirmation == "open")
+                    {
+                        Console.WriteLine("Assistant: Ok! Opening YouTube now.\n");
+                        SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening Youtube now.");
+                        Process.Start("https://www.youtube.com");
+                    }
+                    else if (confirmation.StartsWith("search for") || confirmation.StartsWith("search up"))
+                    {
+                        string action = recognizedText.StartsWith("search for") ? "Searching for" : "Searching up";
+                        Console.WriteLine($"Assistant: {action} {confirmation.Remove(0, 10)} now");
+                        SynthesizeTextToSpeech("en-US-AndrewNeural", $"Searching up {confirmation.TrimEnd('.')} now");
+                        Process.Start($"https://www.youtube.com/results?search_query={confirmation.Replace(" ", "+")}");
+                    }
+                }
+                else if (recognizedText.Contains("visual studio") || recognizedText.Contains("code") || recognizedText.Contains("coding"))
+                {
+                    Console.WriteLine("Assistant: Ok! Opening Visual Studio now.\n");
+                    SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening Visual Studio now.");
+                    Process.Start("devenv");
+                }
+                else if (recognizedText.Contains("playstation"))
+                {
+                    Console.WriteLine("Assistant: Ok! Turning on your PlayStation 5 now.\n");
+                    Process remoteplay = Process.Start(@"C:\Program Files (x86)\Sony\PS Remote Play\RemotePlay.exe");
+                    await SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Turning on your PlayStation 5 now.");
+                    simulator.Mouse.MoveMouseTo(32500, 40000).LeftButtonClick();
+
+
+                    // Create a timer for 40 seconds to automatically close Remote Play
+                    System.Timers.Timer timer = new System.Timers.Timer(40000);
+
+                    timer.Start();
+
+                    // Define event handler for when timer is done
+                    timer.Elapsed += (sender, e) =>
+                    {
+                        // Send a request to close Remote Play
+                        remoteplay.CloseMainWindow();
+                        // Confirm request to close Remote Play
+                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.RETURN);
+                        timer.Stop(); // Stop the timer after closing attempt
+                    };
                 }
                 else if (recognizedText.Contains("weather"))
                 {
-                    GetWeather weather = new GetWeather(weatherAPIKey);
-
                     try
                     {
                         await weather.GetWeatherData();
@@ -263,19 +336,22 @@ namespace Personal_Assistant
                         Thread.Sleep(500);
                     }
                 }
-                else if (recognizedText.Contains("visual studio") || recognizedText.Contains("code") || recognizedText.Contains("coding"))
-                {
-                    Console.WriteLine("Assistant: Ok! Opening Visual Studio now.\n");
-                    SynthesizeTextToSpeech("en-US-AndrewNeural", "Ok! Opening Visual Studio now.");
-                    Process.Start("devenv");
-                }
                 else
                 {
-                    string openaiResponse = await GenerateOpenAIResponse(recognizedText);
-                    Console.WriteLine("Assistant: " + openaiResponse + " Is there anything else you'd like to ask?\n");
+                    
+                    if (result.Reason == ResultReason.NoMatch || result.Reason == ResultReason.Canceled)
+                    {
+                        Console.WriteLine("Assistant: Sorry I didn't get that. Can you say it again?");
+                        SynthesizeTextToSpeech("en-US-AndrewNeural", "Sorry I didn't get that. Can you say it again?");
+                    }
+                    else
+                    {
+                        string openaiResponse = await GenerateOpenAIResponse(recognizedText);
+                        Console.WriteLine("Assistant: " + openaiResponse + " Is there anything else you'd like to ask?\n");
 
-                    // Synthesize the OpenAI response using text-to-speech
-                    await SynthesizeTextToSpeech("en-US-AndrewNeural", openaiResponse + " Is there anything else you'd like to ask?");
+                        // Synthesize the OpenAI response using text-to-speech
+                        await SynthesizeTextToSpeech("en-US-AndrewNeural", openaiResponse + " Is there anything else you'd like to ask?");
+                    }
                 }
             }
         }

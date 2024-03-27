@@ -24,9 +24,9 @@ namespace Personal_Assistant.WeatherLogic
             GetLocation location = new GetLocation();
 
 
-            var latitude = await location.GetLatitude();
-            var longitude = await location.GetLongitude();
-            var city = await location.GetCity();
+            double latitude = await location.GetLatitude();
+            double longitude = await location.GetLongitude();
+            string city = await location.GetCity();
 
 
             try
