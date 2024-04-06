@@ -95,7 +95,6 @@ namespace Personal_Assistant.LocationLogic
                 // Parse the JSON response to extract city information (OpenStreetMap Nominatim format)
                 dynamic jsonObject = JsonConvert.DeserializeObject(jsonResponse);
 
-
                 // Assuming address is an object containing components
                 if (jsonObject.address != null) // Check if address object exists
                 {
@@ -131,6 +130,5 @@ namespace Personal_Assistant.LocationLogic
 
             return ""; // Return empty string if city cannot be parsed
         }
-
     }
 }

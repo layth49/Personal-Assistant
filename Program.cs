@@ -3,14 +3,12 @@ using System.Media;
 using System.Threading.Tasks;
 using System.Threading;
 using System.Diagnostics;
-using System.Timers;
-using OpenAI_API;
-using OpenAI_API.Models;
 using Microsoft.CognitiveServices.Speech;
 using Microsoft.CognitiveServices.Speech.Audio;
 using Personal_Assistant.LocationLogic;
 using Personal_Assistant.PrayTimesLogic;
 using Personal_Assistant.WeatherLogic;
+using Personal_Assistant.GeminiLogic;
 using WindowsInput;
 
 namespace Personal_Assistant
@@ -18,7 +16,7 @@ namespace Personal_Assistant
     class Program
     {
         // Replace these with your own Cognitive Services Speech API subscription key and service region endpoint
-        static string openAIApiKey = Environment.GetEnvironmentVariable("OPENAIAPI_KEY");
+        static string geminiApiKey = Environment.GetEnvironmentVariable("GEMINIAPI_KEY");
         static string speechKey = Environment.GetEnvironmentVariable("SPEECH_KEY");
         static string speechRegion = Environment.GetEnvironmentVariable("SPEECH_REGION");
         static string weatherAPIKey = Environment.GetEnvironmentVariable("WEATHERAPI_KEY");
@@ -26,14 +24,14 @@ namespace Personal_Assistant
         // Inform the user that environment variables are required and how to set them
         static void CheckEnvironmentVariables()
         {
-            if (string.IsNullOrEmpty(openAIApiKey) || string.IsNullOrEmpty(speechKey) || string.IsNullOrEmpty(speechRegion))
+            if (string.IsNullOrEmpty(geminiApiKey) || string.IsNullOrEmpty(speechKey) || string.IsNullOrEmpty(speechRegion))
             {
                 Console.WriteLine("Error: Please set the following environment variables before running the program:");
                 Console.WriteLine("  - OPENAIAPI_KEY: Your OpenAI API key");
                 Console.WriteLine("  - SPEECH_KEY: Your Cognitive Services Speech API subscription key");
                 Console.WriteLine("  - SPEECH_REGION: Your Cognitive Services Speech API service region (e.g., westus)");
                 Console.WriteLine("You can set them using the following commands (replace 'your_key' with your actual keys):");
-                Console.WriteLine("  - setx OPENAIAPI_KEY your_openai_key");
+                Console.WriteLine("  - setx GEMINIAPI_KEY your_openai_key");
                 Console.WriteLine("  - setx SPEECH_KEY your_speech_key");
                 Console.WriteLine("  - setx SPEECH_REGION your_speech_region");
                 Console.WriteLine("  - setx WEATHERAPI_KEY your_weatherapi_key");
@@ -60,6 +58,7 @@ namespace Personal_Assistant
                 case ResultReason.NoMatch:
                     Console.WriteLine("Assistant: Sorry I didn't get that. Can you say it again?");
                     SynthesizeTextToSpeech("en-US-AndrewNeural", "Sorry I didn't get that. Can you say it again?");
+
                     break;
                 case ResultReason.Canceled:
                     CancellationDetails cancellation = CancellationDetails.FromResult(speechRecognitionResult);
@@ -111,34 +110,11 @@ namespace Personal_Assistant
             }
         }
 
-        // This helped a lot https://bit.ly/3vgUqBO
-        // This method interacts with the OpenAI API to generate a response
-        static async Task<string> GenerateOpenAIResponse(string inputText)
-        {
-            
-            OpenAIAPI api = new OpenAIAPI(openAIApiKey);
-            // Create a new conversation with OpenAI
-            OpenAI_API.Chat.Conversation chat = api.Chat.CreateConversation();
-            chat.Model = Model.ChatGPTTurbo;
-            chat.RequestParameters.Temperature = 1;
-
-            chat.AppendSystemMessage("You are a personal assistant who helps the user for various things. " +
-                "This can range from simple requests like \"What is the time?/What day is it?\" to more complex questions.");
-
-            // Add user's response to the conversation
-            chat.AppendUserInput(inputText);
-
-            // Get the response from OpenAI
-            return await chat.GetResponseFromChatbotAsync();
-        }
-
         // Here's the Main method where we put everything together
         async static Task Main(string[] args)
         {
             CheckEnvironmentVariables(); // Ensure required environment variables are set
 
-            // pUbErtYy (ASCII art)
-            //Console.WriteLine("                        ,,                                                     \r\n         `7MMF'   `7MF'*MM      `7MM\"\"\"YMM             mm `YMM'   `MM'         \r\n           MM       M   MM        MM    `7             MM   VMA   ,V           \r\n`7MMpdMAo. MM       M   MM,dMMb.  MM   d    `7Mb,od8 mmMMmm  VMA ,V `7M'   `MF'\r\n  MM   `Wb MM       M   MM    `Mb MMmmMM      MM' \"'   MM     VMMP    VA   ,V  \r\n  MM    M8 MM       M   MM     M8 MM   Y  ,   MM       MM      MM      VA ,V   \r\n  MM   ,AP YM.     ,M   MM.   ,M9 MM     ,M   MM       MM      MM       VVV    \r\n  MMbmmd'   `bmmmmd\"'   P^YbmdP'.JMMmmmmMMM .JMML.     `Mbmo .JMML.     ,V     \r\n  MM                                                                   ,V      \r\n.JMML.                                                              OOb\"       \n\n");
             // 49 (ASCII art)
             Console.WriteLine("                                    \r\n     ,AM  .d*\"*bg.\r\n    AVMM 6MP    Mb\r\n  ,W' MM YMb    MM\r\n,W'   MM  `MbmmdM9\r\nAmmmmmMMmm     .M'\r\n      MM     .d9  \r\n      MM   m\"'    \n\n");
 
@@ -162,7 +138,6 @@ namespace Personal_Assistant
                 // Preloading the weather to get faster response time
                 GetWeather weather = new GetWeather(weatherAPIKey);
 
-
                 // Waits for keyword ("Hey Computer")
                 var keywordModel = KeywordRecognitionModel.FromFile("C:\\Users\\15048\\source\\repos\\Personal Assistant(.Net Framework)\\bin\\Debug\\42b1e1dd-320e-4426-b693-4b7c163d4e46.table");
                 var keywordRecognizer = new KeywordRecognizer(audioConfig);
@@ -171,12 +146,15 @@ namespace Personal_Assistant
                 PlaySound();
                 Thread.Sleep(500);
 
+                // Create a speech recognizer
+                var speechRecognizer = new SpeechRecognizer(speechConfig, audioConfig);
+
                 if (hour < 12)
                 {
                     Console.WriteLine("\nAssistant: Good Morning! What can I do for you?\n");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "Good Morning! What can I do for you?");
-                }
-                else if (hour >= 12 && hour < 16)
+                }//                         6 PM
+                else if (hour >= 12 && hour < 18)
                 {
                     Console.WriteLine("\nAssistant: Good Evening! What can I do for you?\n");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "Good Evening! What can I do for you?");
@@ -187,9 +165,6 @@ namespace Personal_Assistant
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "Good Afternoon! What can I do for you?");
                 }
                 
-
-                // Create a speech recognizer
-                var speechRecognizer = new SpeechRecognizer(speechConfig, audioConfig);
 
                 // Recognize microphone input
                 var speechRecognitionResult = await speechRecognizer.RecognizeOnceAsync();
@@ -215,7 +190,12 @@ namespace Personal_Assistant
                     Console.WriteLine("Assistant: Ok! Closing current window now.\n");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Closing current window now.");
                     Console.WriteLine(Process.GetCurrentProcess());
-                    Process.GetCurrentProcess().Close();
+                    Process.GetCurrentProcess().CloseMainWindow();
+                }
+                else if (recognizedText.Contains("nevermind") || recognizedText.Contains("never mind"))
+                {
+                    Console.WriteLine("Assistant: Ok! Let me know if you need anything else.");
+                    await SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Let me know if you need anything else.");
                 }
                 else if (recognizedText == "what time is it?" || recognizedText == "what's the time?")
                 {
@@ -235,10 +215,10 @@ namespace Personal_Assistant
                 }
                 else if (recognizedText.StartsWith("search up") || recognizedText.StartsWith("google"))
                 {
-                    string query = recognizedText.Contains("search up") ? recognizedText.Remove(0, "search up".Length) : recognizedText.Remove(0, "google".Length);
-                    Console.WriteLine($"Assistant: Ok! Searching up{query.TrimEnd('.')} now\n");
-                    SynthesizeTextToSpeech("en-US-AndrewNeural", $"Ok! Searching up {query.TrimEnd('.')} now");
-                    Process.Start("https://www.google.com/search?q=" + query.TrimEnd('.'));
+                    string query = recognizedText.Contains("search up") ? recognizedText.Remove(0, "search up".Length).TrimEnd('.') : recognizedText.Remove(0, "google".Length).TrimEnd('.');
+                    Console.WriteLine($"Assistant: Ok! Searching up{query} now\n");
+                    SynthesizeTextToSpeech("en-US-AndrewNeural", $"Okay! Searching up {query} now");
+                    Process.Start("https://www.google.com/search?q=" + query);
                 }
                 else if (recognizedText.Contains("youtube"))
                 {
@@ -250,7 +230,7 @@ namespace Personal_Assistant
                     ConvertSpeechToText(confirmationResult);
                     string confirmation = confirmationResult.Text.ToLower();
 
-                    if (confirmation == "open")
+                    if (confirmation == "open." || confirmation == "open it." || confirmation == "just open it.")
                     {
                         Console.WriteLine("Assistant: Ok! Opening YouTube now.\n");
                         SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening Youtube now.");
@@ -258,10 +238,15 @@ namespace Personal_Assistant
                     }
                     else if (confirmation.StartsWith("search for") || confirmation.StartsWith("search up"))
                     {
-                        string action = recognizedText.StartsWith("search for") ? "Searching for" : "Searching up";
-                        Console.WriteLine($"Assistant: {action} {confirmation.Remove(0, 10)} now");
-                        SynthesizeTextToSpeech("en-US-AndrewNeural", $"Searching up {confirmation.TrimEnd('.')} now");
-                        Process.Start($"https://www.youtube.com/results?search_query={confirmation.Replace(" ", "+")}");
+                        string query = confirmation.Contains("search up") ? confirmation.Remove(0, "search up ".Length).TrimEnd('.') : confirmation.Remove(0, "search for ".Length).TrimEnd('.');
+                        Console.WriteLine($"Assistant: Ok! Searching for {query} now");
+                        SynthesizeTextToSpeech("en-US-AndrewNeural", $"Searching for {query} now");
+                        Process.Start($"https://www.youtube.com/results?search_query={query.Replace(" ", "+")}");
+                    }
+                    else if (recognizedText.Contains("nevermind") || recognizedText.Contains("never mind"))
+                    {
+                        Console.WriteLine("Assistant: Ok! Let me know if you need anything else.");
+                        await SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Let me know if you need anything else.");
                     }
                 }
                 else if (recognizedText.Contains("visual studio") || recognizedText.Contains("code") || recognizedText.Contains("coding"))
@@ -270,7 +255,7 @@ namespace Personal_Assistant
                     SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening Visual Studio now.");
                     Process.Start("devenv");
                 }
-                else if (recognizedText.Contains("playstation"))
+                else if (recognizedText.Contains("playstation") || recognizedText.Contains("ps5"))
                 {
                     Console.WriteLine("Assistant: Ok! Turning on your PlayStation 5 now.\n");
                     Process remoteplay = Process.Start(@"C:\Program Files (x86)\Sony\PS Remote Play\RemotePlay.exe");
@@ -278,8 +263,8 @@ namespace Personal_Assistant
                     simulator.Mouse.MoveMouseTo(32500, 40000).LeftButtonClick();
 
 
-                    // Create a timer for 40 seconds to automatically close Remote Play
-                    System.Timers.Timer timer = new System.Timers.Timer(40000);
+                    // Create a timer for 30 seconds to automatically close Remote Play
+                    System.Timers.Timer timer = new System.Timers.Timer(30000);
 
                     timer.Start();
 
@@ -316,7 +301,7 @@ namespace Personal_Assistant
                 else if (recognizedText == "shut down." || recognizedText == "restart.")
                 {
                     Console.WriteLine("Assistant: Are you sure?");
-                    SynthesizeTextToSpeech("en-US-AndrewNeural", "Are you sure?");
+                    await SynthesizeTextToSpeech("en-US-AndrewNeural", "Are you sure?");
 
                     SpeechRecognizer confirmationSpeechRecognizer = new SpeechRecognizer(speechConfig, audioConfig);
                     SpeechRecognitionResult confirmationResult = await confirmationSpeechRecognizer.RecognizeOnceAsync();
@@ -342,20 +327,19 @@ namespace Personal_Assistant
                     if (result.Reason == ResultReason.NoMatch || result.Reason == ResultReason.Canceled)
                     {
                         Console.WriteLine("Assistant: Sorry I didn't get that. Can you say it again?");
-                        SynthesizeTextToSpeech("en-US-AndrewNeural", "Sorry I didn't get that. Can you say it again?");
+                        await SynthesizeTextToSpeech("en-US-AndrewNeural", "Sorry I didn't get that. Can you say it again?");
+                        break;
                     }
                     else
                     {
-                        string openaiResponse = await GenerateOpenAIResponse(recognizedText);
-                        Console.WriteLine("Assistant: " + openaiResponse + " Is there anything else you'd like to ask?\n");
 
-                        // Synthesize the OpenAI response using text-to-speech
-                        await SynthesizeTextToSpeech("en-US-AndrewNeural", openaiResponse + " Is there anything else you'd like to ask?");
+                        string geminiResponse = await GeminiClient.GenerateGeminiResponse(recognizedText, geminiApiKey, "gemini-pro");
+
+                        Console.WriteLine("Assistant: " + geminiResponse);
+                        await SynthesizeTextToSpeech("en-US-AndrewNeural", geminiResponse);
                     }
                 }
             }
         }
     }
 }
-
-

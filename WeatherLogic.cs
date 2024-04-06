@@ -35,7 +35,13 @@ namespace Personal_Assistant.WeatherLogic
                 OpenWeatherApiClient openWeatherAPI = new OpenWeatherApiClient(apiKey);
                 QueryResponse query = await openWeatherAPI.QueryAsync(city);
 
-                // Additional request for sunrise/sunset data
+                foreach (var weather in query.WeatherList)
+                {
+                    Console.WriteLine(weather.Description.ToUpper());
+                    await SynthesizeTextToSpeech("en-US-AndrewNeural", weather.Description.ToUpper());
+                }
+
+                // Additional request for feels_like data (this is really messy but the original library doesn't support feels_like)
                 RestClient client = new RestClient("https://api.openweathermap.org/data/2.5/weather");
                 RestRequest request = new RestRequest($"?lat={latitude}&lon={longitude}&appid={apiKey}&units=imperial");
 
@@ -44,10 +50,7 @@ namespace Personal_Assistant.WeatherLogic
                 if (json.StatusCode == HttpStatusCode.OK)
                 {
                     OpenWeatherMapResponse weatherData = JsonConvert.DeserializeObject<OpenWeatherMapResponse>(json.Content);
-
-                    // Process and announce weather information
-                    Console.WriteLine(weatherData.weather[0].description.ToUpper()); // Use weather.description from OpenWeatherMapResponse
-                    await SynthesizeTextToSpeech("en-US-AndrewNeural", weatherData.weather[0].description.ToUpper());
+                    
                     string response = $"The temperature in {query.Name}, {query.Sys.Country} is currently {(int)query.Main.Temperature.FahrenheitCurrent}°F and feels like {(int)weatherData.main.feels_like}°F. The sun is setting at {query.Sys.Sunset.ToShortTimeString()} and rising tomorrow at {query.Sys.Sunrise.ToShortTimeString()}\n";
                     Console.WriteLine($"Assistant: {response}");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", response);
@@ -102,19 +105,12 @@ namespace Personal_Assistant.WeatherLogic
 
         public class OpenWeatherMapResponse
         {
-            public Main2 main { get; set; }
-            public List<Weather> weather { get; set; }
+            public WeatherMain main { get; set; }
         }
 
-        public class Main2
+        public class WeatherMain
         {
             public double feels_like { get; set; }
         }
-
-        public class Weather
-        {
-            public string description { get; set; }
-        }
-
     }
 }
