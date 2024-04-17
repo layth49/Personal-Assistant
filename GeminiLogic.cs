@@ -36,10 +36,10 @@ namespace Personal_Assistant.GeminiLogic
                 },
                 generationConfig = new
                 {
-                    temperature = 0.05,
-                    top_p = 0.05,
+                    temperature = 0.5,
+                    top_p = 0.5,
                     top_k = 10,
-                    max_output_tokens = 100
+                    max_output_tokens = 800
                 }
             };
 
@@ -70,7 +70,7 @@ namespace Personal_Assistant.GeminiLogic
                     var jsonObject = System.Text.Json.JsonSerializer.Deserialize<JsonObject>(jsonString);
 
 
-                    // Get the first candidate object(assuming there's only one)
+                    // Get the first candidate object
                     var candidateObject = jsonObject["candidates"][0];
 
                     // Get the content object

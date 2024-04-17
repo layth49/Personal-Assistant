@@ -16,10 +16,10 @@ namespace Personal_Assistant
     class Program
     {
         // Replace these with your own Cognitive Services Speech API subscription key and service region endpoint
-        static string geminiApiKey = Environment.GetEnvironmentVariable("GEMINIAPI_KEY");
-        static string speechKey = Environment.GetEnvironmentVariable("SPEECH_KEY");
-        static string speechRegion = Environment.GetEnvironmentVariable("SPEECH_REGION");
-        static string weatherAPIKey = Environment.GetEnvironmentVariable("WEATHERAPI_KEY");
+        static readonly string geminiApiKey = Environment.GetEnvironmentVariable("GEMINIAPI_KEY");
+        static readonly string speechKey = Environment.GetEnvironmentVariable("SPEECH_KEY");
+        static readonly string speechRegion = Environment.GetEnvironmentVariable("SPEECH_REGION");
+        static readonly string weatherAPIKey = Environment.GetEnvironmentVariable("WEATHERAPI_KEY");
 
         // Inform the user that environment variables are required and how to set them
         static void CheckEnvironmentVariables()
@@ -31,7 +31,7 @@ namespace Personal_Assistant
                 Console.WriteLine("  - SPEECH_KEY: Your Cognitive Services Speech API subscription key");
                 Console.WriteLine("  - SPEECH_REGION: Your Cognitive Services Speech API service region (e.g., westus)");
                 Console.WriteLine("You can set them using the following commands (replace 'your_key' with your actual keys):");
-                Console.WriteLine("  - setx GEMINIAPI_KEY your_openai_key");
+                Console.WriteLine("  - setx GEMINIAPI_KEY your_gemini_key");
                 Console.WriteLine("  - setx SPEECH_KEY your_speech_key");
                 Console.WriteLine("  - setx SPEECH_REGION your_speech_region");
                 Console.WriteLine("  - setx WEATHERAPI_KEY your_weatherapi_key");
@@ -42,7 +42,7 @@ namespace Personal_Assistant
         public static void PlaySound() // Plays a chime sound to indicate the assistant is ready
         {
             SoundPlayer player = new SoundPlayer();
-            player.SoundLocation = "C:\\Users\\15048\\source\\repos\\Personal Assistant(.Net Framework)\\bin\\Debug\\chime.wav";
+            player.SoundLocation = @"C:\Users\15048\vstudio\repos\Personal Assistant(.Net Framework)\bin\Debug\chime.wav";
             player.Play();
         }
 
@@ -111,7 +111,7 @@ namespace Personal_Assistant
         }
 
         // Here's the Main method where we put everything together
-        async static Task Main(string[] args)
+        async static Task Main()
         {
             CheckEnvironmentVariables(); // Ensure required environment variables are set
 
@@ -137,9 +137,9 @@ namespace Personal_Assistant
 
                 // Preloading the weather to get faster response time
                 GetWeather weather = new GetWeather(weatherAPIKey);
-
+                
                 // Waits for keyword ("Hey Computer")
-                var keywordModel = KeywordRecognitionModel.FromFile("C:\\Users\\15048\\source\\repos\\Personal Assistant(.Net Framework)\\bin\\Debug\\42b1e1dd-320e-4426-b693-4b7c163d4e46.table");
+                var keywordModel = KeywordRecognitionModel.FromFile(@"C:\Users\15048\vstudio\repos\Projects\Personal Assistant(.Net Framework)\bin\Debug\42b1e1dd-320e-4426-b693-4b7c163d4e46.table");
                 var keywordRecognizer = new KeywordRecognizer(audioConfig);
                 KeywordRecognitionResult result = await keywordRecognizer.RecognizeOnceAsync(keywordModel);
 
@@ -173,11 +173,10 @@ namespace Personal_Assistant
                 // Use the recognized text
                 string recognizedText = speechRecognitionResult.Text.ToLower();
 
-                if (recognizedText == "who are you?" || recognizedText == "who made you?")
+                if (recognizedText == "who are you?")
                 {
                     Console.WriteLine("Assistant: Hi! I'm BOT49, your own personal assistant!");
-                    Console.WriteLine("Assistant: I was made by layth49!");
-                    await SynthesizeTextToSpeech("en-US-AndrewNeural", "hhi! I'm bot 49, your own personal assistant!.. I was made by layth49!");
+                    await SynthesizeTextToSpeech("en-US-AndrewNeural", "hhi! I'm bot 49, your own personal assistant!");
                 }
                 else if (recognizedText.Contains("exit"))
                 {
@@ -264,18 +263,18 @@ namespace Personal_Assistant
 
 
                     // Create a timer for 30 seconds to automatically close Remote Play
-                    System.Timers.Timer timer = new System.Timers.Timer(30000);
+                    System.Timers.Timer autoCloseTimer = new System.Timers.Timer(30000);
 
-                    timer.Start();
+                    autoCloseTimer.Start();
 
                     // Define event handler for when timer is done
-                    timer.Elapsed += (sender, e) =>
+                    autoCloseTimer.Elapsed += (sender, e) =>
                     {
                         // Send a request to close Remote Play
                         remoteplay.CloseMainWindow();
                         // Confirm request to close Remote Play
                         simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.RETURN);
-                        timer.Stop(); // Stop the timer after closing attempt
+                        autoCloseTimer.Stop(); // Stop the timer after closing attempt
                     };
                 }
                 else if (recognizedText.Contains("weather"))
@@ -323,19 +322,17 @@ namespace Personal_Assistant
                 }
                 else
                 {
-                    
-                    if (result.Reason == ResultReason.NoMatch || result.Reason == ResultReason.Canceled)
+                     
+                    if (speechRecognitionResult.Reason == ResultReason.NoMatch)
                     {
-                        Console.WriteLine("Assistant: Sorry I didn't get that. Can you say it again?");
-                        await SynthesizeTextToSpeech("en-US-AndrewNeural", "Sorry I didn't get that. Can you say it again?");
-                        break;
+                        
                     }
                     else
                     {
 
                         string geminiResponse = await GeminiClient.GenerateGeminiResponse(recognizedText, geminiApiKey, "gemini-pro");
 
-                        Console.WriteLine("Assistant: " + geminiResponse);
+                        Console.WriteLine("\nAssistant: " + geminiResponse);
                         await SynthesizeTextToSpeech("en-US-AndrewNeural", geminiResponse);
                     }
                 }

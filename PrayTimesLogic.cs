@@ -1,7 +1,7 @@
 ﻿using System;
 using System.Threading.Tasks;
-using PrayTimes; // Namespace for the PrayTimesCalculator library
-using Microsoft.CognitiveServices.Speech; // Namespace for text-to-speech functionality
+using PrayTimes; // Library for the PrayTimesCalculator library
+using Microsoft.CognitiveServices.Speech; // Library for text-to-speech functionality
 
 namespace Personal_Assistant.PrayTimesLogic
 {
