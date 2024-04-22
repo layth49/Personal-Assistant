@@ -42,8 +42,11 @@ namespace Personal_Assistant
         public static void PlaySound() // Plays a chime sound to indicate the assistant is ready
         {
             SoundPlayer player = new SoundPlayer();
-            player.SoundLocation = @"C:\Users\15048\vstudio\repos\Personal Assistant(.Net Framework)\bin\Debug\chime.wav";
+            player.SoundLocation = @"./chime.wav";
             player.Play();
+
+            
+
         }
 
         // Got this beautiful method from https://bit.ly/3GVo2r1
@@ -139,7 +142,7 @@ namespace Personal_Assistant
                 GetWeather weather = new GetWeather(weatherAPIKey);
                 
                 // Waits for keyword ("Hey Computer")
-                var keywordModel = KeywordRecognitionModel.FromFile(@"C:\Users\15048\vstudio\repos\Projects\Personal Assistant(.Net Framework)\bin\Debug\42b1e1dd-320e-4426-b693-4b7c163d4e46.table");
+                var keywordModel = KeywordRecognitionModel.FromFile(@"./42b1e1dd-320e-4426-b693-4b7c163d4e46.table");
                 var keywordRecognizer = new KeywordRecognizer(audioConfig);
                 KeywordRecognitionResult result = await keywordRecognizer.RecognizeOnceAsync(keywordModel);
 
@@ -214,7 +217,7 @@ namespace Personal_Assistant
                 }
                 else if (recognizedText.StartsWith("search up") || recognizedText.StartsWith("google"))
                 {
-                    string query = recognizedText.Contains("search up") ? recognizedText.Remove(0, "search up".Length).TrimEnd('.') : recognizedText.Remove(0, "google".Length).TrimEnd('.');
+                    string query = recognizedText.Contains("search up") ? recognizedText.Remove(0, "search up".Length).TrimEnd('.', '?') : recognizedText.Remove(0, "google".Length).TrimEnd('.');
                     Console.WriteLine($"Assistant: Ok! Searching up{query} now\n");
                     SynthesizeTextToSpeech("en-US-AndrewNeural", $"Okay! Searching up {query} now");
                     Process.Start("https://www.google.com/search?q=" + query);
@@ -329,10 +332,9 @@ namespace Personal_Assistant
                     }
                     else
                     {
-
                         string geminiResponse = await GeminiClient.GenerateGeminiResponse(recognizedText, geminiApiKey, "gemini-pro");
 
-                        Console.WriteLine("\nAssistant: " + geminiResponse);
+                        Console.WriteLine("Assistant: " + geminiResponse);
                         await SynthesizeTextToSpeech("en-US-AndrewNeural", geminiResponse);
                     }
                 }
