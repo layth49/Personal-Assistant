@@ -44,9 +44,6 @@ namespace Personal_Assistant
             SoundPlayer player = new SoundPlayer();
             player.SoundLocation = @"./chime.wav";
             player.Play();
-
-            
-
         }
 
         // Got this beautiful method from https://bit.ly/3GVo2r1
@@ -129,8 +126,9 @@ namespace Personal_Assistant
             InputSimulator simulator = new InputSimulator();
             while (true)
             {
+                Console.WriteLine(Process.GetCurrentProcess());
 
-                // Set up audio configuration using the default microphone input
+               // Set up audio configuration using the default microphone input
                AudioConfig audioConfig = AudioConfig.FromDefaultMicrophoneInput();
 
                int hour = DateTime.Now.Hour;
@@ -147,7 +145,7 @@ namespace Personal_Assistant
                 KeywordRecognitionResult result = await keywordRecognizer.RecognizeOnceAsync(keywordModel);
 
                 PlaySound();
-                Thread.Sleep(500);
+                simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);
 
                 // Create a speech recognizer
                 var speechRecognizer = new SpeechRecognizer(speechConfig, audioConfig);
@@ -180,11 +178,15 @@ namespace Personal_Assistant
                 {
                     Console.WriteLine("Assistant: Hi! I'm BOT49, your own personal assistant!");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "hhi! I'm bot 49, your own personal assistant!");
+
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);
                 }
                 else if (recognizedText.Contains("exit"))
                 {
                     Console.WriteLine("Exiting the program");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "Exiting the program");
+
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                     Environment.Exit(0);
                 }
                 else if (recognizedText.Contains("close"))
@@ -192,12 +194,17 @@ namespace Personal_Assistant
                     Console.WriteLine("Assistant: Ok! Closing current window now.\n");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Closing current window now.");
                     Console.WriteLine(Process.GetCurrentProcess());
+
                     Process.GetCurrentProcess().CloseMainWindow();
+
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                 }
                 else if (recognizedText.Contains("nevermind") || recognizedText.Contains("never mind"))
                 {
                     Console.WriteLine("Assistant: Ok! Let me know if you need anything else.");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Let me know if you need anything else.");
+
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                 }
                 else if (recognizedText == "what time is it?" || recognizedText == "what's the time?")
                 {
@@ -205,7 +212,8 @@ namespace Personal_Assistant
                     string response = $"It's {time:t}\n";
                     Console.WriteLine("Assistant: " + response);
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", response);
-                    Thread.Sleep(500);
+
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                 }
                 else if (recognizedText == "what day is it?")
                 {
@@ -213,7 +221,8 @@ namespace Personal_Assistant
                     string response = $"It's {today:D}\n"; 
                     Console.WriteLine("Assistant: " + response);
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", response);
-                    Thread.Sleep(500);
+
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                 }
                 else if (recognizedText.StartsWith("search up") || recognizedText.StartsWith("google"))
                 {
@@ -221,6 +230,8 @@ namespace Personal_Assistant
                     Console.WriteLine($"Assistant: Ok! Searching up{query} now\n");
                     SynthesizeTextToSpeech("en-US-AndrewNeural", $"Okay! Searching up {query} now");
                     Process.Start("https://www.google.com/search?q=" + query);
+
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                 }
                 else if (recognizedText.Contains("youtube"))
                 {
@@ -237,6 +248,8 @@ namespace Personal_Assistant
                         Console.WriteLine("Assistant: Ok! Opening YouTube now.\n");
                         SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening Youtube now.");
                         Process.Start("https://www.youtube.com");
+
+                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                     }
                     else if (confirmation.StartsWith("search for") || confirmation.StartsWith("search up"))
                     {
@@ -244,11 +257,15 @@ namespace Personal_Assistant
                         Console.WriteLine($"Assistant: Ok! Searching for {query} now");
                         SynthesizeTextToSpeech("en-US-AndrewNeural", $"Searching for {query} now");
                         Process.Start($"https://www.youtube.com/results?search_query={query.Replace(" ", "+")}");
+
+                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                     }
                     else if (recognizedText.Contains("nevermind") || recognizedText.Contains("never mind"))
                     {
                         Console.WriteLine("Assistant: Ok! Let me know if you need anything else.");
                         await SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Let me know if you need anything else.");
+
+                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                     }
                 }
                 else if (recognizedText.Contains("visual studio") || recognizedText.Contains("code") || recognizedText.Contains("coding"))
@@ -256,6 +273,8 @@ namespace Personal_Assistant
                     Console.WriteLine("Assistant: Ok! Opening Visual Studio now.\n");
                     SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening Visual Studio now.");
                     Process.Start("devenv");
+
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                 }
                 else if (recognizedText.Contains("playstation") || recognizedText.Contains("ps5"))
                 {
@@ -279,6 +298,8 @@ namespace Personal_Assistant
                         simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.RETURN);
                         autoCloseTimer.Stop(); // Stop the timer after closing attempt
                     };
+
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);
                 }
                 else if (recognizedText.Contains("weather"))
                 {
@@ -290,6 +311,8 @@ namespace Personal_Assistant
                     {
                         Console.WriteLine("An error occurred: " + ex.Message);
                     }
+
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                 }
                 else if (recognizedText.Contains("pray times") || recognizedText.Contains("prayer times"))
                 {
@@ -299,6 +322,8 @@ namespace Personal_Assistant
                     GetPrayTimesLogic prayerTimesLogic = new GetPrayTimesLogic(latitude, longitude);
 
                     await prayerTimesLogic.AnnouncePrayerTimes(DateTime.Now);
+
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                 }
                 else if (recognizedText == "shut down." || recognizedText == "restart.")
                 {
@@ -336,6 +361,8 @@ namespace Personal_Assistant
 
                         Console.WriteLine("Assistant: " + geminiResponse);
                         await SynthesizeTextToSpeech("en-US-AndrewNeural", geminiResponse);
+
+                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                     }
                 }
             }
