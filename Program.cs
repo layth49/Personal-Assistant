@@ -145,7 +145,7 @@ namespace Personal_Assistant
                 KeywordRecognitionResult result = await keywordRecognizer.RecognizeOnceAsync(keywordModel);
 
                 PlaySound();
-                simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);
+                simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
 
                 // Create a speech recognizer
                 var speechRecognizer = new SpeechRecognizer(speechConfig, audioConfig);
@@ -179,7 +179,7 @@ namespace Personal_Assistant
                     Console.WriteLine("Assistant: Hi! I'm BOT49, your own personal assistant!");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "hhi! I'm bot 49, your own personal assistant!");
 
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                 }
                 else if (recognizedText.Contains("exit"))
                 {
@@ -299,7 +299,7 @@ namespace Personal_Assistant
                         autoCloseTimer.Stop(); // Stop the timer after closing attempt
                     };
 
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                 }
                 else if (recognizedText.Contains("weather"))
                 {
