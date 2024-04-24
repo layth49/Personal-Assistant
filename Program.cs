@@ -128,17 +128,17 @@ namespace Personal_Assistant
             {
                 Console.WriteLine(Process.GetCurrentProcess());
 
-               // Set up audio configuration using the default microphone input
-               AudioConfig audioConfig = AudioConfig.FromDefaultMicrophoneInput();
+                // Set up audio configuration using the default microphone input
+                AudioConfig audioConfig = AudioConfig.FromDefaultMicrophoneInput();
 
-               int hour = DateTime.Now.Hour;
+                int hour = DateTime.Now.Hour;
 
                 // Gets the location of user using the LocationLogic class
                 GetLocation location = new GetLocation();
 
                 // Preloading the weather to get faster response time
                 GetWeather weather = new GetWeather(weatherAPIKey);
-                
+
                 // Waits for keyword ("Hey Computer")
                 var keywordModel = KeywordRecognitionModel.FromFile(@"./42b1e1dd-320e-4426-b693-4b7c163d4e46.table");
                 var keywordRecognizer = new KeywordRecognizer(audioConfig);
@@ -165,7 +165,7 @@ namespace Personal_Assistant
                     Console.WriteLine("\nAssistant: Good Afternoon! What can I do for you?\n");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "Good Afternoon! What can I do for you?");
                 }
-                
+
 
                 // Recognize microphone input
                 var speechRecognitionResult = await speechRecognizer.RecognizeOnceAsync();
@@ -218,7 +218,7 @@ namespace Personal_Assistant
                 else if (recognizedText == "what day is it?")
                 {
                     DateTime today = DateTime.Now.Date;
-                    string response = $"It's {today:D}\n"; 
+                    string response = $"It's {today:D}\n";
                     Console.WriteLine("Assistant: " + response);
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", response);
 
@@ -350,10 +350,10 @@ namespace Personal_Assistant
                 }
                 else
                 {
-                     
+
                     if (speechRecognitionResult.Reason == ResultReason.NoMatch)
                     {
-                        
+
                     }
                     else
                     {
