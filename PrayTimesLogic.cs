@@ -54,7 +54,7 @@ namespace Personal_Assistant.PrayTimesLogic
                 string prayerName = prayers[i];
                 string prayerText = texts[i];
 
-                Console.WriteLine($"{prayerName} is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
+                Console.WriteLine($"Assistant: {prayerName} is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
 
                 await SynthesizeTextToSpeech("ar-SY-LaithNeural", prayerText); // Arabic text-to-speech
 

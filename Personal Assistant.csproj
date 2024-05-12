@@ -7,7 +7,7 @@
     <ProjectGuid>{1A93B6BC-BD8E-48BF-8B45-F161DEC545AB}</ProjectGuid>
     <OutputType>Exe</OutputType>
     <RootNamespace>Personal_Assistant</RootNamespace>
-    <AssemblyName>Personal Assistant%28.Net Framework%29</AssemblyName>
+    <AssemblyName>Personal Assistant</AssemblyName>
     <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
     <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
@@ -16,7 +16,7 @@
     </NuGetPackageImportStamp>
     <IsWebBootstrapper>false</IsWebBootstrapper>
     <PublishUrl>publish\</PublishUrl>
-    <Install>true</Install>
+    <Install>false</Install>
     <InstallFrom>Disk</InstallFrom>
     <UpdateEnabled>false</UpdateEnabled>
     <UpdateMode>Foreground</UpdateMode>

@@ -42,7 +42,7 @@ namespace Personal_Assistant
         public static void PlaySound() // Plays a chime sound to indicate the assistant is ready
         {
             SoundPlayer player = new SoundPlayer();
-            player.SoundLocation = @"./chime.wav";
+            player.SoundLocation = @"C:\Users\15048\vstudio\repos\Projects\Personal Assistant\bin\Debug\chime.wav";
             player.Play();
         }
 
@@ -126,8 +126,6 @@ namespace Personal_Assistant
             InputSimulator simulator = new InputSimulator();
             while (true)
             {
-                Console.WriteLine(Process.GetCurrentProcess());
-
                 // Set up audio configuration using the default microphone input
                 AudioConfig audioConfig = AudioConfig.FromDefaultMicrophoneInput();
 
@@ -140,12 +138,14 @@ namespace Personal_Assistant
                 GetWeather weather = new GetWeather(weatherAPIKey);
 
                 // Waits for keyword ("Hey Computer")
-                var keywordModel = KeywordRecognitionModel.FromFile(@"./42b1e1dd-320e-4426-b693-4b7c163d4e46.table");
-                var keywordRecognizer = new KeywordRecognizer(audioConfig);
-                KeywordRecognitionResult result = await keywordRecognizer.RecognizeOnceAsync(keywordModel);
+                using (var keywordModel = KeywordRecognitionModel.FromFile(@"C:\Users\15048\vstudio\repos\Projects\Personal Assistant\bin\Debug\42b1e1dd-320e-4426-b693-4b7c163d4e46.table"))
+                {
+                    var keywordRecognizer = new KeywordRecognizer(audioConfig);
+                    KeywordRecognitionResult result = await keywordRecognizer.RecognizeOnceAsync(keywordModel);
+                }
 
                 PlaySound();
-                simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PAUSE);    // Play/Pause
 
                 // Create a speech recognizer
                 var speechRecognizer = new SpeechRecognizer(speechConfig, audioConfig);
@@ -179,14 +179,14 @@ namespace Personal_Assistant
                     Console.WriteLine("Assistant: Hi! I'm BOT49, your own personal assistant!");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "hhi! I'm bot 49, your own personal assistant!");
 
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play
                 }
                 else if (recognizedText.Contains("exit"))
                 {
                     Console.WriteLine("Exiting the program");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "Exiting the program");
 
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play
                     Environment.Exit(0);
                 }
                 else if (recognizedText.Contains("close"))
@@ -197,14 +197,14 @@ namespace Personal_Assistant
 
                     Process.GetCurrentProcess().CloseMainWindow();
 
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play/Pause
                 }
                 else if (recognizedText.Contains("nevermind") || recognizedText.Contains("never mind"))
                 {
                     Console.WriteLine("Assistant: Ok! Let me know if you need anything else.");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Let me know if you need anything else.");
 
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play/Pause
                 }
                 else if (recognizedText == "what time is it?" || recognizedText == "what's the time?")
                 {
@@ -213,7 +213,7 @@ namespace Personal_Assistant
                     Console.WriteLine("Assistant: " + response);
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", response);
 
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play/Pause
                 }
                 else if (recognizedText == "what day is it?")
                 {
@@ -222,7 +222,7 @@ namespace Personal_Assistant
                     Console.WriteLine("Assistant: " + response);
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", response);
 
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play/Pause
                 }
                 else if (recognizedText.StartsWith("search up") || recognizedText.StartsWith("google"))
                 {
@@ -231,7 +231,7 @@ namespace Personal_Assistant
                     SynthesizeTextToSpeech("en-US-AndrewNeural", $"Okay! Searching up {query} now");
                     Process.Start("https://www.google.com/search?q=" + query);
 
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play/Pause
                 }
                 else if (recognizedText.Contains("youtube"))
                 {
@@ -249,7 +249,7 @@ namespace Personal_Assistant
                         SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening Youtube now.");
                         Process.Start("https://www.youtube.com");
 
-                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play/Pause
                     }
                     else if (confirmation.StartsWith("search for") || confirmation.StartsWith("search up"))
                     {
@@ -258,14 +258,14 @@ namespace Personal_Assistant
                         SynthesizeTextToSpeech("en-US-AndrewNeural", $"Searching for {query} now");
                         Process.Start($"https://www.youtube.com/results?search_query={query.Replace(" ", "+")}");
 
-                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play/Pause
                     }
                     else if (recognizedText.Contains("nevermind") || recognizedText.Contains("never mind"))
                     {
                         Console.WriteLine("Assistant: Ok! Let me know if you need anything else.");
                         await SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Let me know if you need anything else.");
 
-                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play/Pause
                     }
                 }
                 else if (recognizedText.Contains("visual studio") || recognizedText.Contains("code") || recognizedText.Contains("coding"))
@@ -274,15 +274,16 @@ namespace Personal_Assistant
                     SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening Visual Studio now.");
                     Process.Start("devenv");
 
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play/Pause
                 }
-                else if (recognizedText.Contains("playstation") || recognizedText.Contains("ps5"))
+                else if (recognizedText.Contains("turn on") && recognizedText.Contains("playstation") || recognizedText.Contains("ps5"))
                 {
                     Console.WriteLine("Assistant: Ok! Turning on your PlayStation 5 now.\n");
                     Process remoteplay = Process.Start(@"C:\Program Files (x86)\Sony\PS Remote Play\RemotePlay.exe");
                     await SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Turning on your PlayStation 5 now.");
                     simulator.Mouse.MoveMouseTo(32500, 40000).LeftButtonClick();
 
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play/Pause
 
                     // Create a timer for 30 seconds to automatically close Remote Play
                     System.Timers.Timer autoCloseTimer = new System.Timers.Timer(30000);
@@ -298,8 +299,6 @@ namespace Personal_Assistant
                         simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.RETURN);
                         autoCloseTimer.Stop(); // Stop the timer after closing attempt
                     };
-
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
                 }
                 else if (recognizedText.Contains("weather"))
                 {
@@ -312,7 +311,7 @@ namespace Personal_Assistant
                         Console.WriteLine("An error occurred: " + ex.Message);
                     }
 
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play/Pause
                 }
                 else if (recognizedText.Contains("pray times") || recognizedText.Contains("prayer times"))
                 {
@@ -323,7 +322,7 @@ namespace Personal_Assistant
 
                     await prayerTimesLogic.AnnouncePrayerTimes(DateTime.Now);
 
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play/Pause
                 }
                 else if (recognizedText == "shut down." || recognizedText == "restart.")
                 {
@@ -362,7 +361,7 @@ namespace Personal_Assistant
                         Console.WriteLine("Assistant: " + geminiResponse);
                         await SynthesizeTextToSpeech("en-US-AndrewNeural", geminiResponse);
 
-                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play/Pause
+                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.PLAY);    // Play/Pause
                     }
                 }
             }
