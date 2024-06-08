@@ -1,19 +1,21 @@
 ﻿using System;
 using System.Threading.Tasks;
 using PrayTimes; // Library for the PrayTimesCalculator library
-using Microsoft.CognitiveServices.Speech; // Library for text-to-speech functionality
+using Personal_Assistant.SpeechManager;
 
-namespace Personal_Assistant.PrayTimesLogic
+namespace Personal_Assistant.PrayerTimesCalculator
 {
-    public class GetPrayTimesLogic
+    public class GetPrayerTimes
     {
+        SpeechService speechManager = new SpeechService(Program.speechKey, Program.speechRegion);
+
         // Class to handle prayer time calculations and announcements
         private readonly double latitude;  // Latitude of the user's location
         private readonly double longitude; // Longitude of the user's location
         private readonly CalculationMethods calculationMethod; // Calculation method for prayer times (e.g., ISNA)
         private readonly AsrJuristicMethods asrJuristicMethod; // Juristic method for Asr prayer calculation (e.g., Shafii)
 
-        public GetPrayTimesLogic(double latitude, double longitude, CalculationMethods calculationMethod = CalculationMethods.ISNA, AsrJuristicMethods asrJuristicMethod = AsrJuristicMethods.Shafii)
+        public GetPrayerTimes(double latitude, double longitude, CalculationMethods calculationMethod = CalculationMethods.ISNA, AsrJuristicMethods asrJuristicMethod = AsrJuristicMethods.Shafii)
         {
             // Constructor to initialize class properties
             this.latitude = latitude;
@@ -56,10 +58,10 @@ namespace Personal_Assistant.PrayTimesLogic
 
                 Console.WriteLine($"Assistant: {prayerName} is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
 
-                await SynthesizeTextToSpeech("ar-SY-LaithNeural", prayerText); // Arabic text-to-speech
+                await speechManager.SynthesizeTextToSpeech("ar-SY-LaithNeural", prayerText); // Arabic text-to-speech
 
                 // English text-to-speech
-                await SynthesizeTextToSpeech("en-US-AndrewNeural", $"is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
+                await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
             }
         }
 
@@ -95,37 +97,5 @@ namespace Personal_Assistant.PrayTimesLogic
         private int TimeZoneOffset => (int)TimeZone.CurrentTimeZone.GetUtcOffset(DateTime.Now.Date).TotalHours;
 
         private string dayOfWeek => DateTime.Now.DayOfWeek.ToString();
-
-        public static async Task SynthesizeTextToSpeech(string voiceName, string textToSynthesize)
-        {
-            string speechKey = Environment.GetEnvironmentVariable("SPEECH_KEY");
-            string speechRegion = Environment.GetEnvironmentVariable("SPEECH_REGION");
-
-            // Creates an instance of a speech config with specified subscription key and service region.
-            SpeechConfig config = SpeechConfig.FromSubscription(speechKey, speechRegion);
-
-            // I liked this voice but you can look for others on https://bit.ly/3ttEGuH
-            config.SpeechSynthesisVoiceName = voiceName;
-
-            // Use the default speaker as audio output
-            using (SpeechSynthesizer synthesizer = new SpeechSynthesizer(config))
-            {
-                using (SpeechSynthesisResult result = await synthesizer.SpeakTextAsync(textToSynthesize))
-                {
-                    if (result.Reason == ResultReason.Canceled)
-                    {
-                        SpeechSynthesisCancellationDetails cancellation = SpeechSynthesisCancellationDetails.FromResult(result);
-                        Console.WriteLine($"CANCELED: Reason={cancellation.Reason}");
-
-                        if (cancellation.Reason == CancellationReason.Error)
-                        {
-                            Console.WriteLine($"CANCELED: ErrorCode={cancellation.ErrorCode}");
-                            Console.WriteLine($"CANCELED: ErrorDetails=[{cancellation.ErrorDetails}]");
-                            Console.WriteLine($"CANCELED: Did you update the subscription info?");
-                        }
-                    }
-                }
-            }
-        }
     }
 }

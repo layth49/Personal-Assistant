@@ -1,10 +1,10 @@
-﻿using Newtonsoft.Json;
-using System;
+﻿using System;
 using System.Device.Location;
 using System.Net.Http;
 using System.Threading.Tasks;
+using Newtonsoft.Json;
 
-namespace Personal_Assistant.LocationLogic
+namespace Personal_Assistant.Geolocator
 {
     public class GetLocation
     {

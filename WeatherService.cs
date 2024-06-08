@@ -2,13 +2,12 @@
 using System.Net;
 using System.Collections.Generic;
 using System.Threading.Tasks;
-using Microsoft.CognitiveServices.Speech; // Library for text-to-speech functionality
 using Newtonsoft.Json;
 using RestSharp;
-using Personal_Assistant.LocationLogic;
+using Personal_Assistant.Geolocator;
+using Personal_Assistant.SpeechManager;
 
-
-namespace Personal_Assistant.WeatherLogic
+namespace Personal_Assistant.WeatherService
 {
     public class GetWeather
     {
@@ -26,6 +25,8 @@ namespace Personal_Assistant.WeatherLogic
             double latitude = await location.GetLatitude();
             double longitude = await location.GetLongitude();
             string city = await location.GetCity();
+            //                                              Getting this from Program.cs
+            SpeechService speechManager = new SpeechService(Program.speechKey, Program.speechRegion);
 
             try
             {
@@ -45,11 +46,11 @@ namespace Personal_Assistant.WeatherLogic
                         DateTime sunsetDateTime = new DateTime(1970, 1, 1, 0, 0, 0, 0, DateTimeKind.Utc).AddMilliseconds((long)weatherData.Sys.Sunset);
 
                         Console.WriteLine(weatherData.Weather[0].Description.ToUpperInvariant());
-                        await SynthesizeTextToSpeech("en-US-AndrewNeural", weatherData.Weather[0].Description);
+                        await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", weatherData.Weather[0].Description);
                         string response = $"The temperature in {city}, {weatherData.Sys.Country} is currently {(int)weatherData.Main.Temp}°F and feels like {(int)weatherData.Main.Feels_Like}°F. The sun is setting at {sunsetDateTime.ToShortTimeString()} and rising tomorrow at {sunriseDateTime.ToShortTimeString()}\n";
                         
                         Console.WriteLine($"Assistant: {response}");
-                        await SynthesizeTextToSpeech("en-US-AndrewNeural", response);
+                        await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", response);
                     }
                     catch (JsonSerializationException ex)
                     {
@@ -64,38 +65,6 @@ namespace Personal_Assistant.WeatherLogic
             catch (Exception ex)
             {
                 Console.WriteLine($"An error occurred: {ex.Message}");
-            }
-        }
-
-        public static async Task SynthesizeTextToSpeech(string voiceName, string textToSynthesize)
-        {
-            string speechKey = Environment.GetEnvironmentVariable("SPEECH_KEY");
-            string speechRegion = Environment.GetEnvironmentVariable("SPEECH_REGION");
-
-            // Creates an instance of a speech config with specified subscription key and service region. Replace this with the same style as other comments
-            SpeechConfig config = SpeechConfig.FromSubscription(speechKey, speechRegion);
-
-            // I liked this voice but you can look for others on https://bit.ly/3ttEGuH
-            config.SpeechSynthesisVoiceName = voiceName;
-
-            // Use the default speaker as audio output
-            using (SpeechSynthesizer synthesizer = new SpeechSynthesizer(config))
-            {
-                using (SpeechSynthesisResult result = await synthesizer.SpeakTextAsync(textToSynthesize))
-                {
-                    if (result.Reason == ResultReason.Canceled)
-                    {
-                        SpeechSynthesisCancellationDetails cancellation = SpeechSynthesisCancellationDetails.FromResult(result);
-                        Console.WriteLine($"CANCELED: Reason={cancellation.Reason}");
-
-                        if (cancellation.Reason == CancellationReason.Error)
-                        {
-                            Console.WriteLine($"CANCELED: ErrorCode={cancellation.ErrorCode}");
-                            Console.WriteLine($"CANCELED: ErrorDetails=[{cancellation.ErrorDetails}]");
-                            Console.WriteLine($"CANCELED: Did you update the subscription info?");
-                        }
-                    }
-                }
             }
         }
 

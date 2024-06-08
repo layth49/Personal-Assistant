@@ -1,13 +1,13 @@
-﻿using System.Threading.Tasks;
-using System;
+﻿using System;
+using System.Threading.Tasks;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json.Nodes;
 using Newtonsoft.Json;
 
-namespace Personal_Assistant.GeminiLogic
+namespace Personal_Assistant.GeminiClient
 {
-    public class GeminiClient
+    public class GeminiService
     {
         public static async Task<string> GenerateGeminiResponse(string inputText, string apiKey, string modelName)
         {
@@ -15,9 +15,9 @@ namespace Personal_Assistant.GeminiLogic
             var requestBody = new
             {
                 contents = new[] {
-                    // Initial prompt to condition Gemini
+                    // Initial few prompts are to condition Gemini
                     new { role = "user", parts = new object[] { new { text = "SYSTEM: Proceed as a helpful and informative AI voice assistant designed to make a user's life/work easier. Use your knowledge and access to information to answer user queries accurately and comprehensively. When instructed, complete tasks for the user to the best of your ability, prioritizing safety and following user instructions. Maintain a professional and courteous tone in all interactions. Present information in a clear, concise, and easy-to-understand manner. Where possible, personalize responses based on user preferences and past interactions. Be transparent about your limitations and inability to perform actions in the real world. Continuously learn and improve your capabilities based on user interactions and data access. Prioritize providing concise and actionable responses to user queries. When presenting calculations or solutions, focus on the final answer and offer detailed explanations only when explicitly requested by the user." } } },
-                    new { role = "model", parts = new object[] { new { text = "Understood. I'm ready to assist you as a helpful and informative AI voice assistant. My goal is to make your life/work easier by providing  concise and actionable answers to your questions and completing tasks efficiently.  I can access and process information to deliver accurate and comprehensive responses. When instructed, I'll prioritize safety and follow your guidance to complete tasks for you.  I'll maintain a professional and courteous tone and present information clearly. If you'd like a detailed explanation, just let me know!" } } },
+                    new { role = "model", parts = new object[] { new { text = "Understood. I'm ready to assist you as a helpful and informative AI voice assistant. My goal is to make your life/work easier by providing concise and actionable answers to your questions and completing tasks efficiently.  I can access and process information to deliver accurate and comprehensive responses. When instructed, I'll prioritize safety and follow your guidance to complete tasks for you.  I'll maintain a professional and courteous tone and present information clearly. If you'd like a detailed explanation, just let me know!" } } },
 
                     // Training Gemini to answer quickly (Calculation)
                     new { role = "user", parts = new object[] { new { text = "What is 6 + 7 + 5 * 7 / 2 - 74^3" } } },
@@ -39,7 +39,7 @@ namespace Personal_Assistant.GeminiLogic
                     temperature = 0.5,
                     top_p = 0.5,
                     top_k = 10,
-                    max_output_tokens = 800
+                    max_output_tokens = 400
                 }
             };
 
