@@ -1,5 +1,4 @@
-﻿using System;
-using System.Threading.Tasks;
+﻿using System.Threading.Tasks;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -32,14 +31,14 @@ namespace Personal_Assistant.GeminiClient
                     new { role = "model", parts = new object[] { new { text = "As a general guide, here are the recommended pressure cooking times for goat meat: Goat shoulder or leg: 45-60 minutes; Goat ribs: 30-45 minutes; Goat stew meat: 20-30 minutes" } } },
       
                     // User Input
-                    new { role = "user", parts = new object[] { new { text = inputText } } }
+                    new { role = "user", parts = new object[] { new { text = "USER: " + inputText } } }
                 },
                 generationConfig = new
                 {
                     temperature = 0.5,
                     top_p = 0.5,
                     top_k = 10,
-                    max_output_tokens = 400
+                    max_output_tokens = 200
                 }
             };
 

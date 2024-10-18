@@ -1,18 +1,47 @@
 ﻿using System;
+using System.IO;
 using System.Threading.Tasks;
 using Microsoft.CognitiveServices.Speech; // Library for text-to-speech functionality
+using Microsoft.CognitiveServices.Speech.Audio;
 
 namespace Personal_Assistant.SpeechManager
 {
     public class SpeechService
     {
-        private string speechKey;
-        private string speechRegion;
+        public static readonly string speechKey = Environment.GetEnvironmentVariable("SPEECH_KEY");
+        public static readonly string speechRegion = Environment.GetEnvironmentVariable("SPEECH_REGION");
 
-        public SpeechService(string speechKey, string speechRegion) 
+        // Set up audio configuration using the default microphone input
+        public AudioConfig audioConfig = AudioConfig.FromDefaultMicrophoneInput();
+
+        // Set up Speech SDK configuration
+        public SpeechConfig speechConfig = SpeechConfig.FromSubscription(speechKey, speechRegion);
+
+
+        public SpeechService()
         {
-            this.speechKey = speechKey;
-            this.speechRegion = speechRegion;
+            speechConfig.SpeechRecognitionLanguage = "en-US";
+        }
+
+        public async Task KeywordRecognizer() 
+        {
+            try
+            {
+                // Waits for keyword ("Hey Computer")
+                using (var keywordModel = KeywordRecognitionModel.FromFile(@"C:\Users\15048\vstudio\repos\Projects\Personal Assistant\42b1e1dd-320e-4426-b693-4b7c163d4e46.table"))
+                {
+                    var keywordRecognizer = new KeywordRecognizer(audioConfig);
+                    KeywordRecognitionResult result = await keywordRecognizer.RecognizeOnceAsync(keywordModel);
+                }
+            }
+            catch (FileNotFoundException ex)
+            {
+                Console.WriteLine("Error: Keyword model file not found. " + ex.Message);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("An unexpected error occurred: " + ex.Message);
+            }
         }
 
         // Got this beautiful method from https://bit.ly/3GVo2r1
@@ -47,7 +76,7 @@ namespace Personal_Assistant.SpeechManager
         // This method handles the text-to-speech synthesis
         public async Task SynthesizeTextToSpeech(string voiceName, string textToSynthesize)
         {
-            // Creates an instance of a speech config with specified subscription key and service region. Replace this with the same style as other comments
+            // Creates an instance of a speech config with specified subscription key and service region.
             SpeechConfig config = SpeechConfig.FromSubscription(speechKey, speechRegion);
 
             // I liked this voice but you can look for others on https://bit.ly/3ttEGuH

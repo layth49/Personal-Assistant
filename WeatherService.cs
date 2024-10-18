@@ -2,10 +2,11 @@
 using System.Net;
 using System.Collections.Generic;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
-using RestSharp;
 using Personal_Assistant.Geolocator;
 using Personal_Assistant.SpeechManager;
+using Newtonsoft.Json;
+using RestSharp;
+
 
 namespace Personal_Assistant.WeatherService
 {
@@ -25,8 +26,8 @@ namespace Personal_Assistant.WeatherService
             double latitude = await location.GetLatitude();
             double longitude = await location.GetLongitude();
             string city = await location.GetCity();
-            //                                              Getting this from Program.cs
-            SpeechService speechManager = new SpeechService(Program.speechKey, Program.speechRegion);
+
+            SpeechService speechManager = new SpeechService();
 
             try
             {

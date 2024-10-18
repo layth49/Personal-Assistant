@@ -1,16 +1,17 @@
 ﻿using System;
 using System.Media;
-using System.Threading.Tasks;
-using System.Threading;
 using System.Diagnostics;
-using WindowsInput;
-using Microsoft.CognitiveServices.Speech;
-using Microsoft.CognitiveServices.Speech.Audio;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Runtime.InteropServices;
 using Personal_Assistant.Geolocator;
-using Personal_Assistant.PrayerTimesCalculator;
-using Personal_Assistant.WeatherService;
 using Personal_Assistant.GeminiClient;
 using Personal_Assistant.SpeechManager;
+using Personal_Assistant.LightAutomator;
+using Personal_Assistant.WeatherService;
+using Personal_Assistant.PrayerTimesCalculator;
+using Microsoft.CognitiveServices.Speech;
+using WindowsInput;
 
 namespace Personal_Assistant
 {
@@ -18,14 +19,19 @@ namespace Personal_Assistant
     {
         // Replace these with your own Cognitive Services Speech API subscription key and service region endpoint
         public static readonly string geminiApiKey = Environment.GetEnvironmentVariable("GEMINIAPI_KEY");
-        public static readonly string speechKey = Environment.GetEnvironmentVariable("SPEECH_KEY");
-        public static readonly string speechRegion = Environment.GetEnvironmentVariable("SPEECH_REGION");
         public static readonly string weatherAPIKey = Environment.GetEnvironmentVariable("WEATHERAPI_KEY");
+
+        // This is used to turn my personal lights and is therefore not required
+        public static string ipAddressPlug = Environment.GetEnvironmentVariable("IP_ADDRESS:PLUG");
+        public static string ipAddressSwitch = Environment.GetEnvironmentVariable("IP_ADDRESS:SWITCH");
+
+        [DllImport("user32.dll")]
+        static extern bool SetForegroundWindow(IntPtr hWnd);
 
         // Inform the user that environment variables are required and how to set them
         static void CheckEnvironmentVariables()
         {
-            if (string.IsNullOrEmpty(geminiApiKey) || string.IsNullOrEmpty(speechKey) || string.IsNullOrEmpty(speechRegion) || string.IsNullOrEmpty(weatherAPIKey))
+            if (string.IsNullOrEmpty(geminiApiKey) || string.IsNullOrEmpty(SpeechService.speechKey) || string.IsNullOrEmpty(SpeechService.speechRegion) || string.IsNullOrEmpty(weatherAPIKey))
             {
                 Console.WriteLine("Error: Please set the following environment variables before running the program:");
                 Console.WriteLine("  - GEMINIAPI_KEY: Your Gemini API key");
@@ -37,75 +43,100 @@ namespace Personal_Assistant
                 Console.WriteLine("  - setx SPEECH_KEY your_speech_key");
                 Console.WriteLine("  - setx SPEECH_REGION your_speech_region");
                 Console.WriteLine("  - setx WEATHERAPI_KEY your_weatherapi_key");
-                Thread.Sleep(5000);
+                Console.ReadLine();
                 Environment.Exit(1);
             }
         }
 
         public static void PlaySound() // Plays a chime sound to indicate the assistant is ready
         {
-            SoundPlayer player = new SoundPlayer();
-            player.SoundLocation = @"C:\Users\15048\vstudio\repos\Projects\Personal Assistant\bin\Debug\chime.wav";
-            player.Play();
+            try
+            {
+                SoundPlayer player = new SoundPlayer();
+                player.SoundLocation = @"C:\Users\15048\vstudio\repos\Projects\Personal Assistant\chime.wav";
+                player.Play();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex.Message);
+            }
         }
-        
+
 
         // Here's the Main method where we put everything together
         async static Task Main()
         {
+
             CheckEnvironmentVariables(); // Ensure required environment variables are set
 
             // 49 (ASCII art)
             Console.WriteLine("                                    \r\n     ,AM  .d*\"*bg.\r\n    AVMM 6MP    Mb\r\n  ,W' MM YMb    MM\r\n,W'   MM  `MbmmdM9\r\nAmmmmmMMmm     .M'\r\n      MM     .d9  \r\n      MM   m\"'    \n\n");
 
-
-            // Set up Speech SDK configuration
-            SpeechConfig speechConfig = SpeechConfig.FromSubscription(speechKey, speechRegion);
-            speechConfig.SpeechRecognitionLanguage = "en-US";
-
             InputSimulator simulator = new InputSimulator();
             while (true)
             {
-                // Set up audio configuration using the default microphone input
-                AudioConfig audioConfig = AudioConfig.FromDefaultMicrophoneInput();
-
                 int hour = DateTime.Now.Hour;
 
-                SpeechService speechManager = new SpeechService(speechKey, speechRegion);
+                SpeechService speechManager = new SpeechService();
 
-                // Gets the location of user using the LocationLogic class
+                // Gets the location of user using the Geolocator class
                 GetLocation location = new GetLocation();
 
                 // Preloading the weather to get faster response time
                 GetWeather weather = new GetWeather(weatherAPIKey);
 
-                // Waits for keyword ("Hey Computer")
-                using (var keywordModel = KeywordRecognitionModel.FromFile(@"C:\Users\15048\vstudio\repos\Projects\Personal Assistant\bin\Debug\42b1e1dd-320e-4426-b693-4b7c163d4e46.table"))
-                {
-                    var keywordRecognizer = new KeywordRecognizer(audioConfig);
-                    KeywordRecognitionResult result = await keywordRecognizer.RecognizeOnceAsync(keywordModel);
-                }
+                LightControl lightControl = new LightControl();
 
-                PlaySound();
-                simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Pause
+                Playstation playstationControl = new Playstation();
+
+                // Waits for keyword ("Hey Computer")
+                await speechManager.KeywordRecognizer();
+
+                //PlaySound();
+
+                simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_STOP);    // Stop all media
 
                 // Create a speech recognizer
-                var speechRecognizer = new SpeechRecognizer(speechConfig, audioConfig);
+                var speechRecognizer = new SpeechRecognizer(speechManager.speechConfig, speechManager.audioConfig);
+
+                Random random = new Random();
 
                 if (hour < 12)
                 {
-                    Console.WriteLine("\nAssistant: Good Morning! What can I do for you?\n");
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Good Morning! What can I do for you?");
-                }//                         6 PM
+                    string[] morningGreetings = new string[] {
+                        "Good morning! What can I do for you?",
+                        "Morning! How can I assist you today?",
+                        "Rise and shine! What's on your agenda?",
+                        "Good morning! How can I help?",
+                        "Morning! What's up?",
+    };
+                    string greeting = morningGreetings[random.Next(morningGreetings.Length)];
+                    Console.WriteLine($"\nAssistant: {greeting}\n");
+                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
+                }
                 else if (hour >= 12 && hour < 18)
                 {
-                    Console.WriteLine("\nAssistant: Good Evening! What can I do for you?\n");
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Good Evening! What can I do for you?");
+                    string[] afternoonGreetings = new string[] {
+                        "Good afternoon! What can I do for you?",
+                        "Afternoon! How can I help?",
+                        "Hi! What's up?",
+                        "Good afternoon! I'm here to assist you."
+    };
+                    string greeting = afternoonGreetings[random.Next(afternoonGreetings.Length)];
+                    Console.WriteLine($"\nAssistant: {greeting}\n");
+                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
                 }
                 else
                 {
-                    Console.WriteLine("\nAssistant: Good Afternoon! What can I do for you?\n");
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Good Afternoon! What can I do for you?");
+                    string[] eveningGreetings = new string[] {
+                        "Good evening! What can I do for you?",
+                        "Evening! How can I help?",
+                        "Hi! What's up?",
+                        "Good evening! I'm here to assist you."
+    };
+                    string greeting = eveningGreetings[random.Next(eveningGreetings.Length)];
+                    Console.WriteLine($"\nAssistant: {greeting}\n");
+                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
                 }
 
 
@@ -116,6 +147,7 @@ namespace Personal_Assistant
                 // Use the recognized text
                 string recognizedText = speechRecognitionResult.Text.ToLower();
 
+                // Explain himself
                 if (recognizedText == "who are you?")
                 {
                     Console.WriteLine("Assistant: Hi! I'm BOT49, your own personal assistant!");
@@ -123,6 +155,7 @@ namespace Personal_Assistant
 
                     simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
                 }
+                // Close the assistant
                 else if (recognizedText.Contains("exit"))
                 {
                     Console.WriteLine("Exiting the program");
@@ -131,24 +164,15 @@ namespace Personal_Assistant
                     simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
                     Environment.Exit(0);
                 }
-                // Needs to be fixed/deleted
-                else if (recognizedText.Contains("close"))
-                {
-                    Console.WriteLine("Assistant: Ok! Closing current window now.\n");
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Closing current window now.");
-                    Console.WriteLine(Process.GetCurrentProcess());
-
-                    Process.GetCurrentProcess().CloseMainWindow();
-
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
-                }
-                else if (recognizedText.Contains("nevermind") || recognizedText.Contains("never mind"))
+                // Nevermind
+                else if (recognizedText.Contains("never mind"))
                 {
                     Console.WriteLine("Assistant: Ok! Let me know if you need anything else.");
                     await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Let me know if you need anything else.");
 
                     simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
                 }
+                // What time is it?
                 else if (recognizedText == "what time is it?" || recognizedText == "what's the time?")
                 {
                     DateTime time = DateTime.Now.ToLocalTime();
@@ -158,6 +182,7 @@ namespace Personal_Assistant
 
                     simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
                 }
+                // What day is it?
                 else if (recognizedText == "what day is it?")
                 {
                     DateTime today = DateTime.Now.Date;
@@ -167,6 +192,7 @@ namespace Personal_Assistant
 
                     simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
                 }
+                // Search up something
                 else if (recognizedText.StartsWith("search up") || recognizedText.StartsWith("google"))
                 {
                     string query = recognizedText.Contains("search up") ? recognizedText.Remove(0, "search up".Length).TrimEnd('.', '?') : recognizedText.Remove(0, "google".Length).TrimEnd('.');
@@ -176,25 +202,18 @@ namespace Personal_Assistant
 
                     simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
                 }
+                // Open YouTube
                 else if (recognizedText.Contains("youtube"))
                 {
                     Console.WriteLine("Assistant: Ok! Would you like a specific video or to just open it?\n");
                     await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Would you like a specific video or to just open it?");
 
-                    SpeechRecognizer confirmationSpeechRecognizer = new SpeechRecognizer(speechConfig, audioConfig);
+                    SpeechRecognizer confirmationSpeechRecognizer = new SpeechRecognizer(speechManager.speechConfig, speechManager.audioConfig);
                     SpeechRecognitionResult confirmationResult = await confirmationSpeechRecognizer.RecognizeOnceAsync();
                     speechManager.ConvertSpeechToText(confirmationResult);
                     string confirmation = confirmationResult.Text.ToLower();
-
-                    if (confirmation == "open." || confirmation == "open it." || confirmation == "just open it.")
-                    {
-                        Console.WriteLine("Assistant: Ok! Opening YouTube now.\n");
-                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening Youtube now.");
-                        Process.Start("https://www.youtube.com");
-
-                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
-                    }
-                    else if (confirmation.StartsWith("search for") || confirmation.StartsWith("search up"))
+                    // Search for a specific video
+                    if (confirmation.StartsWith("search for") || confirmation.StartsWith("search up"))
                     {
                         string query = confirmation.Contains("search up") ? confirmation.Remove(0, "search up ".Length).TrimEnd('.') : confirmation.Remove(0, "search for ".Length).TrimEnd('.');
                         Console.WriteLine($"Assistant: Ok! Searching for {query} now");
@@ -203,6 +222,16 @@ namespace Personal_Assistant
 
                         simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
                     }
+                    // Just open YouTube
+                    else if (confirmation.Contains("open"))
+                    {
+                        Console.WriteLine("Assistant: Ok! Opening YouTube now.\n");
+                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening Youtube now.");
+                        Process.Start("https://www.youtube.com");
+
+                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
+                    }
+                    // Don't open YouTube
                     else if (recognizedText.Contains("nevermind") || recognizedText.Contains("never mind"))
                     {
                         Console.WriteLine("Assistant: Ok! Let me know if you need anything else.");
@@ -211,6 +240,7 @@ namespace Personal_Assistant
                         simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
                     }
                 }
+                // Open IDE
                 else if (recognizedText.Contains("visual studio") || recognizedText.Contains("code") || recognizedText.Contains("coding"))
                 {
                     Console.WriteLine("Assistant: Ok! Opening Visual Studio now.\n");
@@ -219,30 +249,32 @@ namespace Personal_Assistant
 
                     simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
                 }
+                // Turn on PS5
                 else if (recognizedText.Contains("turn on") && recognizedText.Contains("playstation") || recognizedText.Contains("ps5"))
                 {
-                    Console.WriteLine("Assistant: Ok! Turning on your PlayStation 5 now.\n");
-                    Process remoteplay = Process.Start(@"C:\Program Files (x86)\Sony\PS Remote Play\RemotePlay.exe");
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Turning on your PlayStation 5 now.");
-                    simulator.Mouse.MoveMouseTo(32500, 40000).LeftButtonClick();
-
-                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
-
-                    // Create a timer for 30 seconds to automatically close Remote Play
-                    System.Timers.Timer autoCloseTimer = new System.Timers.Timer(30000);
-
-                    autoCloseTimer.Start();
-
-                    // Define event handler for when timer is done
-                    autoCloseTimer.Elapsed += (sender, e) =>
-                    {
-                        // Send a request to close Remote Play
-                        remoteplay.CloseMainWindow();
-                        // Confirm request to close Remote Play
-                        simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.RETURN);
-                        autoCloseTimer.Stop(); // Stop the timer after closing attempt
-                    };
+                    playstationControl.TurnOnPlaystation();
                 }
+                else if (recognizedText.Contains("turn on") && (recognizedText.Contains("led") && recognizedText.Contains("lights")))
+                {
+                    lightControl.TurnOnLights("LED", ipAddressPlug);
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
+                }
+                else if (recognizedText.Contains("turn off") && (recognizedText.Contains("led") && recognizedText.Contains("lights")))
+                {
+                    lightControl.TurnOffLights("LED", ipAddressPlug);
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
+                }
+                else if (recognizedText.Contains("turn on") && recognizedText.Contains("bedroom") && recognizedText.Contains("light"))
+                {
+                    lightControl.TurnOnLights("bedroom", ipAddressSwitch);
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
+                }
+                else if (recognizedText.Contains("turn off") && recognizedText.Contains("bedroom") && recognizedText.Contains("light"))
+                {
+                    lightControl.TurnOffLights("bedroom", ipAddressSwitch);
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
+                }
+
                 else if (recognizedText.Contains("weather"))
                 {
                     try
@@ -272,7 +304,7 @@ namespace Personal_Assistant
                     Console.WriteLine("Assistant: Are you sure?");
                     await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Are you sure?");
 
-                    SpeechRecognizer confirmationSpeechRecognizer = new SpeechRecognizer(speechConfig, audioConfig);
+                    SpeechRecognizer confirmationSpeechRecognizer = new SpeechRecognizer(speechManager.speechConfig, speechManager.audioConfig);
                     SpeechRecognitionResult confirmationResult = await confirmationSpeechRecognizer.RecognizeOnceAsync();
                     speechManager.ConvertSpeechToText(confirmationResult);
                     var confirmation = confirmationResult.Text.ToLower();
@@ -299,10 +331,10 @@ namespace Personal_Assistant
                     }
                     else
                     {
-                        string geminiResponse = await GeminiService.GenerateGeminiResponse(recognizedText, geminiApiKey, "gemini-pro");
+                        string geminiResponse = await GeminiService.GenerateGeminiResponse(recognizedText, geminiApiKey, "gemini-1.5-flash");
 
                         Console.WriteLine("Assistant: " + geminiResponse);
-                        await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", geminiResponse);
+                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", geminiResponse);
 
                         simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_PLAY_PAUSE);    // Play
                     }

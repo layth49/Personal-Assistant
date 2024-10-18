@@ -7,7 +7,7 @@ namespace Personal_Assistant.PrayerTimesCalculator
 {
     public class GetPrayerTimes
     {
-        SpeechService speechManager = new SpeechService(Program.speechKey, Program.speechRegion);
+        SpeechService speechManager = new SpeechService();
 
         // Class to handle prayer time calculations and announcements
         private readonly double latitude;  // Latitude of the user's location
@@ -33,9 +33,7 @@ namespace Personal_Assistant.PrayerTimesCalculator
                 AsrJuristicMethod = asrJuristicMethod
             };
 
-            return calc.GetPrayerTimes(date, TimeZoneOffset - 1);
-            //                                                ^
-            //                                    Daylight Savings Time
+            return calc.GetPrayerTimes(date, TimeZoneOffset - DaylightSavingsOffset);
         }
 
         public async Task AnnouncePrayerTimes(DateTime date)
@@ -95,7 +93,7 @@ namespace Personal_Assistant.PrayerTimesCalculator
         }
 
         private int TimeZoneOffset => (int)TimeZone.CurrentTimeZone.GetUtcOffset(DateTime.Now.Date).TotalHours;
-
+        private int DaylightSavingsOffset => TimeZone.CurrentTimeZone.IsDaylightSavingTime(DateTime.Now.Date) ? 1 : 0;
         private string dayOfWeek => DateTime.Now.DayOfWeek.ToString();
     }
 }
