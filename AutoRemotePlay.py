@@ -1,5 +1,17 @@
 ﻿import time
+import pyautogui
 from pynput.keyboard import Key, Controller
+
+
+while True:
+  try:
+    referenceImage = pyautogui.locateOnScreen("C:\\Users\\15048\\vstudio\\repos\\Projects\\Personal Assistant\\assets\\reference.png", grayscale= True)
+    time.sleep(1)
+    break
+  except:
+    time.sleep(1)
+
+
 
 def navigator(text):
     try:

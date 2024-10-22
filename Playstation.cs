@@ -43,8 +43,6 @@ namespace Personal_Assistant
             Console.WriteLine($"Assistant: Ok! Loading up {userResponse} now\n");
             speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Okay! Loading up {userResponse} now");
 
-            // This timer sucks because there's no way to actually test if Remote Play is done loading/connecting so it's a gamble everytime with this timer.
-            Thread.Sleep(40000);
 
             try
             {
@@ -65,8 +63,6 @@ namespace Personal_Assistant
             Console.WriteLine($"Assistant: {userResponse} is ready. Have fun!\n");
             speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"{userResponse} is ready! Have fun!");
         }
-
-
 
         public void SendData(string data)
         {
