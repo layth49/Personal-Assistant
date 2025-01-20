@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Diagnostics;
 using System.IO;
 using System.Threading.Tasks;
 using Microsoft.CognitiveServices.Speech; // Library for text-to-speech functionality
@@ -23,7 +24,7 @@ namespace Personal_Assistant.SpeechManager
             speechConfig.SpeechRecognitionLanguage = "en-US";
         }
 
-        public async Task KeywordRecognizer() 
+        public async Task KeywordRecognizer()
         {
             try
             {
@@ -52,11 +53,12 @@ namespace Personal_Assistant.SpeechManager
             {
                 case ResultReason.RecognizedSpeech:
                     Console.WriteLine($"RECOGNIZED: {speechRecognitionResult.Text}");
+                    _cmd.Close();
                     break;
                 case ResultReason.NoMatch:
                     Console.WriteLine("Assistant: Sorry I didn't get that. Can you say it again?");
                     SynthesizeTextToSpeech("en-US-AndrewNeural", "Sorry I didn't get that. Can you say it again?");
-
+                    _cmd.Close();
                     break;
                 case ResultReason.Canceled:
                     CancellationDetails cancellation = CancellationDetails.FromResult(speechRecognitionResult);
@@ -68,6 +70,7 @@ namespace Personal_Assistant.SpeechManager
                         Console.WriteLine($"CANCELED: ErrorDetails={cancellation.ErrorDetails}");
                         Console.WriteLine($"CANCELED: Did you set the speech resource key and region values?");
                     }
+                    _cmd.Close();
                     break;
             }
         }
@@ -102,5 +105,34 @@ namespace Personal_Assistant.SpeechManager
                 }
             }
         }
+
+        private Process _cmd;
+
+        public async Task AudioVisualizer()
+        {
+            _cmd = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    FileName = @"C:\Users\15048\AppData\Local\Programs\Python\Python312\python.exe",
+                    Arguments = "\"C:\\Users\\15048\\vstudio\\repos\\Projects\\Personal Assistant\\AudioVisualizer.py\""
+                }
+            };
+            _cmd.Start();
+        }
+
+        public void EndVisualizer()
+        {
+            if (_cmd != null && !_cmd.HasExited)
+            {
+                _cmd.Close();
+                Console.WriteLine("Python script terminated.");
+            }
+        }
+
     }
 }

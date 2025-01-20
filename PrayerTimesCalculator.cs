@@ -56,6 +56,7 @@ namespace Personal_Assistant.PrayerTimesCalculator
 
                 Console.WriteLine($"Assistant: {prayerName} is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
 
+                //                                          Hey! That's my name 😃
                 await speechManager.SynthesizeTextToSpeech("ar-SY-LaithNeural", prayerText); // Arabic text-to-speech
 
                 // English text-to-speech

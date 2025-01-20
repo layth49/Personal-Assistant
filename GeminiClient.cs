@@ -19,7 +19,7 @@ namespace Personal_Assistant.GeminiClient
                     new { role = "model", parts = new object[] { new { text = "Understood. I'm ready to assist you as a helpful and informative AI voice assistant. My goal is to make your life/work easier by providing concise and actionable answers to your questions and completing tasks efficiently.  I can access and process information to deliver accurate and comprehensive responses. When instructed, I'll prioritize safety and follow your guidance to complete tasks for you.  I'll maintain a professional and courteous tone and present information clearly. If you'd like a detailed explanation, just let me know!" } } },
 
                     // Training Gemini to answer quickly (Calculation)
-                    new { role = "user", parts = new object[] { new { text = "What is 6 + 7 + 5 * 7 / 2 - 74^3" } } },
+                    new { role = "user", parts = new object[] { new { text = "USER: What is 6 + 7 + 5 * 7 / 2 - 74^3" } } },
                     new { role = "model", parts = new object[] { new { text = "6 + 7 + 5 * 7 / 2 - 74^3 = -402,643,351" } } },
       
                     // Training Gemini to answer quickly (Geography)
@@ -55,7 +55,6 @@ namespace Personal_Assistant.GeminiClient
                 string parseRequest = JsonConvert.SerializeObject(requestBody);
                 sendRequest.Content = new StringContent(parseRequest, Encoding.UTF8, "application/json");
 
-
                 // Send the API request asynchronously
                 HttpResponseMessage response = await client.SendAsync(sendRequest);
 
@@ -67,7 +66,6 @@ namespace Personal_Assistant.GeminiClient
 
                     // Parse the JSON string
                     var jsonObject = System.Text.Json.JsonSerializer.Deserialize<JsonObject>(jsonString);
-
 
                     // Get the first candidate object
                     var candidateObject = jsonObject["candidates"][0];

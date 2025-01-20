@@ -1,15 +1,14 @@
 ﻿using System;
 using System.Diagnostics;
-using System.Threading;
 using System.Runtime.InteropServices;
 using Microsoft.CognitiveServices.Speech;
 using Personal_Assistant.SpeechManager;
 using Python.Runtime;
 using WindowsInput;
 
-namespace Personal_Assistant
+namespace Personal_Assistant.PlaystationController
 {
-    public class Playstation
+    public class PlaystationControl
     {
         [DllImport("user32.dll")]
         static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -33,7 +32,7 @@ namespace Personal_Assistant
             simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.RETURN);
             SetForegroundWindow(handle);
 
-            SpeechRecognizer playstationConfirmationRecognizer = new SpeechRecognizer(speechManager.speechConfig, speechManager.audioConfig);
+            SpeechRecognizer playstationConfirmationRecognizer = new SpeechRecognizer(speechManager.speechConfig);
             SpeechRecognitionResult parsedResponse = await playstationConfirmationRecognizer.RecognizeOnceAsync();
             speechManager.ConvertSpeechToText(parsedResponse);
             string userResponse = parsedResponse.Text.TrimEnd('.');
@@ -54,7 +53,7 @@ namespace Personal_Assistant
             {
                 Console.WriteLine($"Error: {ex.Message}");
             }
-            
+
             // Send a request to close Remote Play
             remoteplay.CloseMainWindow();
             // Confirm request to close Remote Play
@@ -73,7 +72,6 @@ namespace Personal_Assistant
                 var pythonScript = Py.Import("AutoRemotePlay");
                 var message = new PyString(data);
                 var result = pythonScript.InvokeMethod("navigator", new PyObject[] { message });
-                
             }
         }
     }

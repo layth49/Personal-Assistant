@@ -2,18 +2,14 @@
 import pyautogui
 from pynput.keyboard import Key, Controller
 
-
-while True:
-  try:
-    referenceImage = pyautogui.locateOnScreen("C:\\Users\\15048\\vstudio\\repos\\Projects\\Personal Assistant\\assets\\reference.png", grayscale= True)
-    time.sleep(1)
-    break
-  except:
-    time.sleep(1)
-
-
-
 def navigator(text):
+    while True:
+        try:
+            referenceImage = pyautogui.locateOnScreen("C:\\Users\\15048\\vstudio\\repos\\Projects\\Personal Assistant\\assets\\reference.png", grayscale= True, confidence= 0.9)
+            time.sleep(1)
+            break
+        except:
+            time.sleep(1)
     try:
         keyboard = Controller()
         
@@ -24,6 +20,10 @@ def navigator(text):
             keyboard.release(Key.right)
         
         time.sleep(0.5)
+        # Gotta make sure the right arrow key is released
+        keyboard.release(Key.right)
+        time.sleep(1)
+
         # Enter the library
         keyboard.press(Key.down)
         time.sleep(0.1)
@@ -86,4 +86,4 @@ def send_keystrokes(keyboard, text):
        time.sleep(0.1)
        keyboard.release(char)
   except:
-    print("Error sending keystrokes")
+    print("Error sending keystrokes"

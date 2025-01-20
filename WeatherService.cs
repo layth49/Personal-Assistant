@@ -27,6 +27,10 @@ namespace Personal_Assistant.WeatherService
             double longitude = await location.GetLongitude();
             string city = await location.GetCity();
 
+            int year = DateTime.Now.Year;
+            int month = DateTime.Now.Month;
+            int day = DateTime.Now.Day;
+
             SpeechService speechManager = new SpeechService();
 
             try
@@ -35,23 +39,23 @@ namespace Personal_Assistant.WeatherService
                 RestClient client = new RestClient("https://api.openweathermap.org/data/2.5/weather");
                 RestRequest request = new RestRequest($"?lat={latitude}&lon={longitude}&appid={apiKey}&units=imperial");
 
-                RestResponse json = client.Execute(request);
+                RestResponse response = client.Execute(request);
 
-                if (json.StatusCode == HttpStatusCode.OK)
+                if (response.StatusCode == HttpStatusCode.OK)
                 {
                     try
-                    {                        
-                        OpenWeatherMapResponse weatherData = JsonConvert.DeserializeObject<OpenWeatherMapResponse>(json.Content);
+                    {
+                        OpenWeatherMapResponse weatherData = JsonConvert.DeserializeObject<OpenWeatherMapResponse>(response.Content);
 
-                        DateTime sunriseDateTime = new DateTime(1970, 1, 1, 12, 0, 0, 0, DateTimeKind.Utc).AddMilliseconds((long)weatherData.Sys.Sunrise);
-                        DateTime sunsetDateTime = new DateTime(1970, 1, 1, 0, 0, 0, 0, DateTimeKind.Utc).AddMilliseconds((long)weatherData.Sys.Sunset);
+                        DateTime sunriseDateTime = DateTimeOffset.FromUnixTimeSeconds((long)weatherData.Sys.Sunrise).ToLocalTime().DateTime;
+                        DateTime sunsetDateTime = DateTimeOffset.FromUnixTimeSeconds((long)weatherData.Sys.Sunset).ToLocalTime().DateTime;
 
                         Console.WriteLine(weatherData.Weather[0].Description.ToUpperInvariant());
                         await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", weatherData.Weather[0].Description);
-                        string response = $"The temperature in {city}, {weatherData.Sys.Country} is currently {(int)weatherData.Main.Temp}°F and feels like {(int)weatherData.Main.Feels_Like}°F. The sun is setting at {sunsetDateTime.ToShortTimeString()} and rising tomorrow at {sunriseDateTime.ToShortTimeString()}\n";
-                        
-                        Console.WriteLine($"Assistant: {response}");
-                        await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", response);
+                        string weatherResponse = $"The temperature in {city}, {weatherData.Sys.Country} is currently {(int)weatherData.Main.Temp}°F and feels like {(int)weatherData.Main.Feels_Like}°F. The sun is setting at {sunsetDateTime.ToShortTimeString()} and rising tomorrow at {sunriseDateTime.ToShortTimeString()}\n";
+
+                        Console.WriteLine($"Assistant: {weatherResponse}");
+                        await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", weatherResponse);
                     }
                     catch (JsonSerializationException ex)
                     {
@@ -60,7 +64,7 @@ namespace Personal_Assistant.WeatherService
                 }
                 else
                 {
-                    Console.WriteLine($"Error: {json.StatusCode}");
+                    Console.WriteLine($"Error: {response.StatusCode}");
                 }
             }
             catch (Exception ex)
