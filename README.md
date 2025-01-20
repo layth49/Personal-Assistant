@@ -1,7 +1,8 @@
+<div align="center">
+  <img src="assets/logo.png" alt="Logo">
+</div>
 
-![Logo](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/th5xamgrr6se0x5ro4g6.png)
-
-
+[Logo]: https://github.com/user-attachments/assets/ba74c14e-fbaa-4aef-9642-e0f6e9ae4ce3
 # L.A.I.T.H.49
 
 ### Logical Assistant for Intelligent Task Handling
