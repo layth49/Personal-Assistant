@@ -8,7 +8,7 @@ namespace Personal_Assistant.Arduino
     {
         public void ArduinoCommunication(string input)
         {
-            string ipAddress = "192.168.1.143";
+            string ipAddress = Environment.GetEnvironmentVariable("IP_ADDRESS:ARDUINO");
             Console.WriteLine($"Arduino IP Address: {ipAddress}");
             int port = 80;
 

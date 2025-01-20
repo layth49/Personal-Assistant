@@ -29,7 +29,7 @@ namespace Personal_Assistant.SpeechManager
             try
             {
                 // Waits for keyword ("Hey Computer")
-                using (var keywordModel = KeywordRecognitionModel.FromFile(@"C:\Users\15048\vstudio\repos\Projects\Personal Assistant\42b1e1dd-320e-4426-b693-4b7c163d4e46.table"))
+                using (var keywordModel = KeywordRecognitionModel.FromFile(@"C:\Users\15048\vstudio\repos\Projects\Personal Assistant\keyword.table"))
                 {
                     var keywordRecognizer = new KeywordRecognizer(audioConfig);
                     KeywordRecognitionResult result = await keywordRecognizer.RecognizeOnceAsync(keywordModel);
