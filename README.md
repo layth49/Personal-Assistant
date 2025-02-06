@@ -30,7 +30,9 @@ My Personal Voice Assistant!
 
 ## Roadmap
 
-- Ability to interrupt L.A.I.T.H
+- [ ] Ability to interrupt L.A.I.T.H
+- [ ] Improve the Audio Visualizer
+- [ ] Send Text Messages  
 
 - Improve the Audio Visualizer
 ## Acknowledgements
