@@ -33,7 +33,6 @@ My Personal Voice Assistant!
 - [ ] Ability to interrupt L.A.I.T.H
 - [ ] Improve the Audio Visualizer
 - [ ] Send Text Messages  
-- [ ] Improve the Audio Visualizer
   
 ## Acknowledgements
 
