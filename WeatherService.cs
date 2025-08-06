@@ -23,9 +23,9 @@ namespace Personal_Assistant.WeatherService
         {
             GetLocation location = new GetLocation();
 
-            double latitude = await location.GetLatitude();
-            double longitude = await location.GetLongitude();
-            string city = await location.GetCity();
+            double latitude = location.GetLatitude().GetAwaiter().GetResult();
+            double longitude = location.GetLongitude().GetAwaiter().GetResult();
+            string city = location.GetCity().GetAwaiter().GetResult();
 
             int year = DateTime.Now.Year;
             int month = DateTime.Now.Month;
@@ -50,12 +50,10 @@ namespace Personal_Assistant.WeatherService
                         DateTime sunriseDateTime = DateTimeOffset.FromUnixTimeSeconds((long)weatherData.Sys.Sunrise).ToLocalTime().DateTime;
                         DateTime sunsetDateTime = DateTimeOffset.FromUnixTimeSeconds((long)weatherData.Sys.Sunset).ToLocalTime().DateTime;
 
-                        Console.WriteLine(weatherData.Weather[0].Description.ToUpperInvariant());
-                        await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", weatherData.Weather[0].Description);
-                        string weatherResponse = $"The temperature in {city}, {weatherData.Sys.Country} is currently {(int)weatherData.Main.Temp}°F and feels like {(int)weatherData.Main.Feels_Like}°F. The sun is setting at {sunsetDateTime.ToShortTimeString()} and rising tomorrow at {sunriseDateTime.ToShortTimeString()}\n";
+                        string weatherResponse = $"{weatherData.Weather[0].Main}. The temperature in {city}, {weatherData.Sys.Country} is currently {(int)weatherData.Main.Temp}°F and feels like {(int)weatherData.Main.Feels_Like}°F. The sun is setting at {sunsetDateTime.ToShortTimeString()} and rising tomorrow at {sunriseDateTime.ToShortTimeString()}";
 
-                        Console.WriteLine($"Assistant: {weatherResponse}");
-                        await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", weatherResponse);
+                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", weatherResponse);
+                        speechManager.SpeechBubble(Program.recognizedText, weatherResponse);
                     }
                     catch (JsonSerializationException ex)
                     {

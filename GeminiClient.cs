@@ -3,12 +3,15 @@ using System.Net.Http;
 using System.Text;
 using System.Text.Json.Nodes;
 using Newtonsoft.Json;
+using System;
 
 namespace Personal_Assistant.GeminiClient
 {
     public class GeminiService
     {
-        public static async Task<string> GenerateGeminiResponse(string inputText, string apiKey, string modelName)
+        public static readonly string geminiApiKey = Environment.GetEnvironmentVariable("GEMINIAPI_KEY");
+
+        public static async Task<string> GenerateGeminiResponse(string inputText)
         {
             // Create the request body
             var requestBody = new
@@ -46,7 +49,7 @@ namespace Personal_Assistant.GeminiClient
             using (var client = new HttpClient())
             {
                 // Set the API endpoint URL
-                string url = $"https://generativelanguage.googleapis.com/v1beta/models/{modelName}:generateContent?key={apiKey}";
+                string url = $"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?&key={geminiApiKey}";
 
                 // Create the request message
                 var sendRequest = new HttpRequestMessage(HttpMethod.Post, url);

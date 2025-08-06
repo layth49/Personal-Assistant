@@ -1,9 +1,10 @@
-﻿using System;
-using System.Diagnostics;
+﻿using Microsoft.CognitiveServices.Speech; // Library for text-to-speech functionality
+using Microsoft.CognitiveServices.Speech.Audio;
+using Python.Runtime;
+using System;
 using System.IO;
 using System.Threading.Tasks;
-using Microsoft.CognitiveServices.Speech; // Library for text-to-speech functionality
-using Microsoft.CognitiveServices.Speech.Audio;
+
 
 namespace Personal_Assistant.SpeechManager
 {
@@ -12,12 +13,16 @@ namespace Personal_Assistant.SpeechManager
         public static readonly string speechKey = Environment.GetEnvironmentVariable("SPEECH_KEY");
         public static readonly string speechRegion = Environment.GetEnvironmentVariable("SPEECH_REGION");
 
+
         // Set up audio configuration using the default microphone input
         public AudioConfig audioConfig = AudioConfig.FromDefaultMicrophoneInput();
 
         // Set up Speech SDK configuration
         public SpeechConfig speechConfig = SpeechConfig.FromSubscription(speechKey, speechRegion);
 
+        dynamic text_display = Py.Import("SpeechBubble");
+
+        private PyDict state;
 
         public SpeechService()
         {
@@ -28,8 +33,8 @@ namespace Personal_Assistant.SpeechManager
         {
             try
             {
-                // Waits for keyword ("Hey Computer")
-                using (var keywordModel = KeywordRecognitionModel.FromFile(@"C:\Users\15048\vstudio\repos\Projects\Personal Assistant\keyword.table"))
+                // Waits for keyword ("Hey 49")
+                using (var keywordModel = KeywordRecognitionModel.FromFile(@"..\..\keyword.table"))
                 {
                     var keywordRecognizer = new KeywordRecognizer(audioConfig);
                     KeywordRecognitionResult result = await keywordRecognizer.RecognizeOnceAsync(keywordModel);
@@ -41,7 +46,7 @@ namespace Personal_Assistant.SpeechManager
             }
             catch (Exception ex)
             {
-                Console.WriteLine("An unexpected error occurred: " + ex.Message);
+                Console.WriteLine("An unexpected error occurred in the KeywordRecognizer Method: " + ex.Message);
             }
         }
 
@@ -53,12 +58,10 @@ namespace Personal_Assistant.SpeechManager
             {
                 case ResultReason.RecognizedSpeech:
                     Console.WriteLine($"RECOGNIZED: {speechRecognitionResult.Text}");
-                    _cmd.Close();
                     break;
                 case ResultReason.NoMatch:
-                    Console.WriteLine("Assistant: Sorry I didn't get that. Can you say it again?");
+                    SpeechBubble("","Sorry I didn't get that. Can you say it again?");
                     SynthesizeTextToSpeech("en-US-AndrewNeural", "Sorry I didn't get that. Can you say it again?");
-                    _cmd.Close();
                     break;
                 case ResultReason.Canceled:
                     CancellationDetails cancellation = CancellationDetails.FromResult(speechRecognitionResult);
@@ -70,7 +73,6 @@ namespace Personal_Assistant.SpeechManager
                         Console.WriteLine($"CANCELED: ErrorDetails={cancellation.ErrorDetails}");
                         Console.WriteLine($"CANCELED: Did you set the speech resource key and region values?");
                     }
-                    _cmd.Close();
                     break;
             }
         }
@@ -90,6 +92,13 @@ namespace Personal_Assistant.SpeechManager
             {
                 using (SpeechSynthesisResult result = await synthesizer.SpeakTextAsync(textToSynthesize))
                 {
+                    // This is to close the speech bubble after the text is spoken
+                    using (Py.GIL())
+                    {
+                        var pyFalse = PythonEngine.Eval("False");
+                        state.SetItem("running", pyFalse);
+                    }
+
                     if (result.Reason == ResultReason.Canceled)
                     {
                         SpeechSynthesisCancellationDetails cancellation = SpeechSynthesisCancellationDetails.FromResult(result);
@@ -106,31 +115,29 @@ namespace Personal_Assistant.SpeechManager
             }
         }
 
-        private Process _cmd;
 
-        public async Task AudioVisualizer()
+        public void SpeechBubble(string userInput, string response)
         {
-            _cmd = new Process
+            using (Py.GIL())
             {
-                StartInfo = new ProcessStartInfo
+                state = new PyDict();
+                state.SetItem("running", PythonEngine.Eval("True"));
+                IntPtr gil = PythonEngine.BeginAllowThreads();
+                try
                 {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    FileName = @"C:\Users\15048\AppData\Local\Programs\Python\Python312\python.exe",
-                    Arguments = "\"C:\\Users\\15048\\vstudio\\repos\\Projects\\Personal Assistant\\AudioVisualizer.py\""
+                    text_display.show_bubble(userInput, response, state);
                 }
-            };
-            _cmd.Start();
-        }
-
-        public void EndVisualizer()
-        {
-            if (_cmd != null && !_cmd.HasExited)
-            {
-                _cmd.Close();
-                Console.WriteLine("Python script terminated.");
+                catch (PythonException ex)
+                {
+                    Console.WriteLine("PythonException caught:");
+                    Console.WriteLine("Type: " + ex.Type);
+                    Console.WriteLine("Message: " + ex.Message);
+                    Console.WriteLine("StackTrace: " + ex.StackTrace);
+                }
+                finally
+                {
+                    PythonEngine.EndAllowThreads(gil);
+                }
             }
         }
 

@@ -46,21 +46,18 @@ namespace Personal_Assistant.PrayerTimesCalculator
                 new[] { "Fajr", "Dhuhr", "Asr", "Maghrib", "Isha" };
 
             string[] texts = dayOfWeek == "Friday" ?
-                new[] { "فَجْر", "جمعة", "عسر", "مغرب", "عشع" } :
-                new[] { "فَجْر", "ظهر", "عسر", "مغرب", "عشع" };
+                new[] { "فَجْر", "جمعة", "عصر", "مغرب", "عشاء" } :
+                new[] { "فَجْر", "ظهر", "عصر", "مغرب", "عشاء" };
 
             for (int i = 0; i < prayers.Length; i++)
             {
                 string prayerName = prayers[i];
                 string prayerText = texts[i];
 
-                Console.WriteLine($"Assistant: {prayerName} is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
-
-                //                                          Hey! That's my name 😃
-                await speechManager.SynthesizeTextToSpeech("ar-SY-LaithNeural", prayerText); // Arabic text-to-speech
-
                 // English text-to-speech
-                await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
+                speechManager.SynthesizeTextToSpeech("en-US-AndrewMultilingualNeural", $"{prayerText} is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
+
+                speechManager.SpeechBubble("", $"{prayerName} is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
             }
         }
 

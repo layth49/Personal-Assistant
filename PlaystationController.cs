@@ -21,8 +21,9 @@ namespace Personal_Assistant.PlaystationController
 
             Process remoteplay = Process.Start(@"C:\Program Files (x86)\Sony\PS Remote Play\RemotePlay.exe");
             remoteplay.PriorityClass = ProcessPriorityClass.High;
-            Console.WriteLine("Assistant: Ok! Turning on your PlayStation 5 now. What game would you like to play?\n");
-            await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Turning on your PlayStation 5 now. What game would you like to play?");
+
+            speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Turning on your PlayStation 5 now. What game would you like to play?");
+            speechManager.SpeechBubble(Program.recognizedText, "Ok! Turning on your PlayStation 5 now. What game would you like to play?");
 
             IntPtr handle = remoteplay.MainWindowHandle;
             SetForegroundWindow(handle);
@@ -33,15 +34,14 @@ namespace Personal_Assistant.PlaystationController
             SetForegroundWindow(handle);
 
             SpeechRecognizer playstationConfirmationRecognizer = new SpeechRecognizer(speechManager.speechConfig);
-            SpeechRecognitionResult parsedResponse = await playstationConfirmationRecognizer.RecognizeOnceAsync();
+            SpeechRecognitionResult parsedResponse = playstationConfirmationRecognizer.RecognizeOnceAsync().GetAwaiter().GetResult();
             speechManager.ConvertSpeechToText(parsedResponse);
             string userResponse = parsedResponse.Text.TrimEnd('.');
 
             SetForegroundWindow(handle);
 
-            Console.WriteLine($"Assistant: Ok! Loading up {userResponse} now\n");
             speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Okay! Loading up {userResponse} now");
-
+            speechManager.SpeechBubble(userResponse, $"Okay! Loading up {userResponse} now");
 
             try
             {
@@ -59,14 +59,12 @@ namespace Personal_Assistant.PlaystationController
             // Confirm request to close Remote Play
             simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.RETURN);
 
-            Console.WriteLine($"Assistant: {userResponse} is ready. Have fun!\n");
             speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"{userResponse} is ready! Have fun!");
+            speechManager.SpeechBubble(userResponse, $"{userResponse} is ready! Have fun!");
         }
 
         public void SendData(string data)
         {
-            Runtime.PythonDLL = @"C:\Users\15048\AppData\Local\Programs\Python\Python312\python312.dll";
-            PythonEngine.Initialize();
             using (Py.GIL())
             {
                 var pythonScript = Py.Import("AutoRemotePlay");

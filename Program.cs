@@ -1,33 +1,31 @@
-﻿using System;
-using System.Media;
-using System.Threading;
-using System.Diagnostics;
-using System.Threading.Tasks;
-using System.Runtime.InteropServices;
-using Microsoft.CognitiveServices.Speech;
-using WindowsInput;
-using Python.Runtime;
+﻿using Microsoft.CognitiveServices.Speech;
 using Personal_Assistant.Arduino;
-using Personal_Assistant.Geolocator;
 using Personal_Assistant.GeminiClient;
-using Personal_Assistant.SpeechManager;
+using Personal_Assistant.Geolocator;
 using Personal_Assistant.LightAutomator;
-using Personal_Assistant.WeatherService;
-using Personal_Assistant.PrayerTimesCalculator;
 using Personal_Assistant.PlaystationController;
+using Personal_Assistant.PrayerTimesCalculator;
+using Personal_Assistant.SpeechManager;
+using Personal_Assistant.WeatherService;
+using Python.Runtime;
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using WindowsInput;
 
 namespace Personal_Assistant
 {
     class Program
     {
-        // Replace these with your own Cognitive Services Speech API subscription key and service region endpoint
-        public static readonly string geminiApiKey = Environment.GetEnvironmentVariable("GEMINIAPI_KEY");
         public static readonly string weatherAPIKey = Environment.GetEnvironmentVariable("WEATHERAPI_KEY");
 
         // This is used to turn my personal lights and is therefore not required
         public static string ipAddressPlug = Environment.GetEnvironmentVariable("IP_ADDRESS:PLUG");
         public static string ipAddressSwitch = Environment.GetEnvironmentVariable("IP_ADDRESS:SWITCH");
 
+        public static string recognizedText = string.Empty; // Variable to store the recognized text
 
         [DllImport("user32.dll")]
         private static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -35,7 +33,7 @@ namespace Personal_Assistant
         // Inform the user that environment variables are required and how to set them
         static void CheckEnvironmentVariables()
         {
-            if (string.IsNullOrEmpty(geminiApiKey) || string.IsNullOrEmpty(SpeechService.speechKey) || string.IsNullOrEmpty(SpeechService.speechRegion) || string.IsNullOrEmpty(weatherAPIKey))
+            if (string.IsNullOrEmpty(GeminiService.geminiApiKey) || string.IsNullOrEmpty(SpeechService.speechKey) || string.IsNullOrEmpty(SpeechService.speechRegion) || string.IsNullOrEmpty(weatherAPIKey))
             {
                 Console.WriteLine("Error: Please set the following environment variables before running the program:");
                 Console.WriteLine("  - GEMINIAPI_KEY: Your Gemini API key");
@@ -53,19 +51,30 @@ namespace Personal_Assistant
         }
 
         // Here's the Main method where we put everything together
-        async static Task Main()
+        public async static Task Main()
         {
             CheckEnvironmentVariables(); // Ensure required environment variables are set
 
             // 49 (ASCII art)
             Console.WriteLine("                                    \r\n     ,AM  .d*\"*bg.\r\n    AVMM 6MP    Mb\r\n  ,W' MM YMb    MM\r\n,W'   MM  `MbmmdM9\r\nAmmmmmMMmm     .M'\r\n      MM     .d9  \r\n      MM   m\"'    \n\n");
 
+            // Initializing code
             InputSimulator simulator = new InputSimulator();
+
+            Runtime.PythonDLL = @"..\..\..\..\AppData\Local\Programs\Python\Python312\python312.dll";
+            PythonEngine.Initialize();
+
+            dynamic sys = Py.Import("sys");
+            sys.path.append(@"..\..\");
+
+            SpeechService speechManager = new SpeechService();
+
             while (true)
             {
+                // More initialization code
+
                 int hour = DateTime.Now.Hour;
 
-                SpeechService speechManager = new SpeechService();
 
                 // Gets the location of user using the Geolocator class
                 GetLocation location = new GetLocation();
@@ -79,11 +88,8 @@ namespace Personal_Assistant
 
                 ArduinoService arduino = new ArduinoService();
 
-                // Waits for keyword ("Hey Computer")
-                await speechManager.KeywordRecognizer();
-
-                
-                speechManager.AudioVisualizer();
+                // Waits for keyword ("Hey 49")
+                speechManager.KeywordRecognizer().GetAwaiter().GetResult();
 
                 simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_STOP);    // Stop all media
 
@@ -91,7 +97,7 @@ namespace Personal_Assistant
                 var speechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
 
                 Random random = new Random();
-
+                // Before 12 PM
                 if (hour <= 12)
                 {
                     string[] morningGreetings = new string[] 
@@ -100,12 +106,14 @@ namespace Personal_Assistant
                         "Morning! How can I assist you today?",
                         "Rise and shine! What's on your agenda?",
                         "Good morning! How can I help?",
-                        "Morning! What's up?",
+                        "Morning! What's up?"
                     };
                     string greeting = morningGreetings[random.Next(morningGreetings.Length)];
-                    Console.WriteLine($"\nAssistant: {greeting}\n");
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
+
+                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
+                    speechManager.SpeechBubble("Hey 49", greeting);
                 }
+                // Between 12 PM and 6 PM
                 else if (hour > 12 && hour <= 18)
                 {
                     string[] afternoonGreetings = new string[] 
@@ -118,9 +126,11 @@ namespace Personal_Assistant
                         "Hello there! What can I do for you this afternoon?"
                     };
                     string greeting = afternoonGreetings[random.Next(afternoonGreetings.Length)];
-                    Console.WriteLine($"\nAssistant: {greeting}\n");
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
+
+                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
+                    speechManager.SpeechBubble("Hey 49", greeting);
                 }
+                // Between 6 PM and 9 PM
                 else if (hour >= 18 && hour <= 21)
                 {
                     string[] eveningGreetings = new string[] 
@@ -133,9 +143,11 @@ namespace Personal_Assistant
                         "Hello! How can I help you this evening?"
                     };
                     string greeting = eveningGreetings[random.Next(eveningGreetings.Length)];
-                    Console.WriteLine($"\nAssistant: {greeting}\n");
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
+
+                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
+                    speechManager.SpeechBubble("Hey 49", greeting);
                 }
+                // After 9 PM
                 else
                 {
                    string[] nightGreetings = new string[]
@@ -144,73 +156,79 @@ namespace Personal_Assistant
                         "Hi there! How can I help you tonight?",
                         "Hello! What do you need this late?",
                         "Good night! I'm here if you need anything.",
-                        "Hope you're having a peaceful night. How can I assist?",
-                        "Evening! Feel free to ask me anything before you rest."
+                        "Hope you're having a peaceful night. How can I assist?"
                    };
                     string greeting = nightGreetings[random.Next(nightGreetings.Length)];
-                    Console.WriteLine($"\nAssistant: {greeting}\n");
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
+
+                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
+                    speechManager.SpeechBubble("Hey 49", greeting);
                 }
 
                 // Recognize microphone input
-                var speechRecognitionResult = await speechRecognizer.RecognizeOnceAsync();
+                var speechRecognitionResult = speechRecognizer.RecognizeOnceAsync().GetAwaiter().GetResult();
                 speechManager.ConvertSpeechToText(speechRecognitionResult);
 
                 // Use the recognized text
-                string recognizedText = speechRecognitionResult.Text.ToLower();
+                recognizedText = speechRecognitionResult.Text;
+                string lowercaseRecognizedText = recognizedText.ToLower();
 
                 // Explain himself
-                if (recognizedText == "who are you?")
+                if (lowercaseRecognizedText == "who are you?")
                 {
-                    Console.WriteLine("Assistant: Hi! I'm BOT49, your own personal assistant!");
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "hhi! I'm bot 49, your own personal assistant!");
+                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "hhi! I'm layth 49, your own personal assistant!");
+                    speechManager.SpeechBubble(recognizedText, "Hi! I'm L.A.I.T.H.49, your own personal assistant!");
                 }
                 // Close the assistant
-                else if (recognizedText.Contains("exit"))
+                else if (lowercaseRecognizedText.Contains("exit"))
                 {
-                    Console.WriteLine("Exiting the program");
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Exiting the program");
+                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Alright goodbye!");
+                    speechManager.SpeechBubble(recognizedText, "Alright goodbye!");
 
+                    PythonEngine.Shutdown();
                     Environment.Exit(0);
                 }
                 // Nevermind
-                else if (recognizedText.Contains("never mind"))
+                else if (lowercaseRecognizedText.Contains("never mind"))
                 {
-                    Console.WriteLine("Assistant: Ok! Let me know if you need anything else.");
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Let me know if you need anything else.");
+                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Let me know if you need anything else.");
+                    speechManager.SpeechBubble(recognizedText, "Okay! Let me know if you need anything else.");
                 }
                 // What time is it?
-                else if (recognizedText == "what time is it?" || recognizedText == "what's the time?")
+                else if (lowercaseRecognizedText == "what time is it?" || lowercaseRecognizedText == "what's the time?")
                 {
                     DateTime time = DateTime.Now.ToLocalTime();
-                    string response = $"It's {time:t}\n";
-                    Console.WriteLine("Assistant: " + response);
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", response);
+                    string response = $"It's {time:t}";
+
+                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", response);
+                    speechManager.SpeechBubble(recognizedText, response);
                 }
                 // What day is it?
-                else if (recognizedText == "what day is it?")
+                else if (lowercaseRecognizedText == "what day is it?")
                 {
                     DateTime today = DateTime.Now.Date;
-                    string response = $"It's {today:D}\n";
-                    Console.WriteLine("Assistant: " + response);
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", response);
+                    string response = $"It's {today:D}";
+                   
+                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", response);
+                    speechManager.SpeechBubble(recognizedText, response);
                 }
                 // Search up something
-                else if (recognizedText.StartsWith("search up") || recognizedText.StartsWith("google"))
+                else if (lowercaseRecognizedText.StartsWith("search up") || lowercaseRecognizedText.StartsWith("google"))
                 {
                     string query = recognizedText.Contains("search up") ? recognizedText.Remove(0, "search up".Length).TrimEnd('.', '?') : recognizedText.Remove(0, "google".Length).TrimEnd('.');
-                    Console.WriteLine($"Assistant: Ok! Searching up{query} now\n");
+
                     speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Okay! Searching up {query} now");
+                    speechManager.SpeechBubble(recognizedText, $"Okay! Searching up {query} now");
+
                     Process.Start("https://www.google.com/search?q=" + query);
                 }
                 // Open YouTube
-                else if (recognizedText.Contains("youtube"))
+                else if (lowercaseRecognizedText.Contains("youtube"))
                 {
-                    Console.WriteLine("Assistant: Ok! Would you like a specific video or to just open it?\n");
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Would you like a specific video or to just open it?");
+                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Would you like a specific video or to just open it?");
+                    speechManager.SpeechBubble(recognizedText, "Okay! Would you like a specific video or to just open it?");
 
                     SpeechRecognizer confirmationSpeechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
-                    SpeechRecognitionResult confirmationResult = await confirmationSpeechRecognizer.RecognizeOnceAsync();
+                    SpeechRecognitionResult confirmationResult = confirmationSpeechRecognizer.RecognizeOnceAsync().GetAwaiter().GetResult();
                     speechManager.ConvertSpeechToText(confirmationResult);
                     string confirmation = confirmationResult.Text.ToLower();
 
@@ -218,66 +236,70 @@ namespace Personal_Assistant
                     if (confirmation.StartsWith("search for") || confirmation.StartsWith("search up"))
                     {
                         string query = confirmation.Contains("search up") ? confirmation.Remove(0, "search up ".Length).TrimEnd('.') : confirmation.Remove(0, "search for ".Length).TrimEnd('.');
-                        Console.WriteLine($"Assistant: Ok! Searching for {query} now");
-                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Searching for {query} now");
+
+                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Ok! Searching for {query} now");
+                        speechManager.SpeechBubble(recognizedText, $"Ok! Searching for {query} now");
+
                         Process.Start($"https://www.youtube.com/results?search_query={query.Replace(" ", "+")}");
                     }
 
                     // Just open YouTube
                     else if (confirmation.Contains("open"))
                     {
-                        Console.WriteLine("Assistant: Ok! Opening YouTube now.\n");
                         speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening Youtube now.");
+                        speechManager.SpeechBubble(recognizedText, "Okay! Opening YouTube now.");
+
                         Process.Start("https://www.youtube.com");
                     }
                     // Don't open YouTube
-                    else if (recognizedText.Contains("nevermind") || recognizedText.Contains("never mind"))
+                    else if (lowercaseRecognizedText.Contains("nevermind") || lowercaseRecognizedText.Contains("never mind"))
                     {
-                        Console.WriteLine("Assistant: Ok! Let me know if you need anything else.");
-                        await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Let me know if you need anything else.");
+                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Let me know if you need anything else.");
+                        speechManager.SpeechBubble(recognizedText, "Okay! Let me know if you need anything else.");
                     }
                 }
                 // Open IDE
-                else if (recognizedText.Contains("visual studio") || recognizedText.Contains("code") || recognizedText.Contains("coding"))
+                else if (lowercaseRecognizedText.Contains("visual studio") || lowercaseRecognizedText.Contains("code") || lowercaseRecognizedText.Contains("coding"))
                 {
-                    Console.WriteLine("Assistant: Ok! Opening Visual Studio now.\n");
                     speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening Visual Studio now.");
+                    speechManager.SpeechBubble(recognizedText, "Okay! Opening Visual Studio now.");
+
                     Process.Start("devenv");
                 }
                 // Turn on PS5
-                else if (recognizedText.Contains("turn on") && recognizedText.Contains("playstation") || recognizedText.Contains("ps5"))
+                else if (lowercaseRecognizedText.Contains("turn on") && (lowercaseRecognizedText.Contains("playstation") || lowercaseRecognizedText.Contains("ps-5")))
                 {
                     playstationControl.TurnOnPlaystation();
                 }
                 // Light control
-                else if (recognizedText.Contains("turn on") && recognizedText.Contains("lights"))
+                else if (lowercaseRecognizedText.Contains("turn on") && lowercaseRecognizedText.Contains("lights"))
                 {
-                    if (recognizedText.Contains("led"))
+                    if (lowercaseRecognizedText.Contains("led"))
                     {
                         lightControl.TurnOnLights("LED", ipAddressPlug);
                     }
-                    else if (recognizedText.Contains("bedroom"))
+                    else if (lowercaseRecognizedText.Contains("bedroom"))
                     {
                         lightControl.TurnOnLights("bedroom", ipAddressSwitch);
                     }
                 }
-                else if (recognizedText.Contains("turn off") && recognizedText.Contains("lights"))
+                else if (lowercaseRecognizedText.Contains("turn off") && lowercaseRecognizedText.Contains("lights"))
                 {
-                    if (recognizedText.Contains("led"))
+                    if (lowercaseRecognizedText.Contains("led"))
                     {
                         lightControl.TurnOffLights("LED", ipAddressPlug);
                     }
-                    else if (recognizedText.Contains("bedroom"))
+                    else if (lowercaseRecognizedText.Contains("bedroom"))
                     {
                         lightControl.TurnOffLights("bedroom", ipAddressSwitch);
                     }
                 }
                 // Weather
-                else if (recognizedText.Contains("weather"))
+                else if (lowercaseRecognizedText.Contains("weather"))
                 {
                     try
                     {
-                        await weather.GetWeatherData();
+                        weather.GetWeatherData().GetAwaiter().GetResult();
                     }
                     catch (Exception ex)
                     {
@@ -285,51 +307,69 @@ namespace Personal_Assistant
                     }
                 }
                 // Prayer times
-                else if (recognizedText.Contains("pray times") || recognizedText.Contains("prayer times"))
+                else if (lowercaseRecognizedText.Contains("pray times") || lowercaseRecognizedText.Contains("prayer times"))
                 {
                     double latitude = location.GetLatitude().Result;
                     double longitude = location.GetLongitude().Result;
 
                     GetPrayerTimes prayerTimesLogic = new GetPrayerTimes(latitude, longitude);
 
-                    await prayerTimesLogic.AnnouncePrayerTimes(DateTime.Now);
+                    prayerTimesLogic.AnnouncePrayerTimes(DateTime.Now).GetAwaiter().GetResult();
+                }
+                // Send Text Messages
+                else if (lowercaseRecognizedText.Contains("send") && lowercaseRecognizedText.Contains("text") || lowercaseRecognizedText.Contains("message"))
+                {
+                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! What would you like to say?");
+                    speechManager.SpeechBubble(recognizedText, "Okay! What would you like to say?");
+
+                    SpeechRecognizer messageSpeechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
+                    SpeechRecognitionResult messageResult = messageSpeechRecognizer.RecognizeOnceAsync().GetAwaiter().GetResult();
+                    speechManager.ConvertSpeechToText(messageResult);
+
+                    string message = messageResult.Text;
                 }
                 // Door Control
-                else if (recognizedText.Contains("door")) {
+                else if (lowercaseRecognizedText.Contains("door")) {
 
-                    if (recognizedText.Contains("open"))
+                    if (lowercaseRecognizedText.Contains("open"))
                     {
                         arduino.ArduinoCommunication("OPEN");
-                        Console.WriteLine("Assistant: Ok! Opening your door now.");
-                        await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening your door now.");
+
+                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening your door now.");
+                        speechManager.SpeechBubble(recognizedText, "Okay! Opening your door now.");
                     }
-                    else if (recognizedText.Contains("close"))
+                    else if (lowercaseRecognizedText.Contains("close"))
                     {
                         arduino.ArduinoCommunication("CLOSE");
-                        Console.WriteLine("Assistant: Ok! Closing your door now.");
-                        await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Closing your door now.");
+
+                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Closing your door now.");
+                        speechManager.SpeechBubble(recognizedText, "Okay! Closing your door now.");
                     }
                 }
                 // Shut down or restart
-                else if (recognizedText == "shut down." || recognizedText == "restart.")
+                else if (lowercaseRecognizedText == "shut down." || lowercaseRecognizedText == "restart.")
                 {
-                    Console.WriteLine("Assistant: Are you sure?");
-                    await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Are you sure?");
+                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Are you sure?");
+                    speechManager.SpeechBubble(recognizedText, "Are you sure?");
 
                     SpeechRecognizer confirmationSpeechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
-                    SpeechRecognitionResult confirmationResult = await confirmationSpeechRecognizer.RecognizeOnceAsync();
+                    SpeechRecognitionResult confirmationResult = confirmationSpeechRecognizer.RecognizeOnceAsync().GetAwaiter().GetResult();
                     speechManager.ConvertSpeechToText(confirmationResult);
+
+                    string action = recognizedText.Contains("shut down") ? "Shutting down" : "Restarting now";
 
                     if (confirmationResult.Text.ToLower() == "yes.")
                     {
-                        string action = recognizedText.Contains("shut down") ? "Shutting down" : "Restarting now";
-                        Console.WriteLine($"Assistant: Ok. {action}");
-                        await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Ok. {action}");
+
+                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Ok. {action}");
+                        speechManager.SpeechBubble(recognizedText, $"Ok. {action}");
+
                         Process.Start("shutdown", recognizedText.Contains("shut down") ? "/s /t 0" : "/r /t 0");
                     }
                     else
                     {
-                        Console.WriteLine("\n");
+                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Ok. NOT {action}");
+                        speechManager.SpeechBubble(recognizedText, $"Ok. NOT {action}"); ;
                         Thread.Sleep(500);
                     }
                 }
@@ -338,10 +378,10 @@ namespace Personal_Assistant
                 {
                     if (speechRecognitionResult.Reason != ResultReason.NoMatch)
                     {
-                        string geminiResponse = await GeminiService.GenerateGeminiResponse(recognizedText, geminiApiKey, "gemini-1.5-flash");
+                        string geminiResponse = GeminiService.GenerateGeminiResponse(recognizedText).GetAwaiter().GetResult();
 
-                        Console.WriteLine("Assistant: " + geminiResponse);
-                        await speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", geminiResponse);
+                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", geminiResponse);
+                        speechManager.SpeechBubble(recognizedText, geminiResponse);
                     }
                 }
             }

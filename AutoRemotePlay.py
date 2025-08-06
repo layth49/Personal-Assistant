@@ -1,14 +1,22 @@
 ﻿import time
 import pyautogui
+from pyautogui import ImageNotFoundException
 from pynput.keyboard import Key, Controller
 
 def navigator(text):
     while True:
         try:
-            referenceImage = pyautogui.locateOnScreen("C:\\Users\\15048\\vstudio\\repos\\Projects\\Personal Assistant\\assets\\reference.png", grayscale= True, confidence= 0.9)
-            time.sleep(1)
-            break
-        except:
+            result = pyautogui.locateOnScreen(
+                "..\\..\\assets\\reference.png",
+                grayscale=True,
+                confidence=0.8
+            )
+            if result is not None:
+                time.sleep(1)
+                break
+            else:
+                time.sleep(1)
+        except ImageNotFoundException:
             time.sleep(1)
     try:
         keyboard = Controller()
@@ -86,4 +94,4 @@ def send_keystrokes(keyboard, text):
        time.sleep(0.1)
        keyboard.release(char)
   except:
-    print("Error sending keystrokes"
+    print("Error sending keystrokes")

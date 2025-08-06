@@ -1,5 +1,4 @@
-﻿using System;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using Personal_Assistant.SpeechManager;
 
 namespace Personal_Assistant.LightAutomator
@@ -17,8 +16,8 @@ namespace Personal_Assistant.LightAutomator
             cmd.StartInfo.Arguments = $"/c kasa --host {ipAddress} on";
             cmd.Start();
 
-            Console.WriteLine($"Assistant: Ok! Turning your {lightName} lights on now.\n");
             speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Okay! Turning your {lightName} lights on now.");
+            speechManager.SpeechBubble(Program.recognizedText, $"Ok! Turning your {lightName} lights on now.");
         }
 
         public void TurnOffLights(string lightName, string ipAddress)
@@ -30,8 +29,8 @@ namespace Personal_Assistant.LightAutomator
             cmd.StartInfo.Arguments = $"/c kasa --host {ipAddress} off";
             cmd.Start();
 
-            Console.WriteLine($"Assistant: Ok! Turning your {lightName} lights off now.\n");
             speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Okay! Turning your {lightName} lights off now.");
+            speechManager.SpeechBubble(Program.recognizedText, $"Ok! Turning your {lightName} lights off now.");
         }
     }
 }
