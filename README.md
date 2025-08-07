@@ -2,6 +2,7 @@
   <img src="assets/logo.png" alt="Logo">
 </div>
 
+[Logo]: https://github.com/user-attachments/assets/ba74c14e-fbaa-4aef-9642-e0f6e9ae4ce3
 # L.A.I.T.H.49
 
 ### Logical Assistant for Intelligent Task Handling
@@ -19,6 +20,7 @@ My Personal Voice Assistant!
 - Turn on/off my lights
 - Open/Close my door
 - Turn on my PS5 and open a game for me
+- Send an SMS Message to anyone in my contacts
 - Tell the Date/Time
 - Search up/Google anything
 - Open/Search on YouTube
@@ -31,8 +33,6 @@ My Personal Voice Assistant!
 ## Roadmap
 
 - [ ] Ability to interrupt L.A.I.T.H
-- [ ] Improve the Audio Visualizer
-- [ ] Send Text Messages  
   
 ## Acknowledgements
 
