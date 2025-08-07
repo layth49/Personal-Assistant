@@ -47,7 +47,7 @@ namespace Personal_Assistant.PlaystationController
             {
                 SetForegroundWindow(handle);
                 // Execute the Python script
-                SendData(userResponse);
+                NavigateToGame(userResponse);
             }
             catch (Exception ex)
             {
@@ -63,13 +63,27 @@ namespace Personal_Assistant.PlaystationController
             speechManager.SpeechBubble(userResponse, $"{userResponse} is ready! Have fun!");
         }
 
-        public void SendData(string data)
+        public void NavigateToGame(string gameName)
         {
             using (Py.GIL())
             {
-                var pythonScript = Py.Import("AutoRemotePlay");
-                var message = new PyString(data);
-                var result = pythonScript.InvokeMethod("navigator", new PyObject[] { message });
+                try
+                {
+                    var autoRemotePlayModule = Py.Import("AutoRemotePlay");
+                    var gameTitlePyStr = new PyString(gameName);
+                    autoRemotePlayModule.InvokeMethod("navigator", new PyObject[] { gameTitlePyStr });
+                }
+                catch (PythonException ex)
+                {
+                    Console.WriteLine("PythonException caught:");
+                    Console.WriteLine("Type: " + ex.Type);
+                    Console.WriteLine("Message: " + ex.Message);
+                    Console.WriteLine("StackTrace: " + ex.StackTrace);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error: {ex.Message}");
+                }
             }
         }
     }

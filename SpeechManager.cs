@@ -27,6 +27,8 @@ namespace Personal_Assistant.SpeechManager
         public SpeechService()
         {
             speechConfig.SpeechRecognitionLanguage = "en-US";
+
+            speechConfig.EndpointId = Environment.GetEnvironmentVariable("SPEECH_ENDPOINT_ID");
         }
 
         public async Task KeywordRecognizer()

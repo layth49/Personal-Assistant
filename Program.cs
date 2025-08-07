@@ -5,15 +5,20 @@ using Personal_Assistant.Geolocator;
 using Personal_Assistant.LightAutomator;
 using Personal_Assistant.PlaystationController;
 using Personal_Assistant.PrayerTimesCalculator;
+using Personal_Assistant.SMSController;
 using Personal_Assistant.SpeechManager;
 using Personal_Assistant.WeatherService;
 using Python.Runtime;
 using System;
+using System.IO;
+using System.Text.Json;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using WindowsInput;
+using System.Linq;
 
 namespace Personal_Assistant
 {
@@ -21,7 +26,6 @@ namespace Personal_Assistant
     {
         public static readonly string weatherAPIKey = Environment.GetEnvironmentVariable("WEATHERAPI_KEY");
 
-        // This is used to turn my personal lights and is therefore not required
         public static string ipAddressPlug = Environment.GetEnvironmentVariable("IP_ADDRESS:PLUG");
         public static string ipAddressSwitch = Environment.GetEnvironmentVariable("IP_ADDRESS:SWITCH");
 
@@ -67,7 +71,30 @@ namespace Personal_Assistant
             dynamic sys = Py.Import("sys");
             sys.path.append(@"..\..\");
 
+
             SpeechService speechManager = new SpeechService();
+
+            // Create a speech recognizer
+            var speechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
+
+            var phraseList = PhraseListGrammar.FromRecognizer(speechRecognizer);
+
+
+            Dictionary<string, string> contacts = null;
+
+            var contactsPath = Environment.GetEnvironmentVariable("CONTACTS_PATH");
+            if (contactsPath != null && File.Exists(contactsPath))
+            {
+                var json = File.ReadAllText(contactsPath);
+                contacts = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+            }
+
+            var phrases = contacts.Keys.ToList();
+
+            foreach (var phrase in phrases)
+            {
+                phraseList.AddPhrase(phrase);
+            }
 
             while (true)
             {
@@ -86,17 +113,17 @@ namespace Personal_Assistant
 
                 PlaystationControl playstationControl = new PlaystationControl();
 
+                SMSControl smsControl = new SMSControl();
+
                 ArduinoService arduino = new ArduinoService();
 
                 // Waits for keyword ("Hey 49")
                 speechManager.KeywordRecognizer().GetAwaiter().GetResult();
 
-                simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.MEDIA_STOP);    // Stop all media
-
-                // Create a speech recognizer
-                var speechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
 
                 Random random = new Random();
+
+                // Greet the user based on the time of day
                 // Before 12 PM
                 if (hour <= 12)
                 {
@@ -113,6 +140,8 @@ namespace Personal_Assistant
                     speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
                     speechManager.SpeechBubble("Hey 49", greeting);
                 }
+
+
                 // Between 12 PM and 6 PM
                 else if (hour > 12 && hour <= 18)
                 {
@@ -130,6 +159,8 @@ namespace Personal_Assistant
                     speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
                     speechManager.SpeechBubble("Hey 49", greeting);
                 }
+
+
                 // Between 6 PM and 9 PM
                 else if (hour >= 18 && hour <= 21)
                 {
@@ -147,6 +178,8 @@ namespace Personal_Assistant
                     speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
                     speechManager.SpeechBubble("Hey 49", greeting);
                 }
+
+
                 // After 9 PM
                 else
                 {
@@ -168,6 +201,7 @@ namespace Personal_Assistant
                 var speechRecognitionResult = speechRecognizer.RecognizeOnceAsync().GetAwaiter().GetResult();
                 speechManager.ConvertSpeechToText(speechRecognitionResult);
 
+
                 // Use the recognized text
                 recognizedText = speechRecognitionResult.Text;
                 string lowercaseRecognizedText = recognizedText.ToLower();
@@ -178,6 +212,8 @@ namespace Personal_Assistant
                     speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "hhi! I'm layth 49, your own personal assistant!");
                     speechManager.SpeechBubble(recognizedText, "Hi! I'm L.A.I.T.H.49, your own personal assistant!");
                 }
+
+
                 // Close the assistant
                 else if (lowercaseRecognizedText.Contains("exit"))
                 {
@@ -187,12 +223,16 @@ namespace Personal_Assistant
                     PythonEngine.Shutdown();
                     Environment.Exit(0);
                 }
+
+
                 // Nevermind
                 else if (lowercaseRecognizedText.Contains("never mind"))
                 {
                     speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Let me know if you need anything else.");
                     speechManager.SpeechBubble(recognizedText, "Okay! Let me know if you need anything else.");
                 }
+
+
                 // What time is it?
                 else if (lowercaseRecognizedText == "what time is it?" || lowercaseRecognizedText == "what's the time?")
                 {
@@ -202,6 +242,8 @@ namespace Personal_Assistant
                     speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", response);
                     speechManager.SpeechBubble(recognizedText, response);
                 }
+
+
                 // What day is it?
                 else if (lowercaseRecognizedText == "what day is it?")
                 {
@@ -211,6 +253,8 @@ namespace Personal_Assistant
                     speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", response);
                     speechManager.SpeechBubble(recognizedText, response);
                 }
+
+
                 // Search up something
                 else if (lowercaseRecognizedText.StartsWith("search up") || lowercaseRecognizedText.StartsWith("google"))
                 {
@@ -221,6 +265,8 @@ namespace Personal_Assistant
 
                     Process.Start("https://www.google.com/search?q=" + query);
                 }
+
+
                 // Open YouTube
                 else if (lowercaseRecognizedText.Contains("youtube"))
                 {
@@ -258,6 +304,8 @@ namespace Personal_Assistant
                         speechManager.SpeechBubble(recognizedText, "Okay! Let me know if you need anything else.");
                     }
                 }
+
+
                 // Open IDE
                 else if (lowercaseRecognizedText.Contains("visual studio") || lowercaseRecognizedText.Contains("code") || lowercaseRecognizedText.Contains("coding"))
                 {
@@ -266,11 +314,15 @@ namespace Personal_Assistant
 
                     Process.Start("devenv");
                 }
+
+
                 // Turn on PS5
                 else if (lowercaseRecognizedText.Contains("turn on") && (lowercaseRecognizedText.Contains("playstation") || lowercaseRecognizedText.Contains("ps-5")))
                 {
                     playstationControl.TurnOnPlaystation();
                 }
+
+
                 // Light control
                 else if (lowercaseRecognizedText.Contains("turn on") && lowercaseRecognizedText.Contains("lights"))
                 {
@@ -294,6 +346,8 @@ namespace Personal_Assistant
                         lightControl.TurnOffLights("bedroom", ipAddressSwitch);
                     }
                 }
+
+
                 // Weather
                 else if (lowercaseRecognizedText.Contains("weather"))
                 {
@@ -306,6 +360,8 @@ namespace Personal_Assistant
                         Console.WriteLine("An error occurred: " + ex.Message);
                     }
                 }
+
+
                 // Prayer times
                 else if (lowercaseRecognizedText.Contains("pray times") || lowercaseRecognizedText.Contains("prayer times"))
                 {
@@ -316,18 +372,32 @@ namespace Personal_Assistant
 
                     prayerTimesLogic.AnnouncePrayerTimes(DateTime.Now).GetAwaiter().GetResult();
                 }
+
+
                 // Send Text Messages
-                else if (lowercaseRecognizedText.Contains("send") && lowercaseRecognizedText.Contains("text") || lowercaseRecognizedText.Contains("message"))
+                else if (contacts.Keys.Any(name => lowercaseRecognizedText.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0) || lowercaseRecognizedText.Contains("leith"))
+                //     ^^^           This looks to see if the recognized text contains a contact name                     ^^^
                 {
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! What would you like to say?");
-                    speechManager.SpeechBubble(recognizedText, "Okay! What would you like to say?");
+                    string contactName = null;
+                    string contactNumber = null;
 
-                    SpeechRecognizer messageSpeechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
-                    SpeechRecognitionResult messageResult = messageSpeechRecognizer.RecognizeOnceAsync().GetAwaiter().GetResult();
-                    speechManager.ConvertSpeechToText(messageResult);
+                    foreach (var name in contacts.Keys)
+                    {
+                        if (lowercaseRecognizedText.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            contactName = name;
+                            contactNumber = contacts[name];
+                            break;
+                        }
+                    }
 
-                    string message = messageResult.Text;
+                    if (contactName != null && contactNumber != null)
+                    {
+                        smsControl.SendSMS(contactName, contactNumber);
+                    }
                 }
+
+
                 // Door Control
                 else if (lowercaseRecognizedText.Contains("door")) {
 
@@ -346,6 +416,8 @@ namespace Personal_Assistant
                         speechManager.SpeechBubble(recognizedText, "Okay! Closing your door now.");
                     }
                 }
+
+
                 // Shut down or restart
                 else if (lowercaseRecognizedText == "shut down." || lowercaseRecognizedText == "restart.")
                 {
@@ -373,6 +445,8 @@ namespace Personal_Assistant
                         Thread.Sleep(500);
                     }
                 }
+
+                // If the recognized text is not a command, we can use the Gemini API to generate a response
                 // Gemini API
                 else
                 {
