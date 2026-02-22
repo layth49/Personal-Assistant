@@ -16,7 +16,7 @@ namespace Personal_Assistant.LightAutomator
             cmd.StartInfo.Arguments = $"/c kasa --host {ipAddress} on";
             cmd.Start();
 
-            speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Okay! Turning your {lightName} lights on now.");
+            speechManager.SynthesizeTextToSpeech($"Okay! Turning your {lightName} lights on now.");
             speechManager.SpeechBubble(Program.recognizedText, $"Ok! Turning your {lightName} lights on now.");
         }
 
@@ -29,7 +29,7 @@ namespace Personal_Assistant.LightAutomator
             cmd.StartInfo.Arguments = $"/c kasa --host {ipAddress} off";
             cmd.Start();
 
-            speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Okay! Turning your {lightName} lights off now.");
+            speechManager.SynthesizeTextToSpeech($"Okay! Turning your {lightName} lights off now.");
             speechManager.SpeechBubble(Program.recognizedText, $"Ok! Turning your {lightName} lights off now.");
         }
     }

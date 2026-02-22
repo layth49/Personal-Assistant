@@ -117,6 +117,7 @@ namespace Personal_Assistant
 
                 ArduinoService arduino = new ArduinoService();
 
+
                 // Waits for keyword ("Hey 49")
                 speechManager.KeywordRecognizer().GetAwaiter().GetResult();
 
@@ -137,7 +138,7 @@ namespace Personal_Assistant
                     };
                     string greeting = morningGreetings[random.Next(morningGreetings.Length)];
 
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
+                    speechManager.SynthesizeTextToSpeech(greeting);
                     speechManager.SpeechBubble("Hey 49", greeting);
                 }
 
@@ -156,7 +157,7 @@ namespace Personal_Assistant
                     };
                     string greeting = afternoonGreetings[random.Next(afternoonGreetings.Length)];
 
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
+                    speechManager.SynthesizeTextToSpeech(greeting);
                     speechManager.SpeechBubble("Hey 49", greeting);
                 }
 
@@ -175,7 +176,7 @@ namespace Personal_Assistant
                     };
                     string greeting = eveningGreetings[random.Next(eveningGreetings.Length)];
 
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
+                    speechManager.SynthesizeTextToSpeech(greeting);
                     speechManager.SpeechBubble("Hey 49", greeting);
                 }
 
@@ -193,7 +194,7 @@ namespace Personal_Assistant
                    };
                     string greeting = nightGreetings[random.Next(nightGreetings.Length)];
 
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", greeting);
+                    speechManager.SynthesizeTextToSpeech(greeting);
                     speechManager.SpeechBubble("Hey 49", greeting);
                 }
 
@@ -209,7 +210,7 @@ namespace Personal_Assistant
                 // Explain himself
                 if (lowercaseRecognizedText == "who are you?")
                 {
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "hhi! I'm layth 49, your own personal assistant!");
+                    speechManager.SynthesizeTextToSpeech("hhi! I'm layth 49, your own personal assistant!");
                     speechManager.SpeechBubble(recognizedText, "Hi! I'm L.A.I.T.H.49, your own personal assistant!");
                 }
 
@@ -217,7 +218,7 @@ namespace Personal_Assistant
                 // Close the assistant
                 else if (lowercaseRecognizedText.Contains("exit"))
                 {
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Alright goodbye!");
+                    speechManager.SynthesizeTextToSpeech("Alright goodbye!");
                     speechManager.SpeechBubble(recognizedText, "Alright goodbye!");
 
                     PythonEngine.Shutdown();
@@ -228,7 +229,7 @@ namespace Personal_Assistant
                 // Nevermind
                 else if (lowercaseRecognizedText.Contains("never mind"))
                 {
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Let me know if you need anything else.");
+                    speechManager.SynthesizeTextToSpeech("Okay! Let me know if you need anything else.");
                     speechManager.SpeechBubble(recognizedText, "Okay! Let me know if you need anything else.");
                 }
 
@@ -239,7 +240,7 @@ namespace Personal_Assistant
                     DateTime time = DateTime.Now.ToLocalTime();
                     string response = $"It's {time:t}";
 
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", response);
+                    speechManager.SynthesizeTextToSpeech(response);
                     speechManager.SpeechBubble(recognizedText, response);
                 }
 
@@ -249,8 +250,8 @@ namespace Personal_Assistant
                 {
                     DateTime today = DateTime.Now.Date;
                     string response = $"It's {today:D}";
-                   
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", response);
+
+                    speechManager.SynthesizeTextToSpeech(response);
                     speechManager.SpeechBubble(recognizedText, response);
                 }
 
@@ -260,7 +261,7 @@ namespace Personal_Assistant
                 {
                     string query = recognizedText.Contains("search up") ? recognizedText.Remove(0, "search up".Length).TrimEnd('.', '?') : recognizedText.Remove(0, "google".Length).TrimEnd('.');
 
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Okay! Searching up {query} now");
+                    speechManager.SynthesizeTextToSpeech($"Okay! Searching up {query} now");
                     speechManager.SpeechBubble(recognizedText, $"Okay! Searching up {query} now");
 
                     Process.Start("https://www.google.com/search?q=" + query);
@@ -270,7 +271,7 @@ namespace Personal_Assistant
                 // Open YouTube
                 else if (lowercaseRecognizedText.Contains("youtube"))
                 {
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Would you like a specific video or to just open it?");
+                    speechManager.SynthesizeTextToSpeech("Okay! Would you like a specific video or to just open it?");
                     speechManager.SpeechBubble(recognizedText, "Okay! Would you like a specific video or to just open it?");
 
                     SpeechRecognizer confirmationSpeechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
@@ -283,7 +284,7 @@ namespace Personal_Assistant
                     {
                         string query = confirmation.Contains("search up") ? confirmation.Remove(0, "search up ".Length).TrimEnd('.') : confirmation.Remove(0, "search for ".Length).TrimEnd('.');
 
-                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Ok! Searching for {query} now");
+                        speechManager.SynthesizeTextToSpeech($"Ok! Searching for {query} now");
                         speechManager.SpeechBubble(recognizedText, $"Ok! Searching for {query} now");
 
                         Process.Start($"https://www.youtube.com/results?search_query={query.Replace(" ", "+")}");
@@ -292,7 +293,7 @@ namespace Personal_Assistant
                     // Just open YouTube
                     else if (confirmation.Contains("open"))
                     {
-                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening Youtube now.");
+                        speechManager.SynthesizeTextToSpeech("Okay! Opening Youtube now.");
                         speechManager.SpeechBubble(recognizedText, "Okay! Opening YouTube now.");
 
                         Process.Start("https://www.youtube.com");
@@ -300,7 +301,7 @@ namespace Personal_Assistant
                     // Don't open YouTube
                     else if (lowercaseRecognizedText.Contains("nevermind") || lowercaseRecognizedText.Contains("never mind"))
                     {
-                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Let me know if you need anything else.");
+                        speechManager.SynthesizeTextToSpeech("Okay! Let me know if you need anything else.");
                         speechManager.SpeechBubble(recognizedText, "Okay! Let me know if you need anything else.");
                     }
                 }
@@ -309,7 +310,7 @@ namespace Personal_Assistant
                 // Open IDE
                 else if (lowercaseRecognizedText.Contains("visual studio") || lowercaseRecognizedText.Contains("code") || lowercaseRecognizedText.Contains("coding"))
                 {
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening Visual Studio now.");
+                    speechManager.SynthesizeTextToSpeech("Okay! Opening Visual Studio now.");
                     speechManager.SpeechBubble(recognizedText, "Okay! Opening Visual Studio now.");
 
                     Process.Start("devenv");
@@ -324,7 +325,7 @@ namespace Personal_Assistant
 
 
                 // Light control
-                else if (lowercaseRecognizedText.Contains("turn on") && lowercaseRecognizedText.Contains("lights"))
+                else if (lowercaseRecognizedText.Contains("turn on") && lowercaseRecognizedText.Contains("light"))
                 {
                     if (lowercaseRecognizedText.Contains("led"))
                     {
@@ -335,7 +336,7 @@ namespace Personal_Assistant
                         lightControl.TurnOnLights("bedroom", ipAddressSwitch);
                     }
                 }
-                else if (lowercaseRecognizedText.Contains("turn off") && lowercaseRecognizedText.Contains("lights"))
+                else if (lowercaseRecognizedText.Contains("turn off") && lowercaseRecognizedText.Contains("light"))
                 {
                     if (lowercaseRecognizedText.Contains("led"))
                     {
@@ -405,14 +406,14 @@ namespace Personal_Assistant
                     {
                         arduino.ArduinoCommunication("OPEN");
 
-                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Opening your door now.");
+                        speechManager.SynthesizeTextToSpeech("Okay! Opening your door now.");
                         speechManager.SpeechBubble(recognizedText, "Okay! Opening your door now.");
                     }
                     else if (lowercaseRecognizedText.Contains("close"))
                     {
                         arduino.ArduinoCommunication("CLOSE");
 
-                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Closing your door now.");
+                        speechManager.SynthesizeTextToSpeech("Okay! Closing your door now.");
                         speechManager.SpeechBubble(recognizedText, "Okay! Closing your door now.");
                     }
                 }
@@ -421,27 +422,27 @@ namespace Personal_Assistant
                 // Shut down or restart
                 else if (lowercaseRecognizedText == "shut down." || lowercaseRecognizedText == "restart.")
                 {
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Are you sure?");
+                    speechManager.SynthesizeTextToSpeech("Are you sure?");
                     speechManager.SpeechBubble(recognizedText, "Are you sure?");
 
                     SpeechRecognizer confirmationSpeechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
                     SpeechRecognitionResult confirmationResult = confirmationSpeechRecognizer.RecognizeOnceAsync().GetAwaiter().GetResult();
                     speechManager.ConvertSpeechToText(confirmationResult);
 
-                    string action = recognizedText.Contains("shut down") ? "Shutting down" : "Restarting now";
+                    string action = lowercaseRecognizedText.Contains("shut down") ? "Shutting down" : "Restarting now";
 
                     if (confirmationResult.Text.ToLower() == "yes.")
                     {
 
-                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Ok. {action}");
-                        speechManager.SpeechBubble(recognizedText, $"Ok. {action}");
+                        speechManager.SynthesizeTextToSpeech($"Ok. {action}");
+                        speechManager.SpeechBubble(confirmationResult.Text, $"Ok. {action}");
 
-                        Process.Start("shutdown", recognizedText.Contains("shut down") ? "/s /t 0" : "/r /t 0");
+                        Process.Start("shutdown", lowercaseRecognizedText.Contains("shut") ? "/s /t 0" : "/r /t 0");
                     }
                     else
                     {
-                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Ok. NOT {action}");
-                        speechManager.SpeechBubble(recognizedText, $"Ok. NOT {action}"); ;
+                        speechManager.SynthesizeTextToSpeech($"Ok. NOT {action}");
+                        speechManager.SpeechBubble(recognizedText, $"Ok. NOT {action}");
                         Thread.Sleep(500);
                     }
                 }
@@ -454,7 +455,7 @@ namespace Personal_Assistant
                     {
                         string geminiResponse = GeminiService.GenerateGeminiResponse(recognizedText).GetAwaiter().GetResult();
 
-                        speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", geminiResponse);
+                        speechManager.SynthesizeTextToSpeech(geminiResponse);
                         speechManager.SpeechBubble(recognizedText, geminiResponse);
                     }
                 }

@@ -63,7 +63,7 @@ namespace Personal_Assistant.SpeechManager
                     break;
                 case ResultReason.NoMatch:
                     SpeechBubble("","Sorry I didn't get that. Can you say it again?");
-                    SynthesizeTextToSpeech("en-US-AndrewNeural", "Sorry I didn't get that. Can you say it again?");
+                    SynthesizeTextToSpeech("Sorry I didn't get that. Can you say it again?");
                     break;
                 case ResultReason.Canceled:
                     CancellationDetails cancellation = CancellationDetails.FromResult(speechRecognitionResult);
@@ -81,13 +81,13 @@ namespace Personal_Assistant.SpeechManager
 
         // Got this beautiful method from https://bit.ly/3GVnSjc
         // This method handles the text-to-speech synthesis
-        public async Task SynthesizeTextToSpeech(string voiceName, string textToSynthesize)
+        public async Task SynthesizeTextToSpeech(string textToSynthesize)
         {
             // Creates an instance of a speech config with specified subscription key and service region.
             SpeechConfig config = SpeechConfig.FromSubscription(speechKey, speechRegion);
 
             // I liked this voice but you can look for others on https://bit.ly/3ttEGuH
-            config.SpeechSynthesisVoiceName = voiceName;
+            config.SpeechSynthesisVoiceName = "en-US-AndrewMultilingualNeural";
 
             // Use the default speaker as audio output
             using (SpeechSynthesizer synthesizer = new SpeechSynthesizer(config))

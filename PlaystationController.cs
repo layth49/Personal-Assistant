@@ -22,7 +22,7 @@ namespace Personal_Assistant.PlaystationController
             Process remoteplay = Process.Start(@"C:\Program Files (x86)\Sony\PS Remote Play\RemotePlay.exe");
             remoteplay.PriorityClass = ProcessPriorityClass.High;
 
-            speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", "Okay! Turning on your PlayStation 5 now. What game would you like to play?");
+            speechManager.SynthesizeTextToSpeech("Okay! Turning on your PlayStation 5 now. What game would you like to play?");
             speechManager.SpeechBubble(Program.recognizedText, "Ok! Turning on your PlayStation 5 now. What game would you like to play?");
 
             IntPtr handle = remoteplay.MainWindowHandle;
@@ -40,7 +40,7 @@ namespace Personal_Assistant.PlaystationController
 
             SetForegroundWindow(handle);
 
-            speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"Okay! Loading up {userResponse} now");
+            speechManager.SynthesizeTextToSpeech($"Okay! Loading up {userResponse} now");
             speechManager.SpeechBubble(userResponse, $"Okay! Loading up {userResponse} now");
 
             try
@@ -59,7 +59,7 @@ namespace Personal_Assistant.PlaystationController
             // Confirm request to close Remote Play
             simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.RETURN);
 
-            speechManager.SynthesizeTextToSpeech("en-US-AndrewNeural", $"{userResponse} is ready! Have fun!");
+            speechManager.SynthesizeTextToSpeech($"{userResponse} is ready! Have fun!");
             speechManager.SpeechBubble(userResponse, $"{userResponse} is ready! Have fun!");
         }
 

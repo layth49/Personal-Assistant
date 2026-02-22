@@ -55,7 +55,7 @@ namespace Personal_Assistant.PrayerTimesCalculator
                 string prayerText = texts[i];
 
                 // English text-to-speech
-                speechManager.SynthesizeTextToSpeech("en-US-AndrewMultilingualNeural", $"{prayerText} is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
+                speechManager.SynthesizeTextToSpeech($"{prayerText} is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
 
                 speechManager.SpeechBubble("", $"{prayerName} is at: {Format12HourTime(GetPrayerTime(prayerTimes, prayerName))}");
             }

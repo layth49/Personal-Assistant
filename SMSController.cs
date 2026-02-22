@@ -38,7 +38,7 @@ namespace Personal_Assistant.SMSController
 
                 while (true)
                 {
-                    speechManager.SynthesizeTextToSpeech("en-US-AndrewMultilingualNeural", $"Okay! What would you like to send {contactName}?");
+                    speechManager.SynthesizeTextToSpeech($"Okay! What would you like to send {contactName}?");
                     speechManager.SpeechBubble(Program.recognizedText, $"Okay! What would you like to send {contactName}?");
 
                     SpeechRecognizer recognizer = new SpeechRecognizer(speechManager.speechConfig);
@@ -54,7 +54,7 @@ namespace Personal_Assistant.SMSController
 
                             SendMessageToContact(contactNumber, "Hello! This was sent by L.A.I.T.H.49, AKA Layth's Logical Assistant for Intelligent Task Handling 49!");
 
-                            speechManager.SynthesizeTextToSpeech("en-US-AndrewMultilingualNeural", $"Okay! Introducing myself to {contactName}.");
+                            speechManager.SynthesizeTextToSpeech($"Okay! Introducing myself to {contactName}.");
                             speechManager.SpeechBubble(userResponse.Text, $"Okay! Introducing myself to {contactName}.");
                             break;
                         }
@@ -65,7 +65,7 @@ namespace Personal_Assistant.SMSController
                     }
                     else
                     {
-                        speechManager.SynthesizeTextToSpeech("en-US-AndrewMultilingualNeural", $"You'd like to send {userResponse.Text} to {contactName}. Is that correct?");
+                        speechManager.SynthesizeTextToSpeech($"You'd like to send {userResponse.Text} to {contactName}. Is that correct?");
                         speechManager.SpeechBubble(userResponse.Text, $"You'd like to send {userResponse.Text} to {contactName}. Is that correct?");
 
                         SpeechRecognizer confirmationSpeechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
@@ -74,7 +74,7 @@ namespace Personal_Assistant.SMSController
 
                         if (confirmationResult.Text.Contains("no"))
                         {
-                            speechManager.SynthesizeTextToSpeech("en-US-AndrewMultilingualNeural", "Okay, message cancelled. ");
+                            speechManager.SynthesizeTextToSpeech("Okay, message cancelled.");
                             speechManager.SpeechBubble(confirmationResult.Text, "Okay, message cancelled.");
                         }
                         else
@@ -87,7 +87,7 @@ namespace Personal_Assistant.SMSController
 
                                 SendMessageToContact(contactNumber, userResponse.Text);
 
-                                speechManager.SynthesizeTextToSpeech("en-US-AndrewMultilingualNeural", $"Sending {userResponse.Text} to {contactName}.");
+                                speechManager.SynthesizeTextToSpeech($"Sending {userResponse.Text} to {contactName}.");
                                 speechManager.SpeechBubble(userResponse.Text, $"Sending {userResponse.Text} to {contactName}.");
                                 break;
                             }
@@ -98,7 +98,7 @@ namespace Personal_Assistant.SMSController
                         }
                     }
                 }
-                
+
             }
             catch (Exception ex)
             {
@@ -128,7 +128,7 @@ namespace Personal_Assistant.SMSController
                     Console.WriteLine($"Error: {ex.Message}");
                 }
             }
-        }   
+        }
 
     }
 }
