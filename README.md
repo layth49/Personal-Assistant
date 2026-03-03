@@ -2,7 +2,7 @@
   <img src="assets/logo.ico" alt="Logo">
 </div>
 
-# L.A.I.T.H.49
+# L./\.I.T.H.49
 
 ### Logical Assistant for Intelligent Task Handling
 
