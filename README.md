@@ -31,7 +31,7 @@ My Personal Voice Assistant!
 
 ## Roadmap
 
-- [ ] Ability to interrupt L.A.I.T.H
+- [x] Ability to interrupt L.A.I.T.H
   
 ## Acknowledgements
 
