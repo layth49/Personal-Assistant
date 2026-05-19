@@ -1,9 +1,9 @@
-﻿using System.Threading.Tasks;
+﻿using System;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
-using System.Text.Json.Nodes;
-using Newtonsoft.Json;
-using System;
+using System.Text.Json;
+using System.Threading.Tasks;
 
 namespace Personal_Assistant.GeminiClient
 {
@@ -11,88 +11,111 @@ namespace Personal_Assistant.GeminiClient
     {
         public static readonly string geminiApiKey = Environment.GetEnvironmentVariable("GEMINIAPI_KEY");
 
+        // Reused across the app's lifetime to avoid socket exhaustion / TLS handshake costs
+        // (Microsoft guidance: do not new-up HttpClient per request on .NET Framework).
+        private static readonly HttpClient httpClient = CreateHttpClient();
+
+        private const string Endpoint =
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+
+        private const string SystemPrompt =
+            "You are a concise voice assistant. Answer accurately and in as few words as possible. " +
+            "Lead with the final answer; only expand if the user asks for detail. " +
+            "Maintain a courteous, professional tone. Be transparent about limitations.";
+
+        private static readonly JsonSerializerOptions JsonOpts = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+        };
+
+        private static HttpClient CreateHttpClient()
+        {
+            var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            if (!string.IsNullOrEmpty(geminiApiKey))
+            {
+                client.DefaultRequestHeaders.Add("x-goog-api-key", geminiApiKey);
+            }
+            return client;
+        }
+
         public static async Task<string> GenerateGeminiResponse(string inputText)
         {
-            // Create the request body
             var requestBody = new
             {
-                contents = new[] {
-                    // Initial few prompts are to condition Gemini
-                    new { role = "user", parts = new object[] { new { text = "SYSTEM: Proceed as a helpful and informative AI voice assistant designed to make a user's life/work easier. Use your knowledge and access to information to answer user queries accurately and comprehensively. When instructed, complete tasks for the user to the best of your ability, prioritizing safety and following user instructions. Maintain a professional and courteous tone in all interactions. Present information in a clear, concise, and easy-to-understand manner. Where possible, personalize responses based on user preferences and past interactions. Be transparent about your limitations and inability to perform actions in the real world. Continuously learn and improve your capabilities based on user interactions and data access. Prioritize providing concise and actionable responses to user queries. When presenting calculations or solutions, focus on the final answer and offer detailed explanations only when explicitly requested by the user." } } },
-                    new { role = "model", parts = new object[] { new { text = "Understood. I'm ready to assist you as a helpful and informative AI voice assistant. My goal is to make your life/work easier by providing concise and actionable answers to your questions and completing tasks efficiently.  I can access and process information to deliver accurate and comprehensive responses. When instructed, I'll prioritize safety and follow your guidance to complete tasks for you.  I'll maintain a professional and courteous tone and present information clearly. If you'd like a detailed explanation, just let me know!" } } },
-
-                    // Training Gemini to answer quickly (Calculation)
-                    new { role = "user", parts = new object[] { new { text = "USER: What is 6 + 7 + 5 * 7 / 2 - 74^3" } } },
-                    new { role = "model", parts = new object[] { new { text = "6 + 7 + 5 * 7 / 2 - 74^3 = -402,643,351" } } },
-      
-                    // Training Gemini to answer quickly (Geography)
-                    new { role = "user", parts = new object[] { new { text = "USER: What is the capital of Thailand" } } },
-                    new { role = "model", parts = new object[] { new { text = "The capital of Thailand is Bangkok." } } },
-      
-                    // Training Gemini to not give long winded explanations 
-                    new { role = "user", parts = new object[] { new { text = "USER: How long does it take to pressure cook goat meat" } } },
-                    new { role = "model", parts = new object[] { new { text = "As a general guide, here are the recommended pressure cooking times for goat meat: Goat shoulder or leg: 45-60 minutes; Goat ribs: 30-45 minutes; Goat stew meat: 20-30 minutes" } } },
-      
-                    // User Input
-                    new { role = "user", parts = new object[] { new { text = "USER: " + inputText } } }
+                system_instruction = new { parts = new[] { new { text = SystemPrompt } } },
+                contents = new[]
+                {
+                    new { role = "user", parts = new[] { new { text = inputText } } }
+                },
+                // Google Search grounding — Gemini will run a web search when it
+                // helps answer the question, then cite the result. Lets the
+                // assistant answer about current events / facts past the model
+                // cutoff. Tool name is google_search (the snake_case form Gemini
+                // 2.0+ uses; the older googleSearchRetrieval is for 1.5 only).
+                tools = new[]
+                {
+                    new { google_search = new { } }
                 },
                 generationConfig = new
                 {
                     temperature = 0.5,
-                    top_p = 0.5,
-                    top_k = 10,
-                    max_output_tokens = 200
+                    topP = 0.5,
+                    topK = 10,
+                    maxOutputTokens = 200
                 }
             };
 
-            // Create the HTTP client
-            using (var client = new HttpClient())
+            var content = new StringContent(
+                JsonSerializer.Serialize(requestBody, JsonOpts),
+                Encoding.UTF8,
+                "application/json");
+
+            try
             {
-                // Set the API endpoint URL
-                string url = $"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?&key={geminiApiKey}";
-
-                // Create the request message
-                var sendRequest = new HttpRequestMessage(HttpMethod.Post, url);
-
-                // Set the request content type and body
-                string parseRequest = JsonConvert.SerializeObject(requestBody);
-                sendRequest.Content = new StringContent(parseRequest, Encoding.UTF8, "application/json");
-
-                // Send the API request asynchronously
-                HttpResponseMessage response = await client.SendAsync(sendRequest);
-
-                // Check for successful response
-                if (response.IsSuccessStatusCode)
+                using (HttpResponseMessage response = await httpClient.PostAsync(Endpoint, content))
                 {
-                    // Read the response content
-                    string jsonString = await response.Content.ReadAsStringAsync();
+                    string body = await response.Content.ReadAsStringAsync();
 
-                    // Parse the JSON string
-                    var jsonObject = System.Text.Json.JsonSerializer.Deserialize<JsonObject>(jsonString);
-
-                    // Get the first candidate object
-                    var candidateObject = jsonObject["candidates"][0];
-
-                    // Get the content object
-                    var contentObject = candidateObject["content"];
-
-                    // Access the list of parts within the content
-                    var parts = contentObject["parts"] as JsonArray;
-
-                    // Iterate through the parts and extract the text
-                    string text = "";
-                    foreach (var part in parts)
+                    if (!response.IsSuccessStatusCode)
                     {
-                        text += part["text"].ToString();
+                        return $"Error: {(int)response.StatusCode} {response.ReasonPhrase}";
                     }
 
-                    // Now the variable 'text' contains only the response from the JSON response
-                    return text;
+                    return ExtractText(body);
                 }
-                else
+            }
+            catch (Exception ex)
+            {
+                return $"Error: {ex.Message}";
+            }
+        }
+
+        private static string ExtractText(string json)
+        {
+            using (JsonDocument doc = JsonDocument.Parse(json))
+            {
+                if (!doc.RootElement.TryGetProperty("candidates", out var candidates) ||
+                    candidates.GetArrayLength() == 0)
                 {
-                    return $"Error: {response.StatusCode}";
+                    return string.Empty;
                 }
+
+                if (!candidates[0].TryGetProperty("content", out var contentEl) ||
+                    !contentEl.TryGetProperty("parts", out var parts))
+                {
+                    return string.Empty;
+                }
+
+                var sb = new StringBuilder();
+                foreach (var part in parts.EnumerateArray())
+                {
+                    if (part.TryGetProperty("text", out var text))
+                    {
+                        sb.Append(text.GetString());
+                    }
+                }
+                return sb.ToString();
             }
         }
     }

@@ -1,10 +1,13 @@
 ﻿using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.CognitiveServices.Speech;
 using Personal_Assistant.SpeechManager;
 using Python.Runtime;
 using WindowsInput;
+using WindowsInput.Native;
 
 namespace Personal_Assistant.PlaystationController
 {
@@ -12,41 +15,58 @@ namespace Personal_Assistant.PlaystationController
     {
         [DllImport("user32.dll")]
         static extern bool SetForegroundWindow(IntPtr hWnd);
-        InputSimulator simulator = new InputSimulator();
 
-        SpeechService speechManager = new SpeechService();
+        [DllImport("user32.dll")]
+        static extern bool IsWindowVisible(IntPtr hWnd);
 
-        async public void TurnOnPlaystation()
+        private readonly InputSimulator simulator = new InputSimulator();
+        private readonly SpeechService speechManager = new SpeechService();
+
+        public async Task TurnOnPlaystation()
         {
-
             Process remoteplay = Process.Start(@"C:\Program Files (x86)\Sony\PS Remote Play\RemotePlay.exe");
+            if (remoteplay == null)
+            {
+                Console.WriteLine("Failed to launch Remote Play.");
+                return;
+            }
             remoteplay.PriorityClass = ProcessPriorityClass.High;
 
-            speechManager.SynthesizeTextToSpeech("Okay! Turning on your PlayStation 5 now. What game would you like to play?");
-            speechManager.SpeechBubble(Program.recognizedText, "Ok! Turning on your PlayStation 5 now. What game would you like to play?");
+            await speechManager.Say(Program.recognizedText,
+                "Okay! Turning on your PlayStation 5 now. What game would you like to play?");
 
-            IntPtr handle = remoteplay.MainWindowHandle;
-            SetForegroundWindow(handle);
-
-            // Turn on
-            simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.TAB);
-            simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.RETURN);
-            SetForegroundWindow(handle);
-
-            SpeechRecognizer playstationConfirmationRecognizer = new SpeechRecognizer(speechManager.speechConfig);
-            SpeechRecognitionResult parsedResponse = playstationConfirmationRecognizer.RecognizeOnceAsync().GetAwaiter().GetResult();
-            speechManager.ConvertSpeechToText(parsedResponse);
-            string userResponse = parsedResponse.Text.TrimEnd('.');
+            // Wait for the Remote Play window to actually appear and become
+            // visible before sending input — the process starts but the window
+            // may take several seconds to render.
+            IntPtr handle = await WaitForWindowAsync(remoteplay, timeoutSeconds: 30);
+            if (handle == IntPtr.Zero)
+            {
+                Console.WriteLine("Remote Play window did not appear within 30s.");
+                return;
+            }
 
             SetForegroundWindow(handle);
+            await Task.Delay(500); // let the window settle before sending keys
 
-            speechManager.SynthesizeTextToSpeech($"Okay! Loading up {userResponse} now");
-            speechManager.SpeechBubble(userResponse, $"Okay! Loading up {userResponse} now");
+            simulator.Keyboard.KeyPress(VirtualKeyCode.TAB);
+            simulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
+            SetForegroundWindow(handle);
+
+            string userResponse;
+            using (var recognizer = new SpeechRecognizer(speechManager.speechConfig))
+            {
+                SpeechRecognitionResult parsedResponse = await recognizer.RecognizeOnceAsync();
+                speechManager.ConvertSpeechToText(parsedResponse);
+                userResponse = (parsedResponse.Text ?? string.Empty).TrimEnd('.');
+            }
+
+            SetForegroundWindow(handle);
+
+            await speechManager.Say(userResponse, $"Okay! Loading up {userResponse} now");
 
             try
             {
                 SetForegroundWindow(handle);
-                // Execute the Python script
                 NavigateToGame(userResponse);
             }
             catch (Exception ex)
@@ -54,13 +74,29 @@ namespace Personal_Assistant.PlaystationController
                 Console.WriteLine($"Error: {ex.Message}");
             }
 
-            // Send a request to close Remote Play
             remoteplay.CloseMainWindow();
-            // Confirm request to close Remote Play
-            simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.RETURN);
+            simulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
 
-            speechManager.SynthesizeTextToSpeech($"{userResponse} is ready! Have fun!");
-            speechManager.SpeechBubble(userResponse, $"{userResponse} is ready! Have fun!");
+            await speechManager.Say(userResponse, $"{userResponse} is ready! Have fun!");
+        }
+
+        // Polls until the process has a valid, visible main window handle,
+        // or the timeout elapses. Returns IntPtr.Zero on timeout.
+        private static async Task<IntPtr> WaitForWindowAsync(Process process, int timeoutSeconds)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+            while (DateTime.UtcNow < deadline)
+            {
+                process.Refresh(); // flush cached handle / module info
+                IntPtr hwnd = process.MainWindowHandle;
+                if (hwnd != IntPtr.Zero && IsWindowVisible(hwnd))
+                {
+                    Console.WriteLine($"Remote Play window ready (hwnd={hwnd}).");
+                    return hwnd;
+                }
+                await Task.Delay(500);
+            }
+            return IntPtr.Zero;
         }
 
         public void NavigateToGame(string gameName)
@@ -70,8 +106,10 @@ namespace Personal_Assistant.PlaystationController
                 try
                 {
                     var autoRemotePlayModule = Py.Import("AutoRemotePlay");
-                    var gameTitlePyStr = new PyString(gameName);
-                    autoRemotePlayModule.InvokeMethod("navigator", new PyObject[] { gameTitlePyStr });
+                    using (var gameTitlePyStr = new PyString(gameName))
+                    {
+                        autoRemotePlayModule.InvokeMethod("navigator", new PyObject[] { gameTitlePyStr });
+                    }
                 }
                 catch (PythonException ex)
                 {

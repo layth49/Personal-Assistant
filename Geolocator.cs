@@ -1,90 +1,116 @@
 ﻿using System;
 using System.Device.Location;
 using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
 
 namespace Personal_Assistant.Geolocator
 {
     public class GetLocation
     {
-        public async Task<double> GetLatitude()
-        {
-            try
-            {
-                // Implement logic to retrieve latitude using GeoCoordinateWatcher
-                GeoCoordinateWatcher watcher = new GeoCoordinateWatcher();
-                watcher.Start();
+        private static readonly HttpClient httpClient = CreateHttpClient();
+        private static GeoCoordinate cachedCoordinate;
+        private static readonly object coordinateLock = new object();
 
-                // Wait for a valid position fix
-                while (watcher.Position.Location.IsUnknown)
-                {
-                    System.Threading.Thread.Sleep(100); // Short delay for position acquisition
-                }
-                return watcher.Position.Location.Latitude;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"An error occurred while retrieving latitude: {ex.Message}");
-                return 0.0; // Return a placeholder value if an error occurs
-            }
+        private static HttpClient CreateHttpClient()
+        {
+            var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+            client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("MyPersonalAssistantApp", "1.0"));
+            return client;
         }
 
-        public async Task<double> GetLongitude()
+        public async Task<double> GetLatitude() => (await GetCoordinateAsync()).Latitude;
+
+        public async Task<double> GetLongitude() => (await GetCoordinateAsync()).Longitude;
+
+        private Task<GeoCoordinate> GetCoordinateAsync()
         {
-            try
+            lock (coordinateLock)
             {
-                // Implement logic to retrieve latitude using GeoCoordinateWatcher
-                GeoCoordinateWatcher watcher = new GeoCoordinateWatcher();
-                watcher.Start();
-
-                // Wait for a valid position fix
-                while (watcher.Position.Location.IsUnknown)
+                if (cachedCoordinate != null && !cachedCoordinate.IsUnknown)
                 {
-                    System.Threading.Thread.Sleep(100); // Short delay for position acquisition
+                    return Task.FromResult(cachedCoordinate);
                 }
+            }
 
-                return watcher.Position.Location.Longitude;
-            }
-            catch (Exception ex)
+            var tcs = new TaskCompletionSource<GeoCoordinate>();
+            var watcher = new GeoCoordinateWatcher(GeoPositionAccuracy.Default);
+
+            EventHandler<GeoPositionChangedEventArgs<GeoCoordinate>> onChanged = null;
+            EventHandler<GeoPositionStatusChangedEventArgs> onStatus = null;
+            Timer timeoutTimer = null;
+
+            void Cleanup()
             {
-                Console.WriteLine($"An error occurred while retrieving longitude: {ex.Message}");
-                return 0.0; // Return a placeholder value if an error occurs
+                watcher.PositionChanged -= onChanged;
+                watcher.StatusChanged -= onStatus;
+                timeoutTimer?.Dispose();
+                try { watcher.Stop(); } catch { }
+                watcher.Dispose();
             }
+
+            onChanged = (s, e) =>
+            {
+                if (e.Position.Location.IsUnknown) return;
+                lock (coordinateLock) { cachedCoordinate = e.Position.Location; }
+                Cleanup();
+                tcs.TrySetResult(e.Position.Location);
+            };
+
+            onStatus = (s, e) =>
+            {
+                // Disabled is the only terminal failure — it means no location
+                // providers are available at all. NoData / Initializing are
+                // expected transient states during startup; we just wait through
+                // them for PositionChanged to fire.
+                if (e.Status == GeoPositionStatus.Disabled)
+                {
+                    Cleanup();
+                    tcs.TrySetException(new InvalidOperationException(
+                        "Location service is disabled. Enable Windows Location Services in Settings."));
+                }
+            };
+
+            watcher.PositionChanged += onChanged;
+            watcher.StatusChanged += onStatus;
+            watcher.Start();
+
+            // Cap the wait so the assistant doesn't hang forever if GPS / network
+            // location never produces a fix (e.g., no internet on a desktop).
+            timeoutTimer = new Timer(_ =>
+            {
+                Cleanup();
+                tcs.TrySetException(new InvalidOperationException(
+                    "Timed out waiting for a location fix (15s)."));
+            }, null, TimeSpan.FromSeconds(15), Timeout.InfiniteTimeSpan);
+
+            return tcs.Task;
         }
 
         public async Task<string> GetCity()
         {
             try
             {
-                double latitude = await GetLatitude();
-                double longitude = await GetLongitude();
+                var coord = await GetCoordinateAsync();
+                string url = $"https://nominatim.openstreetmap.org/reverse?format=json&lat={coord.Latitude}&lon={coord.Longitude}";
 
-                string url = $"https://nominatim.openstreetmap.org/reverse?format=json&lat={latitude}&lon={longitude}";
-
-                using (var httpClient = new HttpClient())
+                using (var response = await httpClient.GetAsync(url))
                 {
-                    httpClient.DefaultRequestHeaders.Add("User-Agent", "MyPersonalAssistantApp/1.0");
-                    using (var response = await httpClient.GetAsync(url))
+                    if (!response.IsSuccessStatusCode)
                     {
-                        if (response.IsSuccessStatusCode)
-                        {
-
-                            string jsonResponse = await response.Content.ReadAsStringAsync();
-                            return ParseCityFromResponse(jsonResponse); // Parse city from JSON response
-                        }
-                        else
-                        {
-                            Console.WriteLine($"Error retrieving city information: {response.StatusCode}");
-                            return ""; // Return empty string on error
-                        }
+                        Console.WriteLine($"Error retrieving city information: {response.StatusCode}");
+                        return string.Empty;
                     }
+                    string json = await response.Content.ReadAsStringAsync();
+                    return ParseCityFromResponse(json);
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"An error occurred while retrieving city: {ex.Message}");
-                return ""; // Return empty string on error
+                return string.Empty;
             }
         }
 
@@ -92,43 +118,29 @@ namespace Personal_Assistant.Geolocator
         {
             try
             {
-                // Parse the JSON response to extract city information (OpenStreetMap Nominatim format)
-                dynamic jsonObject = JsonConvert.DeserializeObject(jsonResponse);
+                using (var doc = JsonDocument.Parse(jsonResponse))
+                {
+                    if (!doc.RootElement.TryGetProperty("address", out var address))
+                    {
+                        Console.WriteLine("Address object not found in the response.");
+                        return string.Empty;
+                    }
 
-                // Assuming address is an object containing components
-                if (jsonObject.address != null) // Check if address object exists
-                {
-                    var village = jsonObject.address.village; // Access village property
-                    var city = jsonObject.address.city; // Access city property
-                    var town = jsonObject.address.town; // Access town property
-                    if (village != null) // Check if village property exists
+                    foreach (var key in new[] { "village", "city", "town" })
                     {
-                        return village; // Return village name
+                        if (address.TryGetProperty(key, out var value) && value.ValueKind == JsonValueKind.String)
+                        {
+                            return value.GetString();
+                        }
                     }
-                    else if (city != null)
-                    {
-                        return city;
-                    }
-                    else if (town != null)
-                    {
-                        return town;
-                    }
-                    else
-                    {
-                        Console.WriteLine("Village/City/Town information not found in the response.");
-                    }
-                }
-                else
-                {
-                    Console.WriteLine("Address object not found in the response.");
+                    Console.WriteLine("Village/City/Town information not found in the response.");
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error parsing city information from response: {ex.Message}");
             }
-
-            return ""; // Return empty string if city cannot be parsed
+            return string.Empty;
         }
     }
 }
