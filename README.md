@@ -32,6 +32,7 @@ My Personal Voice Assistant!
 ## Roadmap
 
 - [x] Ability to interrupt L.A.I.T.H
+- [ ] Multi-turn context/memory
   
 ## Acknowledgements
 
