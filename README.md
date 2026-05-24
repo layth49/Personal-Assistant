@@ -33,6 +33,7 @@ My Personal Voice Assistant!
 
 - [x] Ability to interrupt L.A.I.T.H
 - [ ] Multi-turn context/memory
+- [ ] Give L.A.I.T.H. computer control
   
 ## Acknowledgements
 
