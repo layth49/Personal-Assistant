@@ -1,5 +1,6 @@
-﻿using Microsoft.CognitiveServices.Speech; // Library for text-to-speech functionality
+﻿using Microsoft.CognitiveServices.Speech;
 using Microsoft.CognitiveServices.Speech.Audio;
+using Personal_Assistant.TTSClient;
 using Python.Runtime;
 using System;
 using System.IO;
@@ -23,6 +24,8 @@ namespace Personal_Assistant.SpeechManager
         dynamic text_display = Py.Import("SpeechBubble");
 
         private PyDict state;
+
+        private readonly KokoroTTSService kokoroTTS = new KokoroTTSService();
 
         public SpeechService()
         {
@@ -52,8 +55,6 @@ namespace Personal_Assistant.SpeechManager
             }
         }
 
-        // Got this beautiful method from https://bit.ly/3GVo2r1
-        // This method handles the speech-to-text conversion result
         public void ConvertSpeechToText(SpeechRecognitionResult speechRecognitionResult)
         {
             switch (speechRecognitionResult.Reason)
@@ -62,7 +63,7 @@ namespace Personal_Assistant.SpeechManager
                     Console.WriteLine($"RECOGNIZED: {speechRecognitionResult.Text}");
                     break;
                 case ResultReason.NoMatch:
-                    SpeechBubble("","Sorry I didn't get that. Can you say it again?");
+                    SpeechBubble("", "Sorry I didn't get that. Can you say it again?");
                     SynthesizeTextToSpeech("Sorry I didn't get that. Can you say it again?");
                     break;
                 case ResultReason.Canceled:
@@ -79,42 +80,29 @@ namespace Personal_Assistant.SpeechManager
             }
         }
 
-        // Got this beautiful method from https://bit.ly/3GVnSjc
-        // This method handles the text-to-speech synthesis
         public async Task SynthesizeTextToSpeech(string textToSynthesize)
         {
-            // Creates an instance of a speech config with specified subscription key and service region.
-            SpeechConfig config = SpeechConfig.FromSubscription(speechKey, speechRegion);
-
-            // I liked this voice but you can look for others on https://bit.ly/3ttEGuH
-            config.SpeechSynthesisVoiceName = "en-US-AndrewMultilingualNeural";
-
-            // Use the default speaker as audio output
-            using (SpeechSynthesizer synthesizer = new SpeechSynthesizer(config))
+            try
             {
-                using (SpeechSynthesisResult result = await synthesizer.SpeakTextAsync(textToSynthesize))
+                await kokoroTTS.SpeakAsync(textToSynthesize);
+            }
+            finally
+            {
+                // Retract the speech bubble once playback completes (or fails)
+                if (state != null)
                 {
-                    // This is to close the speech bubble after the text is spoken
                     using (Py.GIL())
                     {
                         var pyFalse = PythonEngine.Eval("False");
                         state.SetItem("running", pyFalse);
                     }
-
-                    if (result.Reason == ResultReason.Canceled)
-                    {
-                        SpeechSynthesisCancellationDetails cancellation = SpeechSynthesisCancellationDetails.FromResult(result);
-                        Console.WriteLine($"CANCELED: Reason={cancellation.Reason}");
-
-                        if (cancellation.Reason == CancellationReason.Error)
-                        {
-                            Console.WriteLine($"CANCELED: ErrorCode={cancellation.ErrorCode}");
-                            Console.WriteLine($"CANCELED: ErrorDetails=[{cancellation.ErrorDetails}]");
-                            Console.WriteLine($"CANCELED: Did you update the subscription info?");
-                        }
-                    }
                 }
             }
+        }
+
+        public void StopSpeaking()
+        {
+            kokoroTTS.StopSpeaking();
         }
 
 

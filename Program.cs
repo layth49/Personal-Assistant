@@ -1,6 +1,6 @@
 ﻿using Microsoft.CognitiveServices.Speech;
 using Personal_Assistant.Arduino;
-using Personal_Assistant.GeminiClient;
+using Personal_Assistant.LLMClient;
 using Personal_Assistant.Geolocator;
 using Personal_Assistant.LightAutomator;
 using Personal_Assistant.PlaystationController;
@@ -10,15 +10,12 @@ using Personal_Assistant.SpeechManager;
 using Personal_Assistant.WeatherService;
 using Python.Runtime;
 using System;
-using System.IO;
-using System.Text.Json;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Runtime.InteropServices;
-using System.Threading;
-using System.Threading.Tasks;
-using WindowsInput;
+using System.IO;
 using System.Linq;
+using System.Text.Json;
+using System.Threading.Tasks;
 
 namespace Personal_Assistant
 {
@@ -29,23 +26,59 @@ namespace Personal_Assistant
         public static string ipAddressPlug = Environment.GetEnvironmentVariable("IP_ADDRESS:PLUG");
         public static string ipAddressSwitch = Environment.GetEnvironmentVariable("IP_ADDRESS:SWITCH");
 
-        public static string recognizedText = string.Empty; // Variable to store the recognized text
+        public static string recognizedText = string.Empty;
 
-        [DllImport("user32.dll")]
-        private static extern bool SetForegroundWindow(IntPtr hWnd);
+        private static readonly string[] morningGreetings =
+        {
+            "Good morning! What can I do for you?",
+            "Morning! How can I assist you today?",
+            "Rise and shine! What's on your agenda?",
+            "Good morning! How can I help?",
+            "Morning! What's up?"
+        };
 
-        // Inform the user that environment variables are required and how to set them
+        private static readonly string[] afternoonGreetings =
+        {
+            "Good afternoon! What can I do for you?",
+            "Afternoon! How can I help?",
+            "Hi! What's up?",
+            "Good afternoon! I'm here to assist you.",
+            "Hope you're having a great afternoon! How can I help?",
+            "Hello there! What can I do for you this afternoon?"
+        };
+
+        private static readonly string[] eveningGreetings =
+        {
+            "Good evening! What can I do for you?",
+            "Evening! How can I help?",
+            "Hi! What's up?",
+            "Good evening! I'm here to assist you.",
+            "Hope your evening is going well! What can I do for you?",
+            "Hello! How can I help you this evening?"
+        };
+
+        private static readonly string[] nightGreetings =
+        {
+            "Good night! How can I assist you?",
+            "Hi there! How can I help you tonight?",
+            "Hello! What do you need this late?",
+            "Good night! I'm here if you need anything.",
+            "Hope you're having a peaceful night. How can I assist?"
+        };
+
+        private static readonly Random random = new Random();
+
         static void CheckEnvironmentVariables()
         {
-            if (string.IsNullOrEmpty(GeminiService.geminiApiKey) || string.IsNullOrEmpty(SpeechService.speechKey) || string.IsNullOrEmpty(SpeechService.speechRegion) || string.IsNullOrEmpty(weatherAPIKey))
+            if (string.IsNullOrEmpty(SpeechService.speechKey) ||
+                string.IsNullOrEmpty(SpeechService.speechRegion) ||
+                string.IsNullOrEmpty(weatherAPIKey))
             {
                 Console.WriteLine("Error: Please set the following environment variables before running the program:");
-                Console.WriteLine("  - GEMINIAPI_KEY: Your Gemini API key");
                 Console.WriteLine("  - SPEECH_KEY: Your Cognitive Services Speech API subscription key");
                 Console.WriteLine("  - SPEECH_REGION: Your Cognitive Services Speech API service region (e.g., westus)");
                 Console.WriteLine("  - WEATHERAPI_KEY: Your OpenWeatherMap API Key");
                 Console.WriteLine("You can set them using the following commands (replace 'your_key' with your actual keys):");
-                Console.WriteLine("  - setx GEMINIAPI_KEY your_gemini_key");
                 Console.WriteLine("  - setx SPEECH_KEY your_speech_key");
                 Console.WriteLine("  - setx SPEECH_REGION your_speech_region");
                 Console.WriteLine("  - setx WEATHERAPI_KEY your_weatherapi_key");
@@ -54,411 +87,270 @@ namespace Personal_Assistant
             }
         }
 
-        // Here's the Main method where we put everything together
-        public async static Task Main()
+        private static string PickGreeting(int hour)
         {
-            CheckEnvironmentVariables(); // Ensure required environment variables are set
+            string[] pool;
+            if (hour < 12) pool = morningGreetings;
+            else if (hour < 18) pool = afternoonGreetings;
+            else if (hour < 21) pool = eveningGreetings;
+            else pool = nightGreetings;
+            return pool[random.Next(pool.Length)];
+        }
+
+        public static async Task Main()
+        {
+            CheckEnvironmentVariables();
 
             // 49 (ASCII art)
             Console.WriteLine("                                    \r\n     ,AM  .d*\"*bg.\r\n    AVMM 6MP    Mb\r\n  ,W' MM YMb    MM\r\n,W'   MM  `MbmmdM9\r\nAmmmmmMMmm     .M'\r\n      MM     .d9  \r\n      MM   m\"'    \n\n");
 
-            // Initializing code
-            InputSimulator simulator = new InputSimulator();
-
             Runtime.PythonDLL = @"..\..\..\..\AppData\Local\Programs\Python\Python312\python312.dll";
             PythonEngine.Initialize();
+            PythonEngine.BeginAllowThreads();
 
-            dynamic sys = Py.Import("sys");
-            sys.path.append(@"..\..\");
+            using (Py.GIL())
+            {
+                dynamic sys = Py.Import("sys");
+                sys.path.append(@"..\..\");
+            }
 
-
-            SpeechService speechManager = new SpeechService();
-
-            // Create a speech recognizer
+            // Single-instance services. Speech recognizer and synthesizer reuse
+            // websocket connections, so creating them once cuts handshake latency.
+            var speechManager = new SpeechService();
+            await speechManager.WarmUpAudioAsync(); // wakes the audio device so first greeting isn't clipped
             var speechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
-
             var phraseList = PhraseListGrammar.FromRecognizer(speechRecognizer);
 
-
-            Dictionary<string, string> contacts = null;
-
-            var contactsPath = Environment.GetEnvironmentVariable("CONTACTS_PATH");
-            if (contactsPath != null && File.Exists(contactsPath))
+            var contacts = LoadContacts();
+            if (contacts != null)
             {
-                var json = File.ReadAllText(contactsPath);
-                contacts = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+                foreach (var phrase in contacts.Keys)
+                {
+                    phraseList.AddPhrase(phrase);
+                }
             }
 
-            var phrases = contacts.Keys.ToList();
-
-            foreach (var phrase in phrases)
-            {
-                phraseList.AddPhrase(phrase);
-            }
+            var location = new GetLocation();
+            var weather = new GetWeather(weatherAPIKey);
+            var lightControl = new LightControl();
+            var playstationControl = new PlaystationControl();
+            var smsControl = new SMSControl();
+            var arduino = new ArduinoService();
 
             while (true)
             {
-                // More initialization code
-
                 int hour = DateTime.Now.Hour;
 
+                await speechManager.KeywordRecognizer();
+                Console.WriteLine($"[loop] KeywordRecognizer awaited returned at {DateTime.Now:HH:mm:ss.fff}");
 
-                // Gets the location of user using the Geolocator class
-                GetLocation location = new GetLocation();
+                string greeting = PickGreeting(hour);
+                Console.WriteLine($"[loop] about to call Say at {DateTime.Now:HH:mm:ss.fff}");
+                await speechManager.Say("Hey 49", greeting);
 
-                // Preloading the weather to get faster response time
-                GetWeather weather = new GetWeather(weatherAPIKey);
-
-                LightControl lightControl = new LightControl();
-
-                PlaystationControl playstationControl = new PlaystationControl();
-
-                SMSControl smsControl = new SMSControl();
-
-                ArduinoService arduino = new ArduinoService();
-
-
-                // Waits for keyword ("Hey 49")
-                speechManager.KeywordRecognizer().GetAwaiter().GetResult();
-
-
-                Random random = new Random();
-
-                // Greet the user based on the time of day
-                // Before 12 PM
-                if (hour <= 12)
-                {
-                    string[] morningGreetings = new string[] 
-                    {
-                        "Good morning! What can I do for you?",
-                        "Morning! How can I assist you today?",
-                        "Rise and shine! What's on your agenda?",
-                        "Good morning! How can I help?",
-                        "Morning! What's up?"
-                    };
-                    string greeting = morningGreetings[random.Next(morningGreetings.Length)];
-
-                    speechManager.SynthesizeTextToSpeech(greeting);
-                    speechManager.SpeechBubble("Hey 49", greeting);
-                }
-
-
-                // Between 12 PM and 6 PM
-                else if (hour > 12 && hour <= 18)
-                {
-                    string[] afternoonGreetings = new string[] 
-                    {
-                        "Good afternoon! What can I do for you?",
-                        "Afternoon! How can I help?",
-                        "Hi! What's up?",
-                        "Good afternoon! I'm here to assist you.",
-                        "Hope you're having a great afternoon! How can I help?",
-                        "Hello there! What can I do for you this afternoon?"
-                    };
-                    string greeting = afternoonGreetings[random.Next(afternoonGreetings.Length)];
-
-                    speechManager.SynthesizeTextToSpeech(greeting);
-                    speechManager.SpeechBubble("Hey 49", greeting);
-                }
-
-
-                // Between 6 PM and 9 PM
-                else if (hour >= 18 && hour <= 21)
-                {
-                    string[] eveningGreetings = new string[] 
-                    {
-                        "Good evening! What can I do for you?",
-                        "Evening! How can I help?",
-                        "Hi! What's up?",
-                        "Good evening! I'm here to assist you.",
-                        "Hope your evening is going well! What can I do for you?",
-                        "Hello! How can I help you this evening?"
-                    };
-                    string greeting = eveningGreetings[random.Next(eveningGreetings.Length)];
-
-                    speechManager.SynthesizeTextToSpeech(greeting);
-                    speechManager.SpeechBubble("Hey 49", greeting);
-                }
-
-
-                // After 9 PM
-                else
-                {
-                   string[] nightGreetings = new string[]
-                   {
-                        "Good night! How can I assist you?",
-                        "Hi there! How can I help you tonight?",
-                        "Hello! What do you need this late?",
-                        "Good night! I'm here if you need anything.",
-                        "Hope you're having a peaceful night. How can I assist?"
-                   };
-                    string greeting = nightGreetings[random.Next(nightGreetings.Length)];
-
-                    speechManager.SynthesizeTextToSpeech(greeting);
-                    speechManager.SpeechBubble("Hey 49", greeting);
-                }
-
-                // Recognize microphone input
-                var speechRecognitionResult = speechRecognizer.RecognizeOnceAsync().GetAwaiter().GetResult();
+                var speechRecognitionResult = await speechRecognizer.RecognizeOnceAsync();
                 speechManager.ConvertSpeechToText(speechRecognitionResult);
 
+                recognizedText = speechRecognitionResult.Text ?? string.Empty;
+                string lower = recognizedText.ToLower();
 
-                // Use the recognized text
-                recognizedText = speechRecognitionResult.Text;
-                string lowercaseRecognizedText = recognizedText.ToLower();
-
-                // Explain himself
-                if (lowercaseRecognizedText == "who are you?")
+                if (lower == "who are you?")
                 {
-                    speechManager.SynthesizeTextToSpeech("hhi! I'm layth 49, your own personal assistant!");
-                    speechManager.SpeechBubble(recognizedText, "Hi! I'm L.A.I.T.H.49, your own personal assistant!");
+                    await speechManager.Say(recognizedText, "Hi! I'm L.A.I.T.H.49, your own personal assistant!");
                 }
-
-
-                // Close the assistant
-                else if (lowercaseRecognizedText.Contains("exit"))
+                else if (lower.Contains("exit"))
                 {
-                    speechManager.SynthesizeTextToSpeech("Alright goodbye!");
-                    speechManager.SpeechBubble(recognizedText, "Alright goodbye!");
-
+                    await speechManager.Say(recognizedText, "Alright goodbye!");
                     PythonEngine.Shutdown();
                     Environment.Exit(0);
                 }
-
-
-                // Nevermind
-                else if (lowercaseRecognizedText.Contains("never mind"))
+                else if (lower.Contains("never mind") || lower.Contains("nevermind"))
                 {
-                    speechManager.SynthesizeTextToSpeech("Okay! Let me know if you need anything else.");
-                    speechManager.SpeechBubble(recognizedText, "Okay! Let me know if you need anything else.");
+                    await speechManager.Say(recognizedText, "Okay! Let me know if you need anything else.");
                 }
-
-
-                // What time is it?
-                else if (lowercaseRecognizedText == "what time is it?" || lowercaseRecognizedText == "what's the time?")
+                else if (lower == "what time is it?" || lower == "what's the time?")
                 {
-                    DateTime time = DateTime.Now.ToLocalTime();
-                    string response = $"It's {time:t}";
-
-                    speechManager.SynthesizeTextToSpeech(response);
-                    speechManager.SpeechBubble(recognizedText, response);
+                    await speechManager.Say(recognizedText, $"It's {DateTime.Now.ToLocalTime():t}");
                 }
-
-
-                // What day is it?
-                else if (lowercaseRecognizedText == "what day is it?")
+                else if (lower == "what day is it?")
                 {
-                    DateTime today = DateTime.Now.Date;
-                    string response = $"It's {today:D}";
-
-                    speechManager.SynthesizeTextToSpeech(response);
-                    speechManager.SpeechBubble(recognizedText, response);
+                    await speechManager.Say(recognizedText, $"It's {DateTime.Now.Date:D}");
                 }
-
-
-                // Search up something
-                else if (lowercaseRecognizedText.StartsWith("search up") || lowercaseRecognizedText.StartsWith("google"))
+                else if (lower.StartsWith("search up") || lower.StartsWith("google"))
                 {
-                    string query = recognizedText.Contains("search up") ? recognizedText.Remove(0, "search up".Length).TrimEnd('.', '?') : recognizedText.Remove(0, "google".Length).TrimEnd('.');
+                    string prefix = lower.StartsWith("search up") ? "search up" : "google";
+                    string query = recognizedText.Substring(prefix.Length).Trim().TrimEnd('.', '?');
 
-                    speechManager.SynthesizeTextToSpeech($"Okay! Searching up {query} now");
-                    speechManager.SpeechBubble(recognizedText, $"Okay! Searching up {query} now");
-
-                    Process.Start("https://www.google.com/search?q=" + query);
+                    await speechManager.Say(recognizedText, $"Okay! Searching up {query} now");
+                    Process.Start("https://www.google.com/search?q=" + Uri.EscapeDataString(query));
                 }
-
-
-                // Open YouTube
-                else if (lowercaseRecognizedText.Contains("youtube"))
+                else if (lower.Contains("youtube"))
                 {
-                    speechManager.SynthesizeTextToSpeech("Okay! Would you like a specific video or to just open it?");
-                    speechManager.SpeechBubble(recognizedText, "Okay! Would you like a specific video or to just open it?");
-
-                    SpeechRecognizer confirmationSpeechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
-                    SpeechRecognitionResult confirmationResult = confirmationSpeechRecognizer.RecognizeOnceAsync().GetAwaiter().GetResult();
-                    speechManager.ConvertSpeechToText(confirmationResult);
-                    string confirmation = confirmationResult.Text.ToLower();
-
-                    // Search for a specific video
-                    if (confirmation.StartsWith("search for") || confirmation.StartsWith("search up"))
-                    {
-                        string query = confirmation.Contains("search up") ? confirmation.Remove(0, "search up ".Length).TrimEnd('.') : confirmation.Remove(0, "search for ".Length).TrimEnd('.');
-
-                        speechManager.SynthesizeTextToSpeech($"Ok! Searching for {query} now");
-                        speechManager.SpeechBubble(recognizedText, $"Ok! Searching for {query} now");
-
-                        Process.Start($"https://www.youtube.com/results?search_query={query.Replace(" ", "+")}");
-                    }
-
-                    // Just open YouTube
-                    else if (confirmation.Contains("open"))
-                    {
-                        speechManager.SynthesizeTextToSpeech("Okay! Opening Youtube now.");
-                        speechManager.SpeechBubble(recognizedText, "Okay! Opening YouTube now.");
-
-                        Process.Start("https://www.youtube.com");
-                    }
-                    // Don't open YouTube
-                    else if (lowercaseRecognizedText.Contains("nevermind") || lowercaseRecognizedText.Contains("never mind"))
-                    {
-                        speechManager.SynthesizeTextToSpeech("Okay! Let me know if you need anything else.");
-                        speechManager.SpeechBubble(recognizedText, "Okay! Let me know if you need anything else.");
-                    }
+                    await HandleYouTubeAsync(speechManager);
                 }
-
-
-                // Open IDE
-                else if (lowercaseRecognizedText.Contains("visual studio") || lowercaseRecognizedText.Contains("code") || lowercaseRecognizedText.Contains("coding"))
+                else if (lower.Contains("visual studio") || lower.Contains("code") || lower.Contains("coding"))
                 {
-                    speechManager.SynthesizeTextToSpeech("Okay! Opening Visual Studio now.");
-                    speechManager.SpeechBubble(recognizedText, "Okay! Opening Visual Studio now.");
-
+                    await speechManager.Say(recognizedText, "Okay! Opening Visual Studio now.");
                     Process.Start("devenv");
                 }
-
-
-                // Turn on PS5
-                else if (lowercaseRecognizedText.Contains("turn on") && (lowercaseRecognizedText.Contains("playstation") || lowercaseRecognizedText.Contains("ps-5")))
+                else if (lower.Contains("turn on") && (lower.Contains("playstation") || lower.Contains("ps-5")))
                 {
-                    playstationControl.TurnOnPlaystation();
+                    await playstationControl.TurnOnPlaystation();
                 }
-
-
-                // Light control
-                else if (lowercaseRecognizedText.Contains("turn on") && lowercaseRecognizedText.Contains("light"))
+                else if (lower.Contains("turn on") && lower.Contains("light"))
                 {
-                    if (lowercaseRecognizedText.Contains("led"))
-                    {
-                        lightControl.TurnOnLights("LED", ipAddressPlug);
-                    }
-                    else if (lowercaseRecognizedText.Contains("bedroom"))
-                    {
-                        lightControl.TurnOnLights("bedroom", ipAddressSwitch);
-                    }
+                    if (lower.Contains("led")) await lightControl.TurnOnLights("LED", ipAddressPlug);
+                    else if (lower.Contains("bedroom")) await lightControl.TurnOnLights("bedroom", ipAddressSwitch);
                 }
-                else if (lowercaseRecognizedText.Contains("turn off") && lowercaseRecognizedText.Contains("light"))
+                else if (lower.Contains("turn off") && lower.Contains("light"))
                 {
-                    if (lowercaseRecognizedText.Contains("led"))
-                    {
-                        lightControl.TurnOffLights("LED", ipAddressPlug);
-                    }
-                    else if (lowercaseRecognizedText.Contains("bedroom"))
-                    {
-                        lightControl.TurnOffLights("bedroom", ipAddressSwitch);
-                    }
+                    if (lower.Contains("led")) await lightControl.TurnOffLights("LED", ipAddressPlug);
+                    else if (lower.Contains("bedroom")) await lightControl.TurnOffLights("bedroom", ipAddressSwitch);
                 }
-
-
-                // Weather
-                else if (lowercaseRecognizedText.Contains("weather"))
+                else if (lower.Contains("weather"))
+                {
+                    try { await weather.GetWeatherData(); }
+                    catch (Exception ex) { Console.WriteLine("An error occurred: " + ex.Message); }
+                }
+                else if (lower.Contains("pray times") || lower.Contains("prayer times"))
                 {
                     try
                     {
-                        weather.GetWeatherData().GetAwaiter().GetResult();
+                        double latitude = await location.GetLatitude();
+                        double longitude = await location.GetLongitude();
+                        var prayerTimesLogic = new GetPrayerTimes(latitude, longitude);
+                        await prayerTimesLogic.AnnouncePrayerTimes(DateTime.Now);
                     }
-                    catch (Exception ex)
+                    catch (InvalidOperationException ex)
                     {
-                        Console.WriteLine("An error occurred: " + ex.Message);
+                        Console.WriteLine($"Location lookup failed: {ex.Message}");
+                        await speechManager.Say(recognizedText,
+                            "Sorry, I couldn't get your location. Make sure Windows location services are enabled.");
                     }
                 }
-
-
-                // Prayer times
-                else if (lowercaseRecognizedText.Contains("pray times") || lowercaseRecognizedText.Contains("prayer times"))
+                else if (contacts != null && TryMatchContact(contacts, lower, out string contactName, out string contactNumber))
                 {
-                    double latitude = location.GetLatitude().Result;
-                    double longitude = location.GetLongitude().Result;
-
-                    GetPrayerTimes prayerTimesLogic = new GetPrayerTimes(latitude, longitude);
-
-                    prayerTimesLogic.AnnouncePrayerTimes(DateTime.Now).GetAwaiter().GetResult();
+                    await smsControl.SendSMS(contactName, contactNumber);
                 }
-
-
-                // Send Text Messages
-                else if (contacts.Keys.Any(name => lowercaseRecognizedText.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0) || lowercaseRecognizedText.Contains("leith"))
-                //     ^^^           This looks to see if the recognized text contains a contact name                     ^^^
+                else if (lower.Contains("door"))
                 {
-                    string contactName = null;
-                    string contactNumber = null;
-
-                    foreach (var name in contacts.Keys)
+                    if (lower.Contains("open"))
                     {
-                        if (lowercaseRecognizedText.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            contactName = name;
-                            contactNumber = contacts[name];
-                            break;
-                        }
+                        await arduino.ArduinoCommunication("OPEN");
+                        await speechManager.Say(recognizedText, "Okay! Opening your door now.");
                     }
-
-                    if (contactName != null && contactNumber != null)
+                    else if (lower.Contains("close"))
                     {
-                        smsControl.SendSMS(contactName, contactNumber);
+                        await arduino.ArduinoCommunication("CLOSE");
+                        await speechManager.Say(recognizedText, "Okay! Closing your door now.");
                     }
                 }
-
-
-                // Door Control
-                else if (lowercaseRecognizedText.Contains("door")) {
-
-                    if (lowercaseRecognizedText.Contains("open"))
-                    {
-                        arduino.ArduinoCommunication("OPEN");
-
-                        speechManager.SynthesizeTextToSpeech("Okay! Opening your door now.");
-                        speechManager.SpeechBubble(recognizedText, "Okay! Opening your door now.");
-                    }
-                    else if (lowercaseRecognizedText.Contains("close"))
-                    {
-                        arduino.ArduinoCommunication("CLOSE");
-
-                        speechManager.SynthesizeTextToSpeech("Okay! Closing your door now.");
-                        speechManager.SpeechBubble(recognizedText, "Okay! Closing your door now.");
-                    }
-                }
-
-
-                // Shut down or restart
-                else if (lowercaseRecognizedText == "shut down." || lowercaseRecognizedText == "restart.")
+                else if (lower == "shut down." || lower == "restart.")
                 {
-                    speechManager.SynthesizeTextToSpeech("Are you sure?");
-                    speechManager.SpeechBubble(recognizedText, "Are you sure?");
-
-                    SpeechRecognizer confirmationSpeechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
-                    SpeechRecognitionResult confirmationResult = confirmationSpeechRecognizer.RecognizeOnceAsync().GetAwaiter().GetResult();
-                    speechManager.ConvertSpeechToText(confirmationResult);
-
-                    string action = lowercaseRecognizedText.Contains("shut down") ? "Shutting down" : "Restarting now";
-
-                    if (confirmationResult.Text.ToLower() == "yes.")
-                    {
-
-                        speechManager.SynthesizeTextToSpeech($"Ok. {action}");
-                        speechManager.SpeechBubble(confirmationResult.Text, $"Ok. {action}");
-
-                        Process.Start("shutdown", lowercaseRecognizedText.Contains("shut") ? "/s /t 0" : "/r /t 0");
-                    }
-                    else
-                    {
-                        speechManager.SynthesizeTextToSpeech($"Ok. NOT {action}");
-                        speechManager.SpeechBubble(recognizedText, $"Ok. NOT {action}");
-                        Thread.Sleep(500);
-                    }
+                    await HandleShutdownAsync(speechManager, speechRecognizer, lower);
                 }
-
-                // If the recognized text is not a command, we can use the Gemini API to generate a response
-                // Gemini API
-                else
+                else if (speechRecognitionResult.Reason != ResultReason.NoMatch)
                 {
-                    if (speechRecognitionResult.Reason != ResultReason.NoMatch)
-                    {
-                        string geminiResponse = GeminiService.GenerateGeminiResponse(recognizedText).GetAwaiter().GetResult();
-
-                        speechManager.SynthesizeTextToSpeech(geminiResponse);
-                        speechManager.SpeechBubble(recognizedText, geminiResponse);
-                    }
+                    string llmResponse = await LocalLLMService.GenerateResponse(recognizedText);
+                    await speechManager.Say(recognizedText, llmResponse);
                 }
+            }
+        }
+
+        private static Dictionary<string, string> LoadContacts()
+        {
+            var contactsPath = Environment.GetEnvironmentVariable("CONTACTS_PATH");
+            if (string.IsNullOrEmpty(contactsPath) || !File.Exists(contactsPath))
+            {
+                return null;
+            }
+            try
+            {
+                return JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(contactsPath));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to load contacts from {contactsPath}: {ex.Message}");
+                return null;
+            }
+        }
+
+        private static bool TryMatchContact(
+            Dictionary<string, string> contacts,
+            string lower,
+            out string contactName,
+            out string contactNumber)
+        {
+            foreach (var kv in contacts)
+            {
+                if (lower.IndexOf(kv.Key, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    contactName = kv.Key;
+                    contactNumber = kv.Value;
+                    return true;
+                }
+            }
+            contactName = null;
+            contactNumber = null;
+            return false;
+        }
+
+        private static async Task HandleYouTubeAsync(SpeechService speechManager)
+        {
+            await speechManager.Say(recognizedText, "Okay! Would you like a specific video or to just open it?");
+
+            string confirmation;
+            using (var recognizer = new SpeechRecognizer(speechManager.speechConfig))
+            {
+                var result = await recognizer.RecognizeOnceAsync();
+                speechManager.ConvertSpeechToText(result);
+                confirmation = (result.Text ?? string.Empty).ToLower();
+            }
+
+            if (confirmation.StartsWith("search for") || confirmation.StartsWith("search up"))
+            {
+                string prefix = confirmation.StartsWith("search up") ? "search up " : "search for ";
+                string query = confirmation.Substring(prefix.Length).TrimEnd('.');
+                await speechManager.Say(recognizedText, $"Ok! Searching for {query} now");
+                Process.Start($"https://www.youtube.com/results?search_query={Uri.EscapeDataString(query)}");
+            }
+            else if (confirmation.Contains("open"))
+            {
+                await speechManager.Say(recognizedText, "Okay! Opening Youtube now.");
+                Process.Start("https://www.youtube.com");
+            }
+            else if (confirmation.Contains("nevermind") || confirmation.Contains("never mind"))
+            {
+                await speechManager.Say(recognizedText, "Okay! Let me know if you need anything else.");
+            }
+        }
+
+        private static async Task HandleShutdownAsync(
+            SpeechService speechManager,
+            SpeechRecognizer speechRecognizer,
+            string lower)
+        {
+            await speechManager.Say(recognizedText, "Are you sure?");
+
+            SpeechRecognitionResult confirmationResult;
+            using (var confirmRecognizer = new SpeechRecognizer(speechManager.speechConfig))
+            {
+                confirmationResult = await confirmRecognizer.RecognizeOnceAsync();
+                speechManager.ConvertSpeechToText(confirmationResult);
+            }
+
+            bool isShutdown = lower.Contains("shut down");
+            string action = isShutdown ? "Shutting down" : "Restarting now";
+
+            if (string.Equals(confirmationResult.Text?.TrimEnd('.'), "yes", StringComparison.OrdinalIgnoreCase))
+            {
+                await speechManager.Say(confirmationResult.Text, $"Ok. {action}");
+                Process.Start("shutdown", isShutdown ? "/s /t 0" : "/r /t 0");
+            }
+            else
+            {
+                await speechManager.Say(recognizedText, $"Ok. NOT {action}");
+                await Task.Delay(500);
             }
         }
     }
