@@ -29,9 +29,55 @@ My Personal Voice Assistant!
 - Turn off/Restart my computer
 
 
+## Local stack (this branch)
+
+This branch runs entirely on-device — no Azure / Gemini keys required:
+
+| Service | Replaces | Default port |
+|---|---|---|
+| LM Studio | Gemini 2.5 Flash | 1234 |
+| SearxNG (Docker) | Gemini search grounding | 8080 |
+| faster-whisper-server (Docker) | Azure Speech-to-Text | 8000 |
+| Kokoro-FastAPI (Docker) | Azure Neural TTS | 8880 |
+
+Wake-word detection (`Hey 49`) still uses the on-device Azure `KeywordRecognizer` — no cloud calls.
+
+### Prerequisites
+
+- Docker Desktop (WSL 2 backend) + NVIDIA Container Toolkit for GPU passthrough
+- LM Studio with `Llama-3.1-8B-Instruct-GGUF` (Q4_K_M) downloaded
+- Python 3.12 + the packages in [requirements.txt](requirements.txt)
+
+### Start
+
+```powershell
+docker compose up -d   # faster-whisper, Kokoro, SearxNG
+# Then launch LM Studio and start its local server (port 1234)
+```
+
+Full setup notes, verification curls, and GPU memory budget: [local-stack.md](local-stack.md).
+
+### Environment variables
+
+Required: `WEATHERAPI_KEY` (OpenWeatherMap).
+
+Optional (defaults shown):
+- `LMSTUDIO_URL` — `http://localhost:1234/v1`
+- `SEARXNG_URL` — `http://localhost:8080`
+- `WHISPER_URL` — `http://localhost:8000`
+- `WHISPER_MODEL` — `Systran/faster-whisper-large-v3`
+- `KOKORO_URL` — `http://localhost:8880`
+- `KOKORO_VOICE` — `am_onyx`
+- `IP_ADDRESS:PLUG`, `IP_ADDRESS:SWITCH` — TP-Link Kasa endpoints
+- `CONTACTS_PATH` — JSON file mapping contact names → phone numbers
+
+`SPEECH_KEY`, `SPEECH_REGION`, `GEMINIAPI_KEY` are **not used** on this branch.
+
 ## Roadmap
 
-- [ ] Ability to interrupt L.A.I.T.H
+- [x] Ability to interrupt L.A.I.T.H
+- [ ] Multi-turn context/memory
+- [ ] Give L.A.I.T.H. computer control
   
 ## Acknowledgements
 

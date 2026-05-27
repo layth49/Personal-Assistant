@@ -1,0 +1,24 @@
+use_default_settings: true
+
+server:
+  # Regenerate with: `openssl rand -hex 32`
+  secret_key: "replace-me-with-a-random-32-byte-hex-string"
+  # Disable both the rate limiter and the public-instance bot detector — the
+  # latter blocks JSON API calls with non-browser User-Agents and 403s them
+  # even when `limiter` alone is off.
+  limiter: false
+  public_instance: false
+  image_proxy: true
+  bind_address: "0.0.0.0"
+  port: 8080
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+ui:
+  static_use_hash: true

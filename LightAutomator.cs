@@ -1,36 +1,33 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
+using System.Threading.Tasks;
 using Personal_Assistant.SpeechManager;
 
 namespace Personal_Assistant.LightAutomator
 {
     public class LightControl
     {
-        SpeechService speechManager = new SpeechService();
+        private readonly SpeechService speechManager = new SpeechService();
 
-        public void TurnOnLights(string lightName, string ipAddress)
+        public async Task TurnOnLights(string lightName, string ipAddress)
         {
-            Process cmd = new Process();
-            cmd.StartInfo.CreateNoWindow = true;
-            cmd.StartInfo.UseShellExecute = false;
-            cmd.StartInfo.FileName = "cmd.exe";
-            cmd.StartInfo.Arguments = $"/c kasa --host {ipAddress} on";
-            cmd.Start();
-
-            speechManager.SynthesizeTextToSpeech($"Okay! Turning your {lightName} lights on now.");
-            speechManager.SpeechBubble(Program.recognizedText, $"Ok! Turning your {lightName} lights on now.");
+            RunKasa(ipAddress, "on");
+            await speechManager.Say(Program.recognizedText, $"Okay! Turning your {lightName} lights on now.");
         }
 
-        public void TurnOffLights(string lightName, string ipAddress)
+        public async Task TurnOffLights(string lightName, string ipAddress)
         {
-            Process cmd = new Process();
+            RunKasa(ipAddress, "off");
+            await speechManager.Say(Program.recognizedText, $"Okay! Turning your {lightName} lights off now.");
+        }
+
+        private static void RunKasa(string ipAddress, string action)
+        {
+            var cmd = new Process();
             cmd.StartInfo.CreateNoWindow = true;
             cmd.StartInfo.UseShellExecute = false;
             cmd.StartInfo.FileName = "cmd.exe";
-            cmd.StartInfo.Arguments = $"/c kasa --host {ipAddress} off";
+            cmd.StartInfo.Arguments = $"/c kasa --host {ipAddress} {action}";
             cmd.Start();
-
-            speechManager.SynthesizeTextToSpeech($"Okay! Turning your {lightName} lights off now.");
-            speechManager.SpeechBubble(Program.recognizedText, $"Ok! Turning your {lightName} lights off now.");
         }
     }
 }

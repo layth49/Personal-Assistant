@@ -27,6 +27,14 @@ namespace Personal_Assistant.SearxNGClient
         {
             var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
             client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            // SearxNG botdetection requires X-Real-IP or X-Forwarded-For to identify
+            // the caller. Without one of these it immediately returns 403, regardless
+            // of the limiter setting. Sending 127.0.0.1 marks us as localhost, which
+            // the limiter.toml pass_ip list then lets through unconditionally.
+            client.DefaultRequestHeaders.Add("X-Real-IP", "127.0.0.1");
+            client.DefaultRequestHeaders.Add("X-Forwarded-For", "127.0.0.1");
+            client.DefaultRequestHeaders.UserAgent.ParseAdd(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
             return client;
         }
 

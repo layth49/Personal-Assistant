@@ -1,10 +1,10 @@
-﻿using Microsoft.CognitiveServices.Speech;
 using Personal_Assistant.Arduino;
-using Personal_Assistant.LLMClient;
 using Personal_Assistant.Geolocator;
 using Personal_Assistant.LightAutomator;
+using Personal_Assistant.LLMClient;
 using Personal_Assistant.PlaystationController;
 using Personal_Assistant.PrayerTimesCalculator;
+using Personal_Assistant.SearxNGClient;
 using Personal_Assistant.SMSController;
 using Personal_Assistant.SpeechManager;
 using Personal_Assistant.WeatherService;
@@ -13,7 +13,6 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
 
@@ -70,18 +69,19 @@ namespace Personal_Assistant
 
         static void CheckEnvironmentVariables()
         {
-            if (string.IsNullOrEmpty(SpeechService.speechKey) ||
-                string.IsNullOrEmpty(SpeechService.speechRegion) ||
-                string.IsNullOrEmpty(weatherAPIKey))
+            if (string.IsNullOrEmpty(weatherAPIKey))
             {
                 Console.WriteLine("Error: Please set the following environment variables before running the program:");
-                Console.WriteLine("  - SPEECH_KEY: Your Cognitive Services Speech API subscription key");
-                Console.WriteLine("  - SPEECH_REGION: Your Cognitive Services Speech API service region (e.g., westus)");
                 Console.WriteLine("  - WEATHERAPI_KEY: Your OpenWeatherMap API Key");
-                Console.WriteLine("You can set them using the following commands (replace 'your_key' with your actual keys):");
-                Console.WriteLine("  - setx SPEECH_KEY your_speech_key");
-                Console.WriteLine("  - setx SPEECH_REGION your_speech_region");
-                Console.WriteLine("  - setx WEATHERAPI_KEY your_weatherapi_key");
+                Console.WriteLine("You can set it using: setx WEATHERAPI_KEY your_key");
+                Console.WriteLine();
+                Console.WriteLine("Optional overrides (defaults used if unset):");
+                Console.WriteLine($"  LMSTUDIO_URL  (default {LocalLLMService.lmStudioUrl})");
+                Console.WriteLine($"  SEARXNG_URL   (default {SearxNGService.searxNGUrl})");
+                Console.WriteLine("  WHISPER_URL   (default http://localhost:8000)");
+                Console.WriteLine("  WHISPER_MODEL (default Systran/faster-whisper-large-v3)");
+                Console.WriteLine("  KOKORO_URL    (default http://localhost:8880)");
+                Console.WriteLine("  KOKORO_VOICE  (default am_onyx)");
                 Console.ReadLine();
                 Environment.Exit(1);
             }
@@ -114,21 +114,12 @@ namespace Personal_Assistant
                 sys.path.append(@"..\..\");
             }
 
-            // Single-instance services. Speech recognizer and synthesizer reuse
-            // websocket connections, so creating them once cuts handshake latency.
+            // Single-instance services. Kokoro / Whisper clients each reuse a
+            // single HttpClient so creating SpeechService once keeps requests warm.
             var speechManager = new SpeechService();
             await speechManager.WarmUpAudioAsync(); // wakes the audio device so first greeting isn't clipped
-            var speechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
-            var phraseList = PhraseListGrammar.FromRecognizer(speechRecognizer);
 
             var contacts = LoadContacts();
-            if (contacts != null)
-            {
-                foreach (var phrase in contacts.Keys)
-                {
-                    phraseList.AddPhrase(phrase);
-                }
-            }
 
             var location = new GetLocation();
             var weather = new GetWeather(weatherAPIKey);
@@ -148,10 +139,7 @@ namespace Personal_Assistant
                 Console.WriteLine($"[loop] about to call Say at {DateTime.Now:HH:mm:ss.fff}");
                 await speechManager.Say("Hey 49", greeting);
 
-                var speechRecognitionResult = await speechRecognizer.RecognizeOnceAsync();
-                speechManager.ConvertSpeechToText(speechRecognitionResult);
-
-                recognizedText = speechRecognitionResult.Text ?? string.Empty;
+                recognizedText = await speechManager.RecognizeOnceAsync();
                 string lower = recognizedText.ToLower();
 
                 if (lower == "who are you?")
@@ -247,9 +235,9 @@ namespace Personal_Assistant
                 }
                 else if (lower == "shut down." || lower == "restart.")
                 {
-                    await HandleShutdownAsync(speechManager, speechRecognizer, lower);
+                    await HandleShutdownAsync(speechManager, lower);
                 }
-                else if (speechRecognitionResult.Reason != ResultReason.NoMatch)
+                else if (!string.IsNullOrEmpty(recognizedText))
                 {
                     string llmResponse = await LocalLLMService.GenerateResponse(recognizedText);
                     await speechManager.Say(recognizedText, llmResponse);
@@ -299,13 +287,7 @@ namespace Personal_Assistant
         {
             await speechManager.Say(recognizedText, "Okay! Would you like a specific video or to just open it?");
 
-            string confirmation;
-            using (var recognizer = new SpeechRecognizer(speechManager.speechConfig))
-            {
-                var result = await recognizer.RecognizeOnceAsync();
-                speechManager.ConvertSpeechToText(result);
-                confirmation = (result.Text ?? string.Empty).ToLower();
-            }
+            string confirmation = (await speechManager.RecognizeOnceAsync()).ToLower();
 
             if (confirmation.StartsWith("search for") || confirmation.StartsWith("search up"))
             {
@@ -325,26 +307,18 @@ namespace Personal_Assistant
             }
         }
 
-        private static async Task HandleShutdownAsync(
-            SpeechService speechManager,
-            SpeechRecognizer speechRecognizer,
-            string lower)
+        private static async Task HandleShutdownAsync(SpeechService speechManager, string lower)
         {
             await speechManager.Say(recognizedText, "Are you sure?");
 
-            SpeechRecognitionResult confirmationResult;
-            using (var confirmRecognizer = new SpeechRecognizer(speechManager.speechConfig))
-            {
-                confirmationResult = await confirmRecognizer.RecognizeOnceAsync();
-                speechManager.ConvertSpeechToText(confirmationResult);
-            }
+            string confirmationText = await speechManager.RecognizeOnceAsync();
 
             bool isShutdown = lower.Contains("shut down");
             string action = isShutdown ? "Shutting down" : "Restarting now";
 
-            if (string.Equals(confirmationResult.Text?.TrimEnd('.'), "yes", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(confirmationText?.TrimEnd('.'), "yes", StringComparison.OrdinalIgnoreCase))
             {
-                await speechManager.Say(confirmationResult.Text, $"Ok. {action}");
+                await speechManager.Say(confirmationText, $"Ok. {action}");
                 Process.Start("shutdown", isShutdown ? "/s /t 0" : "/r /t 0");
             }
             else

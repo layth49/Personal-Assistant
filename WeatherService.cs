@@ -23,9 +23,9 @@ namespace Personal_Assistant.WeatherService
         {
             GetLocation location = new GetLocation();
 
-            double latitude = location.GetLatitude().GetAwaiter().GetResult();
-            double longitude = location.GetLongitude().GetAwaiter().GetResult();
-            string city = location.GetCity().GetAwaiter().GetResult();
+            double latitude = await location.GetLatitude();
+            double longitude = await location.GetLongitude();
+            string city = await location.GetCity();
 
             int year = DateTime.Now.Year;
             int month = DateTime.Now.Month;
@@ -52,8 +52,7 @@ namespace Personal_Assistant.WeatherService
 
                         string weatherResponse = $"{weatherData.Weather[0].Main}. The temperature in {city}, {weatherData.Sys.Country} is currently {(int)weatherData.Main.Temp}°F and feels like {(int)weatherData.Main.Feels_Like}°F. The sun is setting at {sunsetDateTime.ToShortTimeString()} and rising tomorrow at {sunriseDateTime.ToShortTimeString()}";
 
-                        speechManager.SynthesizeTextToSpeech(weatherResponse);
-                        speechManager.SpeechBubble(Program.recognizedText, weatherResponse);
+                        await speechManager.Say(Program.recognizedText, weatherResponse);
                     }
                     catch (JsonSerializationException ex)
                     {

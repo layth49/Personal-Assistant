@@ -1,0 +1,21 @@
+# SearxNG botdetection / rate-limiter config for local (private) instance.
+# Mounted into the container at /etc/searxng/limiter.toml.
+# Without this file SearxNG warns on startup and uses built-in defaults that
+# still block requests missing X-Forwarded-For / X-Real-IP headers.
+
+[botdetection.ip_lists]
+# Requests whose resolved client IP falls in pass_ip bypass all rate limits
+# and bot checks. 127.0.0.1 covers the LAITH app calling via localhost;
+# the RFC-1918 ranges cover any Docker bridge / WSL subnet variation.
+pass_ip = [
+  '127.0.0.1',
+  '::1',
+  '10.0.0.0/8',
+  '172.16.0.0/12',
+  '192.168.0.0/16',
+]
+block_ip = []
+
+[botdetection.ip_limit]
+# Disable per-IP rate limiting entirely for this private instance.
+filter_link_local = false

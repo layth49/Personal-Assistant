@@ -1,0 +1,40 @@
+services:
+  # 1. SearxNG - Private Search Engine
+  searxng:
+    container_name: searxng
+    image: searxng/searxng:latest
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    volumes:
+      - ./searxng:/etc/searxng:rw
+
+  # 2. Kokoro FastAPI - Text-to-Speech
+  kokoro:
+    container_name: kokoro
+    image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
+    ports:
+      - "8880:8880"
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # 3. Faster Whisper Server - Speech-to-Text
+  whisper:
+    container_name: whisper
+    image: fedirz/faster-whisper-server:latest-cuda
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
