@@ -128,7 +128,7 @@ namespace Personal_Assistant.SpeechManager
         {
             try
             {
-                await kokoroTTS.SpeakAsync(".");
+                await kokoroTTS.SpeakAsync("Laith Online");
             }
             catch (Exception ex)
             {

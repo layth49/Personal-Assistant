@@ -15,7 +15,7 @@ namespace Personal_Assistant.STTClient
         private static readonly string whisperUrl =
             Environment.GetEnvironmentVariable("WHISPER_URL") ?? "http://localhost:8000";
         private static readonly string model =
-            Environment.GetEnvironmentVariable("WHISPER_MODEL") ?? "Systran/faster-whisper-large-v3";
+            Environment.GetEnvironmentVariable("WHISPER_MODEL") ?? "deepdml/faster-whisper-large-v3-turbo-ct2";
 
         // 16kHz mono 16-bit PCM — matches Whisper's native sample rate.
         private static readonly WaveFormat captureFormat = new WaveFormat(16000, 16, 1);

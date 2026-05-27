@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Threading.Tasks;
 using PrayTimes;
 using Personal_Assistant.SpeechManager;
@@ -43,12 +43,12 @@ namespace Personal_Assistant.PrayerTimesCalculator
         private static readonly System.Collections.Generic.Dictionary<string, string> PrayerSpoken =
             new System.Collections.Generic.Dictionary<string, string>
             {
-                { "Fajr",    "FAH jr" },
-                { "Dhuhr",   "DOO her" },
-                { "Jumuah",  "joo MOO ah" },
-                { "Asr",     "AH sr" },
-                { "Maghrib", "MAG rib" },
-                { "Isha",    "EE shah" },
+                { "[fajr]fad͡ʒer",    "Fajr" },
+                { "[dhuhr]ðuhr",   "Dhuhr" },
+                { "[jumuah]dʒʊˈmuːə",  "Jumuah" },
+                { "[asr]ˈɑsɹ",     "Asr" },
+                { "[maghrib]maɣrɪb", "Maghrib" },
+                { "[isha]ʕiʃaːʔ",    "Isha" },
             };
 
         public async Task AnnouncePrayerTimes(DateTime date)
@@ -66,7 +66,7 @@ namespace Personal_Assistant.PrayerTimesCalculator
                 string time12h = Format12HourTime(GetPrayerTime(prayerTimes, name));
 
                 string spoken = PrayerSpoken.TryGetValue(name, out var hint) ? hint : name;
-                string bubbleText = $"{name} is at: {time12h}";
+                string bubbleText = "What are today's prayer times?";
 
                 await speechManager.Say(bubbleText, $"{spoken} is at {time12h}");
             }
