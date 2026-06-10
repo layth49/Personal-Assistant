@@ -65,7 +65,7 @@ namespace Personal_Assistant.SpeechManager
             // keyword cycle so we don't re-pay WASAPI setup each time.
             try
             {
-                keywordModel = KeywordRecognitionModel.FromFile(@"..\..\keyword.table");
+                keywordModel = KeywordRecognitionModel.FromFile(@"./keyword.table");
                 keywordRecognizer = new KeywordRecognizer(audioConfig);
             }
             catch (FileNotFoundException ex)
