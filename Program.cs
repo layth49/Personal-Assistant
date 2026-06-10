@@ -111,7 +111,7 @@ namespace Personal_Assistant
             using (Py.GIL())
             {
                 dynamic sys = Py.Import("sys");
-                sys.path.append(@"..\..\");
+                sys.path.append(@"C:\Users\layth\LAITH\local");
             }
 
             // Single-instance services. Kokoro / Whisper clients each reuse a

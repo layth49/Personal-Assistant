@@ -7,7 +7,7 @@ def navigator(text):
     while True:
         try:
             result = pyautogui.locateOnScreen(
-                "..\\..\\assets\\reference.png",
+                "C:\\Users\\layth\\LAITH\\local\\assets\\reference.png",
                 grayscale=True,
                 confidence=0.8
             )

@@ -40,7 +40,7 @@ namespace Personal_Assistant.SpeechManager
         {
             try
             {
-                using (var keywordModel = KeywordRecognitionModel.FromFile(@"..\..\keyword.table"))
+                using (var keywordModel = KeywordRecognitionModel.FromFile(@"C:\Users\layth\LAITH\local\keyword.table"))
                 {
                     var keywordRecognizer = new KeywordRecognizer(audioConfig);
                     KeywordRecognitionResult result = await keywordRecognizer.RecognizeOnceAsync(keywordModel);

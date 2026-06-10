@@ -9,7 +9,7 @@ def smsService(contactNumber, message_body):
     # Press the compose button
     while True:
         try:
-            button = pyautogui.locateOnScreen("..\\..\\assets\\compose.png", grayscale= True, confidence= 0.8)
+            button = pyautogui.locateOnScreen("C:\Users\layth\LAITH\local\\assets\\compose.png", grayscale= True, confidence= 0.8)
             pyautogui.click(button)
 
             time.sleep(1)
