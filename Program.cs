@@ -104,7 +104,7 @@ namespace Personal_Assistant
             // 49 (ASCII art)
             Console.WriteLine("                                    \r\n     ,AM  .d*\"*bg.\r\n    AVMM 6MP    Mb\r\n  ,W' MM YMb    MM\r\n,W'   MM  `MbmmdM9\r\nAmmmmmMMmm     .M'\r\n      MM     .d9  \r\n      MM   m\"'    \n\n");
 
-            Runtime.PythonDLL = @"..\..\..\..\AppData\Local\Programs\Python\Python312\python312.dll";
+            Runtime.PythonDLL = @"C:\Users\layth\AppData\Local\Programs\Python\Python312\python312.dll"; ;
             PythonEngine.Initialize();
             PythonEngine.BeginAllowThreads();
 
