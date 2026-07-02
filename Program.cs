@@ -1,5 +1,6 @@
-﻿using Microsoft.CognitiveServices.Speech;
+using Microsoft.CognitiveServices.Speech;
 using Personal_Assistant.Arduino;
+using Personal_Assistant.Dispatch;
 using Personal_Assistant.GeminiClient;
 using Personal_Assistant.Geolocator;
 using Personal_Assistant.LightAutomator;
@@ -13,7 +14,6 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
 
@@ -140,6 +140,32 @@ namespace Personal_Assistant
             var smsControl = new SMSControl();
             var arduino = new ArduinoService();
 
+            // Shared dependencies handed to every command handler.
+            var context = new CommandContext
+            {
+                Speech = speechManager,
+                Lights = lightControl,
+                Playstation = playstationControl,
+                Sms = smsControl,
+                Arduino = arduino,
+                Weather = weather,
+                Location = location,
+                Contacts = contacts,
+                IpAddressPlug = ipAddressPlug,
+                IpAddressSwitch = ipAddressSwitch
+            };
+
+            // LLM-first dispatch: every utterance goes to Gemini, which picks a tool
+            // (and extracts its arguments) or answers conversationally. The keyword
+            // matcher in the registry is only used as a fallback if Gemini is
+            // unavailable / malformed / times out.
+            var registry = BuildRegistry(context);
+            var dispatcher = new IntentDispatcher(
+                registry,
+                context,
+                GeminiService.DetectToolAsync,
+                GeminiService.GenerateGeminiResponse);
+
             while (true)
             {
                 int hour = DateTime.Now.Hour;
@@ -155,109 +181,239 @@ namespace Personal_Assistant
                 speechManager.ConvertSpeechToText(speechRecognitionResult);
 
                 recognizedText = speechRecognitionResult.Text ?? string.Empty;
-                string lower = recognizedText.ToLower();
 
-                if (lower == "who are you?")
+                // NoMatch is already handled (spoken) by ConvertSpeechToText; only
+                // dispatch real recognised speech.
+                if (speechRecognitionResult.Reason != ResultReason.NoMatch)
                 {
-                    await speechManager.Say(recognizedText, "Hi! I'm L.A.I.T.H.49, your own personal assistant!");
+                    await dispatcher.DispatchAsync(recognizedText);
                 }
-                else if (lower.Contains("exit"))
+            }
+        }
+
+        // Builds the command catalogue. Each VoiceCommand carries its LLM tool
+        // schema (for Gemini dispatch) plus a keyword predicate + arg extractor
+        // (for the fallback path). Registration order == the original if/else
+        // order, so "first keyword match wins" is preserved on fallback.
+        private static ToolRegistry BuildRegistry(CommandContext context)
+        {
+            var registry = new ToolRegistry();
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("who_are_you",
+                    "Introduce the assistant when the user asks who or what it is."),
+                lower => lower == "who are you?",
+                (ctx, args) => ctx.Speech.Say(ctx.RecognizedText,
+                    "Hi! I'm L.A.I.T.H.49, your own personal assistant!")));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("exit_assistant",
+                    "Quit and shut down the assistant program entirely."),
+                lower => lower.Contains("exit"),
+                async (ctx, args) =>
                 {
-                    await speechManager.Say(recognizedText, "Alright goodbye!");
+                    await ctx.Speech.Say(ctx.RecognizedText, "Alright goodbye!");
                     PythonEngine.Shutdown();
                     Environment.Exit(0);
-                }
-                else if (lower.Contains("never mind") || lower.Contains("nevermind"))
-                {
-                    await speechManager.Say(recognizedText, "Okay! Let me know if you need anything else.");
-                }
-                else if (lower == "what time is it?" || lower == "what's the time?")
-                {
-                    await speechManager.Say(recognizedText, $"It's {DateTime.Now.ToLocalTime():t}");
-                }
-                else if (lower == "what day is it?")
-                {
-                    await speechManager.Say(recognizedText, $"It's {DateTime.Now.Date:D}");
-                }
-                else if (lower.StartsWith("search up") || lower.StartsWith("google"))
-                {
-                    string prefix = lower.StartsWith("search up") ? "search up" : "google";
-                    string query = recognizedText.Substring(prefix.Length).Trim().TrimEnd('.', '?');
+                }));
 
-                    await speechManager.Say(recognizedText, $"Okay! Searching up {query} now");
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("never_mind",
+                    "Cancel or dismiss the current request without doing anything."),
+                lower => lower.Contains("never mind") || lower.Contains("nevermind"),
+                (ctx, args) => ctx.Speech.Say(ctx.RecognizedText,
+                    "Okay! Let me know if you need anything else.")));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("get_time",
+                    "Tell the user the current time of day."),
+                lower => lower == "what time is it?" || lower == "what's the time?",
+                (ctx, args) => ctx.Speech.Say(ctx.RecognizedText,
+                    $"It's {DateTime.Now.ToLocalTime():t}")));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("get_date",
+                    "Tell the user today's date / what day it is."),
+                lower => lower == "what day is it?",
+                (ctx, args) => ctx.Speech.Say(ctx.RecognizedText,
+                    $"It's {DateTime.Now.Date:D}")));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("google_search",
+                    "Open a Google web search for what the user wants to look up.",
+                    new ToolParameter("query", "string",
+                        "The search terms to look up on Google.")),
+                lower => lower.StartsWith("search up") || lower.StartsWith("google"),
+                async (ctx, args) =>
+                {
+                    string query = args["query"];
+                    await ctx.Speech.Say(ctx.RecognizedText, $"Okay! Searching up {query} now");
                     Process.Start("https://www.google.com/search?q=" + Uri.EscapeDataString(query));
-                }
-                else if (lower.Contains("youtube"))
+                },
+                text =>
                 {
-                    await HandleYouTubeAsync(speechManager);
-                }
-                else if (lower.Contains("visual studio") || lower.Contains("code") || lower.Contains("coding"))
+                    string lower = text.ToLower();
+                    string prefix = lower.StartsWith("search up") ? "search up" : "google";
+                    string query = text.Substring(prefix.Length).Trim().TrimEnd('.', '?');
+                    return new Dictionary<string, string> { ["query"] = query };
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("open_youtube",
+                    "Open YouTube, optionally searching for a specific video."),
+                lower => lower.Contains("youtube"),
+                (ctx, args) => HandleYouTubeAsync(ctx.Speech)));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("open_visual_studio",
+                    "Open Visual Studio for coding."),
+                lower => lower.Contains("visual studio") || lower.Contains("code") || lower.Contains("coding"),
+                async (ctx, args) =>
                 {
-                    await speechManager.Say(recognizedText, "Okay! Opening Visual Studio now.");
+                    await ctx.Speech.Say(ctx.RecognizedText, "Okay! Opening Visual Studio now.");
                     Process.Start("devenv");
-                }
-                else if (lower.Contains("turn on") && (lower.Contains("playstation") || lower.Contains("ps-5")))
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("turn_on_playstation",
+                    "Turn on the PlayStation 5 via Remote Play and launch a game."),
+                lower => lower.Contains("turn on") && (lower.Contains("playstation") || lower.Contains("ps-5")),
+                (ctx, args) => ctx.Playstation.TurnOnPlaystation()));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("control_lights",
+                    "Turn a smart light on or off.",
+                    new ToolParameter("state", "string",
+                        "Whether to turn the light on or off.",
+                        AllowedValues: new[] { "on", "off" }),
+                    new ToolParameter("room", "string",
+                        "Which light to control.",
+                        AllowedValues: new[] { "LED", "bedroom" })),
+                lower => (lower.Contains("turn on") || lower.Contains("turn off")) && lower.Contains("light"),
+                async (ctx, args) =>
                 {
-                    await playstationControl.TurnOnPlaystation();
-                }
-                else if (lower.Contains("turn on") && lower.Contains("light"))
+                    string state = args["state"];
+                    string room = args["room"];
+                    string ip = room == "LED" ? ctx.IpAddressPlug : ctx.IpAddressSwitch;
+                    if (state == "on") await ctx.Lights.TurnOnLights(room, ip);
+                    else await ctx.Lights.TurnOffLights(room, ip);
+                },
+                text =>
                 {
-                    if (lower.Contains("led")) await lightControl.TurnOnLights("LED", ipAddressPlug);
-                    else if (lower.Contains("bedroom")) await lightControl.TurnOnLights("bedroom", ipAddressSwitch);
-                }
-                else if (lower.Contains("turn off") && lower.Contains("light"))
+                    string lower = text.ToLower();
+                    var d = new Dictionary<string, string>
+                    {
+                        ["state"] = lower.Contains("turn off") ? "off" : "on"
+                    };
+                    if (lower.Contains("led")) d["room"] = "LED";
+                    else if (lower.Contains("bedroom")) d["room"] = "bedroom";
+                    return d;
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("get_weather",
+                    "Report the current weather."),
+                lower => lower.Contains("weather"),
+                async (ctx, args) =>
                 {
-                    if (lower.Contains("led")) await lightControl.TurnOffLights("LED", ipAddressPlug);
-                    else if (lower.Contains("bedroom")) await lightControl.TurnOffLights("bedroom", ipAddressSwitch);
-                }
-                else if (lower.Contains("weather"))
-                {
-                    try { await weather.GetWeatherData(); }
+                    try { await ctx.Weather.GetWeatherData(); }
                     catch (Exception ex) { Console.WriteLine("An error occurred: " + ex.Message); }
-                }
-                else if (lower.Contains("pray times") || lower.Contains("prayer times"))
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("get_prayer_times",
+                    "Announce today's Islamic prayer times for the user's location."),
+                lower => lower.Contains("pray times") || lower.Contains("prayer times"),
+                async (ctx, args) =>
                 {
                     try
                     {
-                        double latitude = await location.GetLatitude();
-                        double longitude = await location.GetLongitude();
+                        double latitude = await ctx.Location.GetLatitude();
+                        double longitude = await ctx.Location.GetLongitude();
                         var prayerTimesLogic = new GetPrayerTimes(latitude, longitude);
                         await prayerTimesLogic.AnnouncePrayerTimes(DateTime.Now);
                     }
                     catch (InvalidOperationException ex)
                     {
                         Console.WriteLine($"Location lookup failed: {ex.Message}");
-                        await speechManager.Say(recognizedText,
+                        await ctx.Speech.Say(ctx.RecognizedText,
                             "Sorry, I couldn't get your location. Make sure Windows location services are enabled.");
                     }
-                }
-                else if (contacts != null && TryMatchContact(contacts, lower, out string contactName, out string contactNumber))
-                {
-                    await smsControl.SendSMS(contactName, contactNumber);
-                }
-                else if (lower.Contains("door"))
-                {
-                    if (lower.Contains("open"))
+                }));
+
+            // Only expose SMS if there are contacts to send to. The allowed contact
+            // names double as the tool's enum and the dispatcher's validation set.
+            if (context.Contacts != null && context.Contacts.Count > 0)
+            {
+                var contacts = context.Contacts;
+                registry.Add(new VoiceCommand(
+                    ToolDefinition.Create("send_sms",
+                        "Send a text message to one of the user's known contacts.",
+                        new ToolParameter("contact", "string",
+                            "Which contact to message.",
+                            AllowedValues: new List<string>(contacts.Keys))),
+                    lower => TryMatchContact(contacts, lower, out _, out _),
+                    (ctx, args) =>
                     {
-                        await arduino.ArduinoCommunication("OPEN");
-                        await speechManager.Say(recognizedText, "Okay! Opening your door now.");
-                    }
-                    else if (lower.Contains("close"))
+                        string name = args["contact"];
+                        string number = ctx.Contacts[name];
+                        return ctx.Sms.SendSMS(name, number);
+                    },
+                    text =>
                     {
-                        await arduino.ArduinoCommunication("CLOSE");
-                        await speechManager.Say(recognizedText, "Okay! Closing your door now.");
-                    }
-                }
-                else if (lower == "shut down." || lower == "restart.")
-                {
-                    await HandleShutdownAsync(speechManager, speechRecognizer, lower);
-                }
-                else if (speechRecognitionResult.Reason != ResultReason.NoMatch)
-                {
-                    string geminiResponse = await GeminiService.GenerateGeminiResponse(recognizedText);
-                    await speechManager.Say(recognizedText, geminiResponse);
-                }
+                        if (TryMatchContact(contacts, text.ToLower(), out string name, out _))
+                            return new Dictionary<string, string> { ["contact"] = name };
+                        return VoiceCommand.EmptyArgs;
+                    }));
             }
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("control_door",
+                    "Open or close the door via the Arduino controller.",
+                    new ToolParameter("state", "string",
+                        "Whether to open or close the door.",
+                        AllowedValues: new[] { "open", "close" })),
+                lower => lower.Contains("door") && (lower.Contains("open") || lower.Contains("close")),
+                async (ctx, args) =>
+                {
+                    if (args["state"] == "open")
+                    {
+                        await ctx.Arduino.ArduinoCommunication("OPEN");
+                        await ctx.Speech.Say(ctx.RecognizedText, "Okay! Opening your door now.");
+                    }
+                    else
+                    {
+                        await ctx.Arduino.ArduinoCommunication("CLOSE");
+                        await ctx.Speech.Say(ctx.RecognizedText, "Okay! Closing your door now.");
+                    }
+                },
+                text =>
+                {
+                    string lower = text.ToLower();
+                    return new Dictionary<string, string>
+                    {
+                        ["state"] = lower.Contains("open") ? "open" : "close"
+                    };
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("power_control",
+                    "Shut down or restart the computer (asks for confirmation first).",
+                    new ToolParameter("action", "string",
+                        "Whether to shut down or restart the machine.",
+                        AllowedValues: new[] { "shutdown", "restart" })),
+                lower => lower == "shut down." || lower == "restart.",
+                (ctx, args) => HandleShutdownAsync(ctx.Speech, args["action"]),
+                text =>
+                {
+                    string lower = text.ToLower();
+                    return new Dictionary<string, string>
+                    {
+                        ["action"] = lower.Contains("shut down") ? "shutdown" : "restart"
+                    };
+                }));
+
+            return registry;
         }
 
         private static Dictionary<string, string> LoadContacts()
@@ -280,6 +436,27 @@ namespace Personal_Assistant
 
         private static bool TryMatchContact(
             Dictionary<string, string> contacts,
+            string lower,
+            out string contactName,
+            out string contactNumber)
+        {
+            foreach (var kv in contacts)
+            {
+                if (lower.IndexOf(kv.Key, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    contactName = kv.Key;
+                    contactNumber = kv.Value;
+                    return true;
+                }
+            }
+            contactName = null;
+            contactNumber = null;
+            return false;
+        }
+
+        // contacts is IReadOnlyDictionary here (from CommandContext); same logic.
+        private static bool TryMatchContact(
+            IReadOnlyDictionary<string, string> contacts,
             string lower,
             out string contactName,
             out string contactNumber)
@@ -328,10 +505,8 @@ namespace Personal_Assistant
             }
         }
 
-        private static async Task HandleShutdownAsync(
-            SpeechService speechManager,
-            SpeechRecognizer speechRecognizer,
-            string lower)
+        // action is "shutdown" or "restart" (validated by the dispatcher).
+        private static async Task HandleShutdownAsync(SpeechService speechManager, string action)
         {
             await speechManager.Say(recognizedText, "Are you sure?");
 
@@ -342,17 +517,17 @@ namespace Personal_Assistant
                 speechManager.ConvertSpeechToText(confirmationResult);
             }
 
-            bool isShutdown = lower.Contains("shut down");
-            string action = isShutdown ? "Shutting down" : "Restarting now";
+            bool isShutdown = action == "shutdown";
+            string actionText = isShutdown ? "Shutting down" : "Restarting now";
 
             if (string.Equals(confirmationResult.Text?.TrimEnd('.'), "yes", StringComparison.OrdinalIgnoreCase))
             {
-                await speechManager.Say(confirmationResult.Text, $"Ok. {action}");
+                await speechManager.Say(confirmationResult.Text, $"Ok. {actionText}");
                 Process.Start("shutdown", isShutdown ? "/s /t 0" : "/r /t 0");
             }
             else
             {
-                await speechManager.Say(recognizedText, $"Ok. NOT {action}");
+                await speechManager.Say(recognizedText, $"Ok. NOT {actionText}");
                 await Task.Delay(500);
             }
         }

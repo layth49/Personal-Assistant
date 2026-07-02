@@ -1,9 +1,12 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
+using Personal_Assistant.Dispatch;
 
 namespace Personal_Assistant.GeminiClient
 {
@@ -27,6 +30,23 @@ namespace Personal_Assistant.GeminiClient
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase
         };
+
+        // Tool-detection requests are built from dictionaries with already-correct
+        // Gemini field names (function_declarations, enum, required, ...), so no
+        // naming policy must be applied or those keys would be mangled.
+        private static readonly JsonSerializerOptions RawJsonOpts = new JsonSerializerOptions();
+
+        private const string ToolSystemPrompt =
+            "You are L.A.I.T.H., a voice assistant intent router. " +
+            "If the user's request matches one of the provided tools, call that tool " +
+            "with the correct arguments extracted from what they said. " +
+            "If no tool fits, just answer briefly without calling a tool. " +
+            "Never invent argument values that the user did not provide.";
+
+        // How long to wait for the tool-detection call before giving up so the
+        // dispatcher can fall back to keyword matching. Shorter than the general
+        // HttpClient timeout because intent routing should feel instant.
+        private static readonly TimeSpan DetectTimeout = TimeSpan.FromSeconds(15);
 
         private static HttpClient CreateHttpClient()
         {
@@ -88,6 +108,173 @@ namespace Personal_Assistant.GeminiClient
             catch (Exception ex)
             {
                 return $"Error: {ex.Message}";
+            }
+        }
+
+        // Intent router for LLM-first dispatch. Sends the user input plus the tool
+        // schemas (as Gemini function_declarations) and returns either a tool call
+        // the model chose, a plain reply (no tool fit), or a Failure the dispatcher
+        // treats as "fall back to keyword matching".
+        public static async Task<LlmDecision> DetectToolAsync(
+            string inputText,
+            IReadOnlyList<ToolDefinition> tools)
+        {
+            object requestBody = BuildToolRequest(inputText, tools);
+
+            var content = new StringContent(
+                JsonSerializer.Serialize(requestBody, RawJsonOpts),
+                Encoding.UTF8,
+                "application/json");
+
+            using (var cts = new CancellationTokenSource(DetectTimeout))
+            {
+                try
+                {
+                    using (HttpResponseMessage response =
+                        await httpClient.PostAsync(Endpoint, content, cts.Token))
+                    {
+                        string body = await response.Content.ReadAsStringAsync();
+
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            Console.WriteLine($"[gemini] tool detect HTTP {(int)response.StatusCode}: {body}");
+                            return LlmDecision.Failure();
+                        }
+
+                        return ParseDecision(body);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Timeout (TaskCanceledException) or any transport/parse error
+                    // -> let the dispatcher fall back to the keyword matcher.
+                    Console.WriteLine($"[gemini] tool detect failed: {ex.Message}");
+                    return LlmDecision.Failure();
+                }
+            }
+        }
+
+        private static object BuildToolRequest(string inputText, IReadOnlyList<ToolDefinition> tools)
+        {
+            var functionDeclarations = new List<object>();
+            foreach (var tool in tools)
+            {
+                var properties = new Dictionary<string, object>();
+                var required = new List<string>();
+
+                foreach (var p in tool.Parameters)
+                {
+                    var prop = new Dictionary<string, object>
+                    {
+                        ["type"] = p.Type,
+                        ["description"] = p.Description
+                    };
+                    if (p.AllowedValues != null && p.AllowedValues.Count > 0)
+                    {
+                        prop["enum"] = p.AllowedValues;
+                    }
+                    properties[p.Name] = prop;
+                    if (p.Required) required.Add(p.Name);
+                }
+
+                var parameters = new Dictionary<string, object>
+                {
+                    ["type"] = "object",
+                    ["properties"] = properties
+                };
+                if (required.Count > 0) parameters["required"] = required;
+
+                functionDeclarations.Add(new Dictionary<string, object>
+                {
+                    ["name"] = tool.Name,
+                    ["description"] = tool.Description,
+                    ["parameters"] = parameters
+                });
+            }
+
+            return new Dictionary<string, object>
+            {
+                ["system_instruction"] = new Dictionary<string, object>
+                {
+                    ["parts"] = new[] { new Dictionary<string, object> { ["text"] = ToolSystemPrompt } }
+                },
+                ["contents"] = new[]
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["role"] = "user",
+                        ["parts"] = new[] { new Dictionary<string, object> { ["text"] = inputText } }
+                    }
+                },
+                ["tools"] = new[]
+                {
+                    new Dictionary<string, object> { ["function_declarations"] = functionDeclarations }
+                },
+                // AUTO lets the model pick a tool OR answer in text — exactly the
+                // LLM-first behaviour we want (it isn't forced to call a tool).
+                ["tool_config"] = new Dictionary<string, object>
+                {
+                    ["function_calling_config"] = new Dictionary<string, object> { ["mode"] = "AUTO" }
+                },
+                ["generationConfig"] = new Dictionary<string, object>
+                {
+                    ["temperature"] = 0.0,
+                    ["maxOutputTokens"] = 200
+                }
+            };
+        }
+
+        private static LlmDecision ParseDecision(string json)
+        {
+            try
+            {
+                using (JsonDocument doc = JsonDocument.Parse(json))
+                {
+                    if (!doc.RootElement.TryGetProperty("candidates", out var candidates) ||
+                        candidates.GetArrayLength() == 0 ||
+                        !candidates[0].TryGetProperty("content", out var contentEl) ||
+                        !contentEl.TryGetProperty("parts", out var parts))
+                    {
+                        return LlmDecision.Failure();
+                    }
+
+                    var textBuilder = new StringBuilder();
+
+                    foreach (var part in parts.EnumerateArray())
+                    {
+                        if (part.TryGetProperty("functionCall", out var fc) &&
+                            fc.TryGetProperty("name", out var nameEl))
+                        {
+                            string name = nameEl.GetString();
+                            var args = new Dictionary<string, string>();
+
+                            if (fc.TryGetProperty("args", out var argsEl) &&
+                                argsEl.ValueKind == JsonValueKind.Object)
+                            {
+                                foreach (var arg in argsEl.EnumerateObject())
+                                {
+                                    args[arg.Name] = arg.Value.ValueKind == JsonValueKind.String
+                                        ? arg.Value.GetString()
+                                        : arg.Value.GetRawText();
+                                }
+                            }
+
+                            return LlmDecision.ToolCall(name, args);
+                        }
+
+                        if (part.TryGetProperty("text", out var textEl))
+                        {
+                            textBuilder.Append(textEl.GetString());
+                        }
+                    }
+
+                    return LlmDecision.Reply(textBuilder.ToString());
+                }
+            }
+            catch (JsonException ex)
+            {
+                Console.WriteLine($"[gemini] tool detect parse error: {ex.Message}");
+                return LlmDecision.Failure();
             }
         }
 

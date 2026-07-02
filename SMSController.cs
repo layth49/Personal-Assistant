@@ -10,7 +10,7 @@ using WindowsInput;
 
 namespace Personal_Assistant.SMSController
 {
-    class SMSControl
+    public class SMSControl
     {
         [DllImport("user32.dll")]
         static extern bool SetForegroundWindow(IntPtr hWnd);
