@@ -5,6 +5,7 @@ using Personal_Assistant.TTSClient;
 using Python.Runtime;
 using System;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 
 
@@ -28,23 +29,27 @@ namespace Personal_Assistant.SpeechManager
 
         private PyDict state;
 
-        public SpeechService()
-        {
-            using (Py.GIL())
-            {
-                text_display = Py.Import("SpeechBubble");
-            }
-        }
+        // Wakeword model, loaded once and shared by the main-loop wait and the
+        // barge-in listener.
+        private readonly KeywordRecognitionModel keywordModel;
 
-        public async Task KeywordRecognizer()
+        // A SEPARATE recognizer + mic config used only for barge-in while speaking.
+        // Keeping it distinct from the per-call main-loop recognizer means a
+        // misbehaving interrupt can never wedge the main wakeword wait.
+        private readonly AudioConfig interruptAudioConfig;
+        private readonly KeywordRecognizer interruptKeywordRecognizer;
+
+        // Serialises Say / SayInterruptible so a background reminder firing while
+        // the assistant is speaking can't garble audio or clobber the bubble state.
+        private readonly SemaphoreSlim sayGate = new SemaphoreSlim(1, 1);
+
+        public SpeechService()
         {
             try
             {
-                using (var keywordModel = KeywordRecognitionModel.FromFile(@"C:\Users\layth\LAITH\local\keyword.table"))
-                {
-                    var keywordRecognizer = new KeywordRecognizer(audioConfig);
-                    KeywordRecognitionResult result = await keywordRecognizer.RecognizeOnceAsync(keywordModel);
-                }
+                keywordModel = KeywordRecognitionModel.FromFile(@"C:\Users\layth\LAITH\local\keyword.table");
+                interruptAudioConfig = AudioConfig.FromDefaultMicrophoneInput();
+                interruptKeywordRecognizer = new KeywordRecognizer(interruptAudioConfig);
             }
             catch (FileNotFoundException ex)
             {
@@ -52,7 +57,45 @@ namespace Personal_Assistant.SpeechManager
             }
             catch (Exception ex)
             {
+                Console.WriteLine("Keyword model load failed: " + ex.Message);
+            }
+
+            using (Py.GIL())
+            {
+                text_display = Py.Import("SpeechBubble");
+            }
+        }
+
+        // Waits for the wakeword. Returns true only if the keyword actually fired,
+        // so the caller can distinguish a real wake from an early/errored return
+        // (returning on error and treating it as a wake caused a runaway loop).
+        public async Task<bool> KeywordRecognizer()
+        {
+            if (keywordModel == null)
+            {
+                Console.WriteLine("KeywordRecognizer: model not loaded. Waiting forever.");
+                await Task.Delay(-1);
+                return false;
+            }
+            try
+            {
+                // Fresh recognizer per wait, as the original did — isolated from the
+                // dedicated interrupt recognizer, so neither can corrupt the other.
+                var keywordRecognizer = new KeywordRecognizer(audioConfig);
+                KeywordRecognitionResult result = await keywordRecognizer.RecognizeOnceAsync(keywordModel);
+                if (result.Reason == ResultReason.RecognizedKeyword)
+                {
+                    Console.WriteLine("Keyword was recognized!");
+                    return true;
+                }
+                Console.WriteLine($"KeywordRecognizer: returned without a keyword ({result.Reason}).");
+                return false;
+            }
+            catch (Exception ex)
+            {
                 Console.WriteLine("An unexpected error occurred in the KeywordRecognizer Method: " + ex.Message);
+                await Task.Delay(1000); // back off so a wedged recognizer can't hot-spin
+                return false;
             }
         }
 
@@ -140,10 +183,136 @@ namespace Personal_Assistant.SpeechManager
         // bubble retracts automatically when the audio finishes.
         public async Task Say(string userInput, string response)
         {
-            var synthTask = Task.Run(() => SynthesizeTextToSpeech(response));
-            SpeechBubble(userInput, response);
-            try { await synthTask; }
-            catch (Exception ex) { Console.WriteLine($"TTS error: {ex.Message}"); }
+            await sayGate.WaitAsync();
+            try
+            {
+                var synthTask = Task.Run(() => SynthesizeTextToSpeech(response));
+                SpeechBubble(userInput, response);
+                try { await synthTask; }
+                catch (Exception ex) { Console.WriteLine($"TTS error: {ex.Message}"); }
+            }
+            finally
+            {
+                sayGate.Release();
+            }
+        }
+
+        // Like Say, but listens for the wakeword on the mic WHILE speaking. If the
+        // user says it mid-utterance, Kokoro playback is cut short and this returns
+        // true so the caller can jump straight to listening (barge-in). Returns
+        // false if the speech finished normally.
+        public async Task<bool> SayInterruptible(string userInput, string response)
+        {
+            // No interrupt recognizer available -> behave exactly like Say.
+            if (interruptKeywordRecognizer == null || keywordModel == null)
+            {
+                await Say(userInput, response);
+                return false;
+            }
+
+            await sayGate.WaitAsync();
+            try
+            {
+                var synthTask = Task.Run(() => SynthesizeTextToSpeech(response));
+
+                // Start listening for the wakeword NOW, before the bubble. The
+                // bubble call below blocks the calling thread for the whole speech,
+                // so the barge-in race must run on its own thread or it would only
+                // begin after the speech already finished.
+                Console.WriteLine("[interrupt] listening for wakeword during speech");
+                var interruptTcs = new TaskCompletionSource<bool>();
+                _ = Task.Run(async () =>
+                {
+                    bool interrupted = false;
+                    try
+                    {
+                        var keywordTask = interruptKeywordRecognizer.RecognizeOnceAsync(keywordModel);
+                        var finished = await Task.WhenAny(synthTask, keywordTask);
+
+                        if (finished == keywordTask)
+                        {
+                            KeywordRecognitionResult kw = null;
+                            try { kw = await keywordTask; }
+                            catch (Exception ex) { Console.WriteLine($"[interrupt] keyword await error: {ex.Message}"); }
+
+                            interrupted = kw != null && kw.Reason == ResultReason.RecognizedKeyword;
+                            if (interrupted)
+                            {
+                                Console.WriteLine("[interrupt] wakeword during speech -> cutting off");
+                                // Cancels Kokoro playback, which lets SpeakAsync
+                                // return and flips state.running false, closing the
+                                // bubble on the main thread (same path as a finish).
+                                StopSpeaking();
+                            }
+                        }
+                        else
+                        {
+                            // Speech finished first -> stop listening. Bounded so a
+                            // stuck recognizer can't hang anything; and it's the
+                            // dedicated recognizer, so worst case only future
+                            // barge-ins suffer, never the main loop.
+                            try { await WithTimeout(interruptKeywordRecognizer.StopRecognitionAsync(), 3000, "StopRecognition"); } catch { }
+                            try { await WithTimeout(keywordTask, 3000, "keywordTask drain"); } catch { }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[interrupt] race error: {ex.Message}");
+                    }
+                    interruptTcs.TrySetResult(interrupted);
+                });
+
+                // Bubble on the calling thread; returns when the synth completes
+                // (naturally or because it was stopped by a barge-in).
+                SpeechBubble(userInput, response);
+                try { await synthTask; }
+                catch (Exception ex) { Console.WriteLine($"TTS error: {ex.Message}"); }
+
+                // Retract the bubble defensively (normally already closed).
+                if (state != null)
+                {
+                    using (Py.GIL())
+                    {
+                        state.SetItem("running", PythonEngine.Eval("False"));
+                    }
+                }
+
+                bool wasInterrupted = false;
+                var settled = await Task.WhenAny(interruptTcs.Task, Task.Delay(4000));
+                if (settled == interruptTcs.Task) wasInterrupted = interruptTcs.Task.Result;
+                else Console.WriteLine("[interrupt] race did not settle in time");
+
+                Console.WriteLine($"[interrupt] returning interrupted = {wasInterrupted}");
+                return wasInterrupted;
+            }
+            finally
+            {
+                sayGate.Release();
+            }
+        }
+
+        // Awaits `task` but gives up after `ms`, so interrupt teardown can never
+        // block the assistant on a recognizer that won't stop.
+        private static async Task WithTimeout(Task task, int ms, string label)
+        {
+            var completed = await Task.WhenAny(task, Task.Delay(ms));
+            if (completed != task)
+            {
+                Console.WriteLine($"[interrupt] {label} timed out after {ms}ms");
+                return;
+            }
+            await task;
+        }
+
+        private static async Task WithTimeout<T>(Task<T> task, int ms, string label)
+        {
+            var completed = await Task.WhenAny(task, Task.Delay(ms));
+            if (completed != task)
+            {
+                Console.WriteLine($"[interrupt] {label} timed out after {ms}ms");
+                return;
+            }
+            await task;
         }
     }
 }

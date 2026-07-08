@@ -1,5 +1,6 @@
 using NAudio.Wave;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -15,13 +16,13 @@ namespace Personal_Assistant.STTClient
         private static readonly string whisperUrl =
             Environment.GetEnvironmentVariable("WHISPER_URL") ?? "http://localhost:8000";
         private static readonly string model =
-            Environment.GetEnvironmentVariable("WHISPER_MODEL") ?? "Zoont/faster-whisper-large-v3-turbo-int8-ct2";
+            Environment.GetEnvironmentVariable("WHISPER_MODEL") ?? "everyscribe/faster-whisper-large-v3-turbo-ct2";
 
         // 16kHz mono 16-bit PCM — matches Whisper's native sample rate.
         private static readonly WaveFormat captureFormat = new WaveFormat(16000, 16, 1);
 
         // RMS threshold (in 16-bit signed sample units) below which a chunk counts as silence.
-        private const double SilenceThresholdRms = 500.0;
+        private const double SilenceThresholdRms = 1000.0;
 
         // Trailing silence required to consider speech finished.
         private static readonly TimeSpan TrailingSilence = TimeSpan.FromMilliseconds(1500);
@@ -177,6 +178,10 @@ namespace Personal_Assistant.STTClient
             return rms >= SilenceThresholdRms;
         }
 
+        // Cache these at the class level so you aren't hitting the disk on every audio chunk
+        private static Dictionary<string, string> _cachedContacts;
+        private static string _dynamicPrompt;
+
         private static async Task<string> TranscribeAsync(byte[] wavBytes)
         {
             string url = whisperUrl.TrimEnd('/') + "/v1/audio/transcriptions";
@@ -189,6 +194,31 @@ namespace Personal_Assistant.STTClient
                 form.Add(new StringContent(model), "model");
                 form.Add(new StringContent("en"), "language");
                 form.Add(new StringContent("json"), "response_format");
+
+                // Force greedy decoding for minimum latency
+                form.Add(new StringContent("1"), "beam_size");
+                form.Add(new StringContent("0"), "temperature");
+
+                // 1. Load and cache contacts on the very first run
+                if (_dynamicPrompt == null)
+                {
+                    _cachedContacts = Program.LoadContacts();
+
+                    string jargon = "Arduino, Home Assistant.";
+
+                    // 3. Flatten the dictionary keys into a comma-separated string
+                    if (_cachedContacts != null && _cachedContacts.Count > 0)
+                    {
+                        _dynamicPrompt = string.Join(", ", _cachedContacts.Keys) + ", " + jargon;
+                    }
+                    else
+                    {
+                        _dynamicPrompt = jargon;
+                    }
+                }
+
+                // 4. Inject the final string into the API payload
+                form.Add(new StringContent(_dynamicPrompt), "prompt");
 
                 using (var resp = await http.PostAsync(url, form).ConfigureAwait(false))
                 {

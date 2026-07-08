@@ -1,3 +1,9 @@
+using FlaUI.Core;
+using FlaUI.Core.AutomationElements;
+using FlaUI.Core.Conditions;
+using FlaUI.Core.Input;
+using FlaUI.Core.WindowsAPI;
+using FlaUI.UIA3;
 using Personal_Assistant.SpeechManager;
 using Python.Runtime;
 using System;
@@ -9,7 +15,7 @@ using WindowsInput;
 
 namespace Personal_Assistant.SMSController
 {
-    class SMSControl
+    public class SMSControl
     {
         [DllImport("user32.dll")]
         static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -79,24 +85,47 @@ namespace Personal_Assistant.SMSController
 
         public void SendMessageToContact(string contactNumber, string message)
         {
-            using (Py.GIL())
+            Console.WriteLine($"Sending message to {contactNumber}: {message}");
+
+            // Phone Link usually runs under this process name
+            var processes = Process.GetProcessesByName("PhoneExperienceHost");
+            if (processes.Length == 0)
             {
-                Console.WriteLine($"Sending message to {contactNumber}: {message}");
+                Console.WriteLine("Phone Link is not running.");
+                return;
+            }
+
+            using (var automation = new UIA3Automation())
+            {
+                var app = Application.Attach(processes[0].Id);
+                var window = app.GetMainWindow(automation);
+                var conditionFactory = new ConditionFactory(new UIA3PropertyLibrary());
+
                 try
                 {
-                    dynamic smsModule = Py.Import("SMSService");
-                    smsModule.smsService(contactNumber, message);
-                }
-                catch (PythonException ex)
-                {
-                    Console.WriteLine("PythonException caught:");
-                    Console.WriteLine("Type: " + ex.Type);
-                    Console.WriteLine("Message: " + ex.Message);
-                    Console.WriteLine("StackTrace: " + ex.StackTrace);
+                    // 1. Find and click the Compose button
+                    var composeButton = window.FindFirstDescendant(conditionFactory.ByAutomationId("NewMessageButton"))?.AsButton();
+                    composeButton?.Invoke();
+                    Wait.UntilInputIsProcessed(); // Let the UI catch up
+                    Console.WriteLine("Shouldve pressed the new message by now");
+
+                    // 2. Find the "To" field, type number, press Enter
+                    var toField = window.FindFirstDescendant(conditionFactory.ByAutomationId("TextBox"))?.AsTextBox();
+                    toField?.Enter(contactNumber);
+                    Keyboard.Press(VirtualKeyShort.ENTER);
+                    Wait.UntilInputIsProcessed();
+                    Console.WriteLine("Shouldve pressed on the 'To' box");
+
+                    // 3. Find the message box, type message, press Enter
+                    var messageBox = window.FindFirstDescendant(conditionFactory.ByAutomationId("InputTextBox"))?.AsTextBox();
+                    messageBox.Text = message;
+                    Keyboard.Press(VirtualKeyShort.ENTER);
+
+                    Console.WriteLine("Message sent successfully via FlaUI.");
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Error: {ex.Message}");
+                    Console.WriteLine($"FlaUI Automation Error: {ex.Message}");
                 }
             }
         }
