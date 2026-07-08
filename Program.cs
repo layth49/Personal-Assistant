@@ -96,7 +96,7 @@ namespace Personal_Assistant
             else pool = nightGreetings;
             return pool[random.Next(pool.Length)];
         }
-
+         
         public static async Task Main()
         {
             CheckEnvironmentVariables();

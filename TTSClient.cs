@@ -16,7 +16,7 @@ namespace Personal_Assistant.TTSClient
         private static readonly string kokoroUrl =
             Environment.GetEnvironmentVariable("KOKORO_URL") ?? "http://localhost:8880";
         private static readonly string voice =
-            Environment.GetEnvironmentVariable("KOKORO_VOICE") ?? "am_adam+am_onyx";
+            Environment.GetEnvironmentVariable("KOKORO_VOICE") ?? "am_onyx+am_puck";
 
         private readonly object playbackLock = new object();
         private WaveOutEvent activeOutput;
