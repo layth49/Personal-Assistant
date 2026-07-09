@@ -4,27 +4,41 @@ using System.Threading.Tasks;
 
 namespace Personal_Assistant.Dispatch
 {
+    // A single tool the model chose, with its extracted arguments. A decision can
+    // carry several of these when the user asked for multiple things at once
+    // ("turn off the lights and close the door").
+    public sealed class ToolInvocation
+    {
+        public string Name { get; }
+        public IReadOnlyDictionary<string, string> Arguments { get; }
+
+        public ToolInvocation(string name, IReadOnlyDictionary<string, string> args)
+        {
+            Name = name;
+            Arguments = args ?? VoiceCommand.EmptyArgs;
+        }
+    }
+
     // The outcome of asking the LLM what to do with a turn of user input.
     // Exactly one of three states:
-    //   ToolCall  - the model picked a tool and gave arguments
-    //   Reply     - the model answered conversationally (no tool)
-    //   Failure   - the call timed out / errored / returned malformed JSON
+    //   ToolCall(s) - the model picked one or more tools and gave arguments
+    //   Reply       - the model answered conversationally (no tool)
+    //   Failure     - the call timed out / errored / returned malformed JSON
     // Failure is what triggers the keyword-matching fallback.
     public sealed class LlmDecision
     {
-        public bool IsToolCall { get; private set; }
         public bool Failed { get; private set; }
-        public string ToolName { get; private set; }
-        public IReadOnlyDictionary<string, string> Arguments { get; private set; }
+        public IReadOnlyList<ToolInvocation> ToolCalls { get; private set; }
         public string Text { get; private set; }
 
+        public bool IsToolCall => ToolCalls != null && ToolCalls.Count > 0;
+
+        // Convenience for the common single-tool case.
         public static LlmDecision ToolCall(string name, IReadOnlyDictionary<string, string> args) =>
-            new LlmDecision
-            {
-                IsToolCall = true,
-                ToolName = name,
-                Arguments = args ?? VoiceCommand.EmptyArgs
-            };
+            new LlmDecision { ToolCalls = new[] { new ToolInvocation(name, args) } };
+
+        public static LlmDecision Tools(IReadOnlyList<ToolInvocation> calls) =>
+            new LlmDecision { ToolCalls = calls };
 
         public static LlmDecision Reply(string text) =>
             new LlmDecision { Text = text ?? string.Empty };
@@ -113,26 +127,10 @@ namespace Personal_Assistant.Dispatch
                 return await FallbackAsync(userInput, lower, history);
             }
 
-            // The LLM chose a tool.
+            // The LLM chose one or more tools.
             if (decision.IsToolCall)
             {
-                var command = registry.FindByName(decision.ToolName);
-                if (command == null)
-                {
-                    Console.WriteLine($"[dispatch] LLM picked unknown tool '{decision.ToolName}' -> fallback");
-                    return await FallbackAsync(userInput, lower, history);
-                }
-
-                if (!TryValidate(command.Tool, decision.Arguments, out var cleanArgs, out string error))
-                {
-                    Console.WriteLine($"[dispatch] invalid args for '{command.Name}': {error} -> fallback");
-                    return await FallbackAsync(userInput, lower, history);
-                }
-
-                Console.WriteLine($"[dispatch] tool '{command.Name}' args=[{Describe(cleanArgs)}]");
-                await command.Handler(context, cleanArgs);
-                memory.AddToolAction($"{command.Name}{DescribeForMemory(cleanArgs)}");
-                return false;
+                return await RunToolCallsAsync(decision.ToolCalls, userInput, lower, history);
             }
 
             // The LLM chose no tool. Fall through to the grounded conversational
@@ -140,6 +138,62 @@ namespace Personal_Assistant.Dispatch
             // classifier's ungrounded text — preserving the app's original
             // answer quality for chit-chat and current-events questions.
             return await ConversationalAsync(userInput, history);
+        }
+
+        // Runs each tool the model asked for, in order (compound requests like
+        // "turn off the lights and close the door" arrive as several calls).
+        // Unknown/invalid calls are skipped rather than aborting the batch. If
+        // NOTHING ran — a lone bogus call — we fall back to keyword matching,
+        // preserving the single-tool miss behaviour.
+        private async Task<bool> RunToolCallsAsync(
+            IReadOnlyList<ToolInvocation> calls,
+            string userInput,
+            string lower,
+            IReadOnlyList<ConversationTurn> history)
+        {
+            int ran = 0;
+            foreach (var call in calls)
+            {
+                var command = registry.FindByName(call.Name);
+                if (command == null)
+                {
+                    Console.WriteLine($"[dispatch] LLM picked unknown tool '{call.Name}' -> skip");
+                    continue;
+                }
+                if (!TryValidate(command.Tool, call.Arguments, out var cleanArgs, out string error))
+                {
+                    Console.WriteLine($"[dispatch] invalid args for '{command.Name}': {error} -> skip");
+                    continue;
+                }
+
+                Console.WriteLine($"[dispatch] tool '{command.Name}' args=[{Describe(cleanArgs)}]");
+                await command.Handler(context, cleanArgs);
+                if (!command.Ephemeral) memory.AddToolCall(command.Name, cleanArgs);
+                ran++;
+            }
+
+            if (ran == 0) return await FallbackAsync(userInput, lower, history);
+            return false;
+        }
+
+        // Runs a single tool by name with the given args, validated — used by the
+        // `repeat` tool to execute the actions it loops over. Does not touch
+        // conversation memory (the top-level call already records what ran).
+        public async Task RunToolByNameAsync(string name, IReadOnlyDictionary<string, string> args)
+        {
+            var command = registry.FindByName(name);
+            if (command == null)
+            {
+                Console.WriteLine($"[dispatch] RunTool: unknown tool '{name}'");
+                return;
+            }
+            if (!TryValidate(command.Tool, args, out var cleanArgs, out string error))
+            {
+                Console.WriteLine($"[dispatch] RunTool: invalid args for '{name}': {error}");
+                return;
+            }
+            Console.WriteLine($"[dispatch] RunTool '{name}' args=[{Describe(cleanArgs)}]");
+            await command.Handler(context, cleanArgs);
         }
 
         // Legacy keyword path: first matching command wins, else conversational AI.
@@ -154,7 +208,7 @@ namespace Personal_Assistant.Dispatch
                 {
                     Console.WriteLine($"[dispatch] keyword match '{command.Name}' args=[{Describe(cleanArgs)}]");
                     await command.Handler(context, cleanArgs);
-                    memory.AddToolAction($"{command.Name}{DescribeForMemory(cleanArgs)}");
+                    memory.AddToolCall(command.Name, cleanArgs);
                     return false;
                 }
                 Console.WriteLine($"[dispatch] keyword match '{command.Name}' had invalid args: {error}");
@@ -239,14 +293,6 @@ namespace Personal_Assistant.Dispatch
         {
             if (args == null || args.Count == 0) return "";
             return string.Join(", ", System.Linq.Enumerable.Select(args, kv => $"{kv.Key}={kv.Value}"));
-        }
-
-        // Same shape as Describe but formatted for the model's own memory (fed
-        // back into future prompts), e.g. "(state=on, room=LED)".
-        private static string DescribeForMemory(IReadOnlyDictionary<string, string> args)
-        {
-            string described = Describe(args);
-            return described.Length == 0 ? "" : $" ({described})";
         }
     }
 }

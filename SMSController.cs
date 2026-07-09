@@ -107,21 +107,18 @@ namespace Personal_Assistant.SMSController
                     var composeButton = window.FindFirstDescendant(conditionFactory.ByAutomationId("NewMessageButton"))?.AsButton();
                     composeButton?.Invoke();
                     Wait.UntilInputIsProcessed(); // Let the UI catch up
-                    Console.WriteLine("Shouldve pressed the new message by now");
 
                     // 2. Find the "To" field, type number, press Enter
                     var toField = window.FindFirstDescendant(conditionFactory.ByAutomationId("TextBox"))?.AsTextBox();
                     toField?.Enter(contactNumber);
                     Keyboard.Press(VirtualKeyShort.ENTER);
                     Wait.UntilInputIsProcessed();
-                    Console.WriteLine("Shouldve pressed on the 'To' box");
 
                     // 3. Find the message box, type message, press Enter
                     var messageBox = window.FindFirstDescendant(conditionFactory.ByAutomationId("InputTextBox"))?.AsTextBox();
                     messageBox.Text = message;
                     Keyboard.Press(VirtualKeyShort.ENTER);
 
-                    Console.WriteLine("Message sent successfully via FlaUI.");
                 }
                 catch (Exception ex)
                 {

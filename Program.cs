@@ -142,8 +142,14 @@ namespace Personal_Assistant
             var nowPlaying = new NowPlayingReader();
             // Fires timers/alarms/reminders by speaking them. Say is serialised
             // internally, so a reminder firing mid-conversation won't garble
-            // whatever the assistant is already saying.
-            var reminders = new ReminderService(message => speechManager.Say("⏰", message));
+            // whatever the assistant is already saying. The widget host mirrors
+            // each one as an on-screen floating countdown.
+            var timerWidgets = new TimerWidgetHost();
+            // Empty userInput label: the speech bubble can't render emoji (shows
+            // as []), and a fired reminder has no user utterance to show anyway.
+            var reminders = new ReminderService(
+                message => speechManager.Say("", message),
+                timerWidgets);
 
             // Shared dependencies handed to every command handler.
             var context = new CommandContext
@@ -179,6 +185,9 @@ namespace Personal_Assistant
                 LocalLLMService.DetectToolAsync,
                 LocalLLMService.GenerateResponse,
                 conversationMemory);
+
+            // Let the `repeat` tool run other tools by name (validated).
+            context.RunTool = dispatcher.RunToolByNameAsync;
 
             // When the user barges in over a spoken reply with the wakeword, we
             // skip the wakeword wait + greeting on the next turn and listen for
@@ -834,7 +843,112 @@ namespace Personal_Assistant
                             : $"Cancelled {n} {(n == 1 ? "reminder" : "reminders")}.");
                 }));
 
+            // --- Composition primitives (LLM-only; no keyword path) ------------------
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("wait",
+                    "Pause for a number of seconds. Use it BETWEEN other tool calls to make " +
+                    "timed effects, e.g. turning a light on, waiting, then off so a flash is " +
+                    "visible. Keep the wait short.",
+                    new ToolParameter("seconds", "integer", "Seconds to pause, from 1 to 30.")),
+                lower => false, // composition-only — the model calls it, not the keyword path
+                async (ctx, args) =>
+                {
+                    int secs = 1;
+                    if (args.TryGetValue("seconds", out string s) && int.TryParse(s, out int parsed)) secs = parsed;
+                    secs = Math.Max(0, Math.Min(30, secs));
+                    await Task.Delay(secs * 1000);
+                },
+                ephemeral: true));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("repeat",
+                    "Repeat a sequence of tool calls several times — use for looping effects " +
+                    "like flashing a light N times. 'actions' is a JSON array of steps, each an " +
+                    "object {\"tool\":\"<tool name>\",\"args\":{...}}. Example to flash the bedroom " +
+                    "light 3 times: times=3, actions=" +
+                    "[{\"tool\":\"control_lights\",\"args\":{\"state\":\"on\",\"room\":\"bedroom\"}}," +
+                    "{\"tool\":\"wait\",\"args\":{\"seconds\":\"1\"}}," +
+                    "{\"tool\":\"control_lights\",\"args\":{\"state\":\"off\",\"room\":\"bedroom\"}}," +
+                    "{\"tool\":\"wait\",\"args\":{\"seconds\":\"1\"}}].",
+                    new ToolParameter("times", "integer", "How many times to repeat the sequence, from 1 to 10."),
+                    new ToolParameter("actions", "string",
+                        "JSON array of steps to repeat, each {\"tool\":\"<name>\",\"args\":{...}}.")),
+                lower => false,
+                async (ctx, args) =>
+                {
+                    if (ctx.RunTool == null) return;
+                    int times = 1;
+                    if (args.TryGetValue("times", out string t) && int.TryParse(t, out int parsedT)) times = parsedT;
+                    times = Math.Max(1, Math.Min(10, times));
+
+                    if (!args.TryGetValue("actions", out string actionsJson) || string.IsNullOrWhiteSpace(actionsJson))
+                        return;
+                    var steps = ParseRepeatActions(actionsJson);
+                    if (steps.Count == 0) return;
+
+                    for (int i = 0; i < times; i++)
+                    {
+                        foreach (var step in steps)
+                        {
+                            // No nesting — a repeat inside a repeat could block for a long time.
+                            if (string.Equals(step.Tool, "repeat", StringComparison.OrdinalIgnoreCase)) continue;
+                            await ctx.RunTool(step.Tool, step.Args);
+                        }
+                    }
+                },
+                ephemeral: true));
+
             return registry;
+        }
+
+        private sealed class RepeatStep
+        {
+            public string Tool;
+            public Dictionary<string, string> Args;
+        }
+
+        // Parses the `repeat` tool's `actions` argument (a JSON array of
+        // {tool, args} steps) into a runnable list. Defensive: malformed input
+        // yields an empty list rather than throwing.
+        private static List<RepeatStep> ParseRepeatActions(string json)
+        {
+            var result = new List<RepeatStep>();
+            try
+            {
+                using (var doc = JsonDocument.Parse(json))
+                {
+                    if (doc.RootElement.ValueKind != JsonValueKind.Array) return result;
+                    foreach (var el in doc.RootElement.EnumerateArray())
+                    {
+                        if (el.ValueKind != JsonValueKind.Object) continue;
+                        if (!el.TryGetProperty("tool", out var toolEl) ||
+                            toolEl.ValueKind != JsonValueKind.String) continue;
+
+                        var step = new RepeatStep
+                        {
+                            Tool = toolEl.GetString(),
+                            Args = new Dictionary<string, string>()
+                        };
+                        if (el.TryGetProperty("args", out var argsEl) &&
+                            argsEl.ValueKind == JsonValueKind.Object)
+                        {
+                            foreach (var p in argsEl.EnumerateObject())
+                            {
+                                step.Args[p.Name] = p.Value.ValueKind == JsonValueKind.String
+                                    ? p.Value.GetString()
+                                    : p.Value.GetRawText();
+                            }
+                        }
+                        result.Add(step);
+                    }
+                }
+            }
+            catch (JsonException)
+            {
+                // Malformed actions -> nothing to run.
+            }
+            return result;
         }
 
         // Human-friendly spoken duration, e.g. "5 minutes", "1 hour and 30 minutes".

@@ -22,21 +22,36 @@ namespace Personal_Assistant.Reminders
         Alarm  // wall-clock time ("at 7 AM")
     }
 
+    // Optional on-screen visualization sink. Implemented by the WinForms widget
+    // host; the scheduler drives it but stays the source of truth for firing.
+    // All calls may arrive from the scheduler's background thread, so the
+    // implementation is responsible for marshalling to its own UI thread.
+    public interface IReminderVisual
+    {
+        void Show(int id, string label, DateTime fireAt, ReminderKind kind);
+        void Fired(int id);   // flash + dismiss the widget
+        void Remove(int id);  // cancelled individually
+        void Clear();         // all cancelled
+    }
+
     // In-memory scheduler for timers, alarms, and reminders. A single background
     // ticker checks once a second for due items and hands each to an injected
-    // announce callback (which speaks it). Not persisted — pending items are
+    // announce callback (which speaks it). An optional visual sink mirrors each
+    // item as an on-screen countdown widget. Not persisted — pending items are
     // lost on restart, matching the in-memory design used elsewhere.
     public class ReminderService : IDisposable
     {
         private readonly List<ScheduledItem> items = new List<ScheduledItem>();
         private readonly object gate = new object();
         private readonly Func<string, Task> announce;
+        private readonly IReminderVisual visual;
         private readonly Timer ticker;
         private int nextId = 1;
 
-        public ReminderService(Func<string, Task> announce)
+        public ReminderService(Func<string, Task> announce, IReminderVisual visual = null)
         {
             this.announce = announce ?? throw new ArgumentNullException(nameof(announce));
+            this.visual = visual;
             // Check every second; first check after one second.
             ticker = new Timer(_ => Tick(), null, 1000, 1000);
         }
@@ -56,6 +71,7 @@ namespace Personal_Assistant.Reminders
                 item.Id = nextId++;
                 items.Add(item);
             }
+            visual?.Show(item.Id, item.Label, item.FireAt, item.Kind);
             return item.FireAt;
         }
 
@@ -80,6 +96,7 @@ namespace Personal_Assistant.Reminders
                 item.Id = nextId++;
                 items.Add(item);
             }
+            visual?.Show(item.Id, item.Label, item.FireAt, item.Kind);
             return fireAt;
         }
 
@@ -95,12 +112,14 @@ namespace Personal_Assistant.Reminders
         // Cancels all pending items; returns how many were removed.
         public int CancelAll()
         {
+            int count;
             lock (gate)
             {
-                int count = items.Count;
+                count = items.Count;
                 items.Clear();
-                return count;
             }
+            visual?.Clear();
+            return count;
         }
 
         private void Tick()
@@ -128,6 +147,9 @@ namespace Personal_Assistant.Reminders
 
         private async Task Fire(ScheduledItem item)
         {
+            // Flash + dismiss the on-screen widget in step with the announcement.
+            visual?.Fired(item.Id);
+
             string message;
             if (!string.IsNullOrWhiteSpace(item.Label))
             {

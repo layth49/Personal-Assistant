@@ -67,6 +67,10 @@ namespace Personal_Assistant.Dispatch
         public string IpAddressPlug { get; init; }
         public string IpAddressSwitch { get; init; }
 
+        // Runs another tool by name (validated) — how the `repeat` tool executes
+        // the actions it loops over. Wired from the dispatcher after construction.
+        public Func<string, IReadOnlyDictionary<string, string>, Task> RunTool { get; set; }
+
         // The raw text the user actually said for this turn. Handlers pass it to
         // SpeechService.Say so the on-screen bubble shows what was heard.
         public string RecognizedText { get; set; }
@@ -97,17 +101,24 @@ namespace Personal_Assistant.Dispatch
         // Executes the command. Args are already validated against Tool.Parameters.
         public Func<CommandContext, IReadOnlyDictionary<string, string>, Task> Handler { get; }
 
+        // Ephemeral tools (wait, repeat) are control-flow primitives, not real
+        // actions — they're skipped from conversation memory to avoid cluttering
+        // it (a flash = many wait/light calls).
+        public bool Ephemeral { get; }
+
         public VoiceCommand(
             ToolDefinition tool,
             Func<string, bool> matches,
             Func<CommandContext, IReadOnlyDictionary<string, string>, Task> handler,
-            Func<string, IReadOnlyDictionary<string, string>> extractArgs = null)
+            Func<string, IReadOnlyDictionary<string, string>> extractArgs = null,
+            bool ephemeral = false)
         {
             Tool = tool ?? throw new ArgumentNullException(nameof(tool));
             Name = tool.Name;
             Matches = matches ?? throw new ArgumentNullException(nameof(matches));
             Handler = handler ?? throw new ArgumentNullException(nameof(handler));
             ExtractArgs = extractArgs ?? (_ => EmptyArgs);
+            Ephemeral = ephemeral;
         }
 
         public static readonly IReadOnlyDictionary<string, string> EmptyArgs =

@@ -25,7 +25,7 @@ namespace Personal_Assistant.LLMClient
 
         private const string BaseSystemPrompt =
             "You are L.A.I.T.H., Layth's personal voice assistant running on his computer. " +
-            "Your responses are converted to speech, so: never use markdown, bullet points, " +
+            "Your responses are converted to speech, so: never use markdown, emojis, bullet points, " +
             "asterisks, or headers — plain spoken sentences only. " +
             "Default to one short sentence. Only give more detail if the user asks for it, " +
             "asks a multi-part question, or the answer genuinely requires it (e.g. instructions, comparisons). " +
@@ -49,11 +49,19 @@ namespace Personal_Assistant.LLMClient
         private static readonly JsonSerializerOptions RawJsonOpts = new JsonSerializerOptions();
 
         private const string ToolSystemPrompt =
-            "You are L.A.I.T.H., a voice assistant intent router. " +
-            "If the user's request matches one of the provided tools, call that tool " +
-            "with the correct arguments extracted from what they said. " +
-            "If no tool fits, just answer briefly without calling a tool. " +
-            "Never invent argument values that the user did not provide.";
+            "You are L.A.I.T.H., a voice assistant. Work out how to accomplish the user's " +
+            "request using the provided tools, then emit the tool call(s) that achieve it.\n" +
+            "- If one tool matches, call it.\n" +
+            "- If the request needs several actions, call all the matching tools, one call per action.\n" +
+            "- If NO single tool directly matches but the request can be accomplished by combining " +
+            "the tools you have, figure out the sequence of calls that achieves it and emit them. " +
+            "For example, there is no 'flash the light' tool, but you can turn the light on, use the " +
+            "wait tool to pause briefly, then turn it off — and use the repeat tool to loop that " +
+            "sequence to flash several times. Think about which primitive actions add up to what the " +
+            "user asked for.\n" +
+            "- Only if the request genuinely can't be done with any combination of the tools, don't " +
+            "call a tool — just answer briefly.\n" +
+            "Never invent tools, and never invent argument values the user did not provide.";
 
         // Detection timeout. Generous because a cold local model can be slow, but
         // bounded so the dispatcher can fall back to keyword matching if the
@@ -118,11 +126,11 @@ namespace Personal_Assistant.LLMClient
             }
         }
 
-        // Builds the OpenAI `messages` array: system prompt (with a note about any
-        // tools already run this session), prior spoken turns (mapping our "model"
-        // role to OpenAI's "assistant"), then the current user input. Tool-action
-        // entries are deliberately NOT emitted as assistant messages — small
-        // models imitate that text and start writing fake tool calls as prose.
+        // Builds the OpenAI `messages` array: system prompt, prior turns, then the
+        // current user input. Spoken turns map "model" -> "assistant"; executed
+        // tools render as a native assistant `tool_calls` message plus a matching
+        // `tool` result. That keeps strict user/assistant alternation AND gives
+        // the model a real prior call to follow, without any imitable text.
         private static List<object> BuildMessages(
             string systemPrompt,
             IReadOnlyList<ConversationTurn> history,
@@ -130,39 +138,57 @@ namespace Personal_Assistant.LLMClient
         {
             var messages = new List<object>
             {
-                new { role = "system", content = AppendRecentActions(systemPrompt, history) }
+                new Dictionary<string, object> { ["role"] = "system", ["content"] = systemPrompt }
             };
+
+            int callId = 0;
             if (history != null)
             {
                 foreach (var turn in history)
                 {
-                    if (turn.IsTool) continue; // surfaced via the system note instead
-                    string role = turn.Role == "model" ? "assistant" : "user";
-                    messages.Add(new { role, content = turn.Text });
+                    if (turn.IsTool)
+                    {
+                        string id = "call_" + (++callId);
+                        string argsJson = JsonSerializer.Serialize(
+                            turn.ToolArgs ?? new Dictionary<string, string>());
+
+                        messages.Add(new Dictionary<string, object>
+                        {
+                            ["role"] = "assistant",
+                            ["content"] = "",
+                            ["tool_calls"] = new object[]
+                            {
+                                new Dictionary<string, object>
+                                {
+                                    ["id"] = id,
+                                    ["type"] = "function",
+                                    ["function"] = new Dictionary<string, object>
+                                    {
+                                        ["name"] = turn.ToolName,
+                                        ["arguments"] = argsJson
+                                    }
+                                }
+                            }
+                        });
+                        messages.Add(new Dictionary<string, object>
+                        {
+                            ["role"] = "tool",
+                            ["tool_call_id"] = id,
+                            ["content"] = "done"
+                        });
+                        continue;
+                    }
+
+                    messages.Add(new Dictionary<string, object>
+                    {
+                        ["role"] = turn.Role == "model" ? "assistant" : "user",
+                        ["content"] = turn.Text
+                    });
                 }
             }
-            messages.Add(new { role = "user", content = inputText });
-            return messages;
-        }
 
-        // Folds any executed-tool entries into a system-prompt context note so the
-        // model has follow-up context ("turn it back off") without ever seeing
-        // tool-call-shaped text in the assistant role.
-        private static string AppendRecentActions(
-            string systemPrompt,
-            IReadOnlyList<ConversationTurn> history)
-        {
-            if (history == null) return systemPrompt;
-            var actions = new List<string>();
-            foreach (var t in history)
-            {
-                if (t.IsTool) actions.Add(t.Text);
-            }
-            if (actions.Count == 0) return systemPrompt;
-            return systemPrompt +
-                "\n\nActions you already performed earlier this session (context only — do NOT " +
-                "re-run, announce, or narrate them, and never write text in this format yourself): " +
-                string.Join("; ", actions) + ".";
+            messages.Add(new Dictionary<string, object> { ["role"] = "user", ["content"] = inputText });
+            return messages;
         }
 
         // Intent router for LLM-first dispatch on the local stack. Sends the tool
@@ -264,8 +290,13 @@ namespace Personal_Assistant.LLMClient
                 // "auto" lets the model pick a tool OR answer in text — the
                 // LLM-first behaviour we want (not forced to call a tool).
                 ["tool_choice"] = "auto",
-                ["temperature"] = 0.0,
-                ["max_tokens"] = 200,
+                // A little warmth so the router isn't rigidly literal and can
+                // reason about composing tools for requests with no direct tool
+                // (e.g. "flash the light" -> on then off). Still low enough to
+                // keep ordinary routing stable.
+                ["temperature"] = 0.3,
+                // Headroom for several tool calls in one compound request.
+                ["max_tokens"] = 400,
                 ["stream"] = false
             };
         }
@@ -283,19 +314,22 @@ namespace Personal_Assistant.LLMClient
                         return LlmDecision.Failure();
                     }
 
-                    // Tool call takes precedence over any text content.
+                    // Tool call(s) take precedence over any text content. Collect
+                    // every call so compound requests run all their actions.
                     if (message.TryGetProperty("tool_calls", out var toolCalls) &&
                         toolCalls.ValueKind == JsonValueKind.Array &&
                         toolCalls.GetArrayLength() > 0)
                     {
-                        var first = toolCalls[0];
-                        if (first.TryGetProperty("function", out var fn) &&
-                            fn.TryGetProperty("name", out var nameEl))
+                        var calls = new List<ToolInvocation>();
+                        foreach (var tc in toolCalls.EnumerateArray())
                         {
-                            string name = nameEl.GetString();
-                            var args = ParseArguments(fn);
-                            return LlmDecision.ToolCall(name, args);
+                            if (tc.TryGetProperty("function", out var fn) &&
+                                fn.TryGetProperty("name", out var nameEl))
+                            {
+                                calls.Add(new ToolInvocation(nameEl.GetString(), ParseArguments(fn)));
+                            }
                         }
+                        if (calls.Count > 0) return LlmDecision.Tools(calls);
                     }
 
                     // No tool -> plain reply.

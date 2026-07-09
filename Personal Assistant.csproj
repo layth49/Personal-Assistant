@@ -458,6 +458,7 @@
     <Compile Include="SMSController.cs" />
     <Compile Include="SpeechManager.cs" />
     <Compile Include="STTClient.cs" />
+    <Compile Include="TimerWidgetHost.cs" />
     <Compile Include="ToolRegistry.cs" />
     <Compile Include="TTSClient.cs" />
     <Compile Include="VoiceCommand.cs" />
