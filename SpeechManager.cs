@@ -1,5 +1,6 @@
 using Microsoft.CognitiveServices.Speech;
 using Microsoft.CognitiveServices.Speech.Audio;
+using Personal_Assistant.Diagnostics;
 using Personal_Assistant.STTClient;
 using Personal_Assistant.TTSClient;
 using Python.Runtime;
@@ -43,8 +44,13 @@ namespace Personal_Assistant.SpeechManager
         // the assistant is speaking can't garble audio or clobber the bubble state.
         private readonly SemaphoreSlim sayGate = new SemaphoreSlim(1, 1);
 
-        public SpeechService()
+        // Optional per-turn latency breakdown (null-safe — a caller that doesn't
+        // care about timing can just not pass one).
+        private readonly LatencyTracker latency;
+
+        public SpeechService(LatencyTracker latency = null)
         {
+            this.latency = latency;
             try
             {
                 keywordModel = KeywordRecognitionModel.FromFile(@"C:\Users\layth\LAITH\local\keyword.table");
@@ -105,6 +111,7 @@ namespace Personal_Assistant.SpeechManager
         public async Task<string> RecognizeOnceAsync(int maxSeconds = 15)
         {
             string text = await whisper.RecognizeOnceAsync(maxSeconds);
+            latency?.RecordStt(whisper.LastTranscribeElapsed);
             if (string.IsNullOrEmpty(text))
             {
                 await Say(string.Empty, "Sorry I didn't get that. Can you say it again?");
@@ -117,6 +124,7 @@ namespace Personal_Assistant.SpeechManager
             try
             {
                 await kokoroTTS.SpeakAsync(textToSynthesize);
+                latency?.RecordTts(kokoroTTS.LastSynthesisElapsed);
             }
             finally
             {

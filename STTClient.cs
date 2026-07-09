@@ -1,6 +1,7 @@
 using NAudio.Wave;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -30,6 +31,13 @@ namespace Personal_Assistant.STTClient
         // How long to wait for the user to start speaking before giving up.
         private static readonly TimeSpan InitialSilenceTimeout = TimeSpan.FromSeconds(5);
 
+        // Wall-clock time of the last TranscribeAsync call only — the network
+        // round trip to the Whisper server. Deliberately excludes
+        // CaptureAudioAsync (which is dominated by however long the user took to
+        // speak, plus the fixed trailing-silence wait), so this reflects only how
+        // long it took to "understand" the already-recorded audio.
+        public TimeSpan LastTranscribeElapsed { get; private set; }
+
         public async Task<string> RecognizeOnceAsync(int maxSeconds = 15)
         {
             byte[] wavBytes;
@@ -48,9 +56,12 @@ namespace Personal_Assistant.STTClient
                 return string.Empty;
             }
 
+            var sw = Stopwatch.StartNew();
             try
             {
                 string text = await TranscribeAsync(wavBytes).ConfigureAwait(false);
+                sw.Stop();
+                LastTranscribeElapsed = sw.Elapsed;
                 if (!string.IsNullOrWhiteSpace(text))
                 {
                     Console.WriteLine($"RECOGNIZED: {text}");
@@ -59,6 +70,8 @@ namespace Personal_Assistant.STTClient
             }
             catch (Exception ex)
             {
+                sw.Stop();
+                LastTranscribeElapsed = sw.Elapsed;
                 Console.WriteLine("Whisper STT transcription failed: " + ex.Message);
                 return string.Empty;
             }

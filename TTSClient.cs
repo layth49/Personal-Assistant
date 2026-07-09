@@ -1,5 +1,6 @@
 using NAudio.Wave;
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
 using System.Text;
@@ -22,6 +23,12 @@ namespace Personal_Assistant.TTSClient
         private WaveOutEvent activeOutput;
         private CancellationTokenSource activeCts;
 
+        // Wall-clock time of the last synthesis request only — the network round
+        // trip to Kokoro to get WAV bytes back. Deliberately excludes playback
+        // (started after this point), which scales with reply length and isn't a
+        // latency bottleneck the way generation time is.
+        public TimeSpan LastSynthesisElapsed { get; private set; }
+
         public async Task SpeakAsync(string text)
         {
             if (string.IsNullOrWhiteSpace(text)) return;
@@ -35,6 +42,7 @@ namespace Personal_Assistant.TTSClient
             }
 
             byte[] wavBytes;
+            var sw = Stopwatch.StartNew();
             try
             {
                 var payload = new
@@ -54,6 +62,7 @@ namespace Personal_Assistant.TTSClient
                         wavBytes = await resp.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
                     }
                 }
+                LastSynthesisElapsed = sw.Elapsed;
             }
             catch (OperationCanceledException)
             {

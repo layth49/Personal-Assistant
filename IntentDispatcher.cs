@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading.Tasks;
+using Personal_Assistant.Diagnostics;
 
 namespace Personal_Assistant.Dispatch
 {
@@ -77,19 +79,22 @@ namespace Personal_Assistant.Dispatch
         private readonly ToolDetector detector;
         private readonly Conversationalist conversationalist;
         private readonly ConversationMemory memory;
+        private readonly LatencyTracker latency;
 
         public IntentDispatcher(
             ToolRegistry registry,
             CommandContext context,
             ToolDetector detector,
             Conversationalist conversationalist,
-            ConversationMemory memory = null)
+            ConversationMemory memory = null,
+            LatencyTracker latency = null)
         {
             this.registry = registry ?? throw new ArgumentNullException(nameof(registry));
             this.context = context ?? throw new ArgumentNullException(nameof(context));
             this.detector = detector ?? throw new ArgumentNullException(nameof(detector));
             this.conversationalist = conversationalist ?? throw new ArgumentNullException(nameof(conversationalist));
             this.memory = memory ?? new ConversationMemory();
+            this.latency = latency;
         }
 
         // Returns true if the assistant's spoken reply was interrupted by the
@@ -109,6 +114,7 @@ namespace Personal_Assistant.Dispatch
             memory.AddUser(userInput);
 
             LlmDecision decision;
+            var detectSw = Stopwatch.StartNew();
             try
             {
                 decision = await detector(userInput, registry.ToolDefinitions, history)
@@ -118,6 +124,10 @@ namespace Personal_Assistant.Dispatch
             {
                 Console.WriteLine($"[dispatch] detector threw, falling back to keywords: {ex.Message}");
                 decision = LlmDecision.Failure();
+            }
+            finally
+            {
+                latency?.RecordLlm(detectSw.Elapsed);
             }
 
             // Malformed / timeout / error -> legacy keyword matcher.
@@ -221,7 +231,9 @@ namespace Personal_Assistant.Dispatch
         // user wants to be able to barge in with the wakeword.
         private async Task<bool> ConversationalAsync(string userInput, IReadOnlyList<ConversationTurn> history)
         {
+            var sw = Stopwatch.StartNew();
             string response = await conversationalist(userInput, history);
+            latency?.RecordLlm(sw.Elapsed);
             memory.AddModel(response);
             return await context.Speech.SayInterruptible(userInput, response);
         }

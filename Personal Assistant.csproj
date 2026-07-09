@@ -443,6 +443,7 @@
     <Compile Include="Geolocator.cs" />
     <Compile Include="IntentDispatcher.cs" />
     <Compile Include="IsExternalInit.cs" />
+    <Compile Include="LatencyTracker.cs" />
     <Compile Include="LightAutomator.cs" />
     <Compile Include="LLMClient.cs" />
     <Compile Include="MediaController.cs" />

@@ -1,6 +1,7 @@
 using Personal_Assistant.AppLaunching;
 using Personal_Assistant.Arduino;
 using Personal_Assistant.AudioControl;
+using Personal_Assistant.Diagnostics;
 using Personal_Assistant.Dispatch;
 using Personal_Assistant.Geolocator;
 using Personal_Assistant.LightAutomator;
@@ -121,9 +122,14 @@ namespace Personal_Assistant
                 sys.path.append(@"C:\Users\layth\LAITH\local");
             }
 
+            // Tracks per-turn stt/llm/tts latency so we can see what's actually
+            // the bottleneck. Reset before each recognition attempt, printed
+            // after the turn's dispatch completes.
+            var latency = new LatencyTracker();
+
             // Single-instance services. Kokoro / Whisper clients each reuse a
             // single HttpClient so creating SpeechService once keeps requests warm.
-            var speechManager = new SpeechService();
+            var speechManager = new SpeechService(latency);
             await speechManager.WarmUpAudioAsync(); // wakes the audio device so first greeting isn't clipped
 
             var contacts = LoadContacts();
@@ -184,7 +190,8 @@ namespace Personal_Assistant
                 context,
                 LocalLLMService.DetectToolAsync,
                 LocalLLMService.GenerateResponse,
-                conversationMemory);
+                conversationMemory,
+                latency);
 
             // Let the `repeat` tool run other tools by name (validated).
             context.RunTool = dispatcher.RunToolByNameAsync;
@@ -215,6 +222,10 @@ namespace Personal_Assistant
                 }
                 listenImmediately = false;
 
+                // Fresh latency counters for this turn — RecognizeOnceAsync
+                // records STT (understanding-only) internally.
+                latency.Reset();
+
                 // Whisper STT returns the transcript, or empty for NoMatch (which
                 // RecognizeOnceAsync has already spoken a re-prompt for).
                 recognizedText = await speechManager.RecognizeOnceAsync();
@@ -223,6 +234,7 @@ namespace Personal_Assistant
                 {
                     bool interrupted = await dispatcher.DispatchAsync(recognizedText);
                     if (interrupted) listenImmediately = true;
+                    Console.WriteLine(latency.Summary());
                 }
             }
         }
