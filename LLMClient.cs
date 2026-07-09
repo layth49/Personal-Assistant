@@ -25,8 +25,10 @@ namespace Personal_Assistant.LLMClient
 
         private const string BaseSystemPrompt =
             "You are L.A.I.T.H., Layth's personal voice assistant running on his computer. " +
-            "Your responses are converted to speech, so: never use markdown, emojis, bullet points, " +
+            "Your responses are converted to speech, so: never use markdown, bullet points, " +
             "asterisks, or headers — plain spoken sentences only. " +
+            "An occasional emoji is fine (it shows in the on-screen bubble and isn't spoken), " +
+            "but don't overuse them. " +
             "Default to one short sentence. Only give more detail if the user asks for it, " +
             "asks a multi-part question, or the answer genuinely requires it (e.g. instructions, comparisons). " +
             "Lead with the answer or result first, then explain if needed — never bury the answer at the end. " +
@@ -36,7 +38,7 @@ namespace Personal_Assistant.LLMClient
             "If voice input is garbled, ambiguous, or doesn't clearly match a command or question, briefly " +
             "ask for clarification instead of guessing. " +
             "Tone is direct and casual, like a capable assistant who knows Layth well — not stiff or overly formal. " +
-            "Never fabricate information; if you don't know or aren't sure, say so plainly.";
+            "Never fabricate information; if you don't know or aren't sure, say so plainly. /no think";
 
         private static readonly JsonSerializerOptions JsonOpts = new JsonSerializerOptions
         {
@@ -75,16 +77,31 @@ namespace Personal_Assistant.LLMClient
             return client;
         }
 
-        // Conversational answer (grounded via SearxNG), matching the
-        // Conversationalist delegate signature so IntentDispatcher can call it.
-        public static async Task<string> GenerateResponse(
+        // Conversational answer, matching the Conversationalist delegate
+        // signature so IntentDispatcher can call it. No web search here — that
+        // used to run unconditionally on every miss (including things that
+        // should've been a tool call, e.g. a misrouted "turn off my lights"),
+        // paying a SearxNG round trip whether or not it was needed. Grounding
+        // now goes through the explicit `web_search` tool the router calls when
+        // IT decides the request needs current/external info.
+        public static Task<string> GenerateResponse(
             string inputText,
+            IReadOnlyList<ConversationTurn> history) =>
+            AnswerAsync(inputText, null, history);
+
+        // Answers using search hits the caller already fetched — what the
+        // `web_search` tool handler calls after running a SearxNG search.
+        public static Task<string> AnswerWithSearchResults(
+            string inputText,
+            List<SearchHit> hits,
+            IReadOnlyList<ConversationTurn> history) =>
+            AnswerAsync(inputText, hits, history);
+
+        private static async Task<string> AnswerAsync(
+            string inputText,
+            List<SearchHit> hits,
             IReadOnlyList<ConversationTurn> history)
         {
-            // Ground the LLM with SearxNG results. Best-effort — a SearxNG outage
-            // returns an empty list, and the LLM still answers from its own knowledge.
-            List<SearchHit> hits = await SearxNGService.SearchAsync(inputText);
-
             string systemPrompt = BuildSystemPrompt(hits);
 
             // OpenAI-compatible chat-completions payload. LM Studio ignores the

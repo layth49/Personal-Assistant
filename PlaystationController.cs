@@ -22,6 +22,10 @@ namespace Personal_Assistant.PlaystationController
             await speechManager.Say(Program.recognizedText,
                 "Okay! Turning on your PlayStation 5 now. What game would you like to play?");
 
+            Console.WriteLine("Waiting for the user to respond with a game title...");
+            string userResponse = (await speechManager.RecognizeOnceAsync()).TrimEnd('.');
+            Console.WriteLine($"User wants to play: {userResponse}");
+
             using (var automation = new UIA3Automation())
             {
                 // 1. Trigger the launcher
@@ -69,7 +73,6 @@ namespace Personal_Assistant.PlaystationController
                 var conditionFactory = new ConditionFactory(new UIA3PropertyLibrary());
 
                 // Try to find the specific console button. 
-                // IMPORTANT: Replace "YOUR_PS5_NAME_HERE" with the actual name shown in Remote Play!
                 var connectButton = window.FindFirstDescendant(conditionFactory.ByName("PS5-900"))?.AsButton();
 
                 if (connectButton != null)
@@ -85,7 +88,7 @@ namespace Personal_Assistant.PlaystationController
                     Keyboard.Press(VirtualKeyShort.ENTER);
                 }
 
-                string userResponse = (await speechManager.RecognizeOnceAsync()).TrimEnd('.');
+                
 
                 window.Focus();
 

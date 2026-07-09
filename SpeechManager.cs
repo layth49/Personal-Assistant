@@ -211,7 +211,8 @@ namespace Personal_Assistant.SpeechManager
         // false if the speech finished normally.
         public async Task<bool> SayInterruptible(string userInput, string response)
         {
-            // No interrupt recognizer available -> behave exactly like Say.
+            // No interrupt recognizer available -> behave exactly like Say
+            // (which shows emoji in the bubble but strips them for TTS).
             if (interruptKeywordRecognizer == null || keywordModel == null)
             {
                 await Say(userInput, response);

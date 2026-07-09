@@ -20,7 +20,6 @@ namespace Personal_Assistant.SMSController
         [DllImport("user32.dll")]
         static extern bool SetForegroundWindow(IntPtr hWnd);
 
-        private readonly InputSimulator simulator = new InputSimulator();
         private readonly SpeechService speechManager = new SpeechService();
 
         public async Task SendSMS(string contactName, string contactNumber)
@@ -46,7 +45,7 @@ namespace Personal_Assistant.SMSController
                     {
                         FocusPhoneLink();
                         SendMessageToContact(contactNumber,
-                            "Hello! This was sent by L.A.I.T.H.49, AKA Layth's Logical Assistant for Intelligent Task Handling 49!");
+                            "Hello! This was sent by L.Λ.I.T.H.49, AKA Layth's Logical Assistant for Intelligent Task Handling 49!");
 
                         await speechManager.Say(userText, $"Okay! Introducing myself to {contactName}.");
                         return;

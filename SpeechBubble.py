@@ -128,17 +128,97 @@ def _font(size, bold=True):
     return ImageFont.load_default()
 
 
+def _emoji_font(size):
+    """Segoe UI Emoji — Windows' COLR/CPAL colour-emoji font. Pillow renders it
+    with embedded_color=True. Returns None if unavailable (falls back to the
+    text font, i.e. tofu, rather than crashing)."""
+    for path in (os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "seguiemj.ttf"), "seguiemj.ttf"):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return None
+
+
 _FONT_USER = _font(_r(16))
 _FONT_REPLY = _font(_r(20))
+_FONT_EMOJI_USER = _emoji_font(_r(16))
+_FONT_EMOJI_REPLY = _emoji_font(_r(20))
 
 
-def _wrap_text(text, font, max_width):
+def _is_emoji_char(ch):
+    """True for code points that should render via the colour-emoji font rather
+    than the text font. Segoe UI (text) has no glyphs for these — that's why
+    they showed as tofu boxes before."""
+    o = ord(ch)
+    return (
+        0x1F000 <= o <= 0x1FAFF or   # supplementary-plane emoji / pictographs
+        0x1F1E6 <= o <= 0x1F1FF or   # regional indicators (flags)
+        0x2600 <= o <= 0x27BF or     # misc symbols + dingbats
+        0x2300 <= o <= 0x23FF or     # misc technical (⏰ ⌚ ⏳ ...)
+        0x2B00 <= o <= 0x2BFF or     # misc symbols & arrows
+        0x2190 <= o <= 0x21FF or     # arrows
+        0xFE00 <= o <= 0xFE0F or     # variation selectors (emoji vs text style)
+        o == 0x200D or               # zero-width joiner (ZWJ sequences)
+        o == 0x20E3 or               # combining enclosing keycap
+        o in (0x203C, 0x2049, 0x2122, 0x2139)
+    )
+
+
+def _segment_runs(text):
+    """Split text into consecutive (substring, is_emoji) runs so each can be
+    drawn with its appropriate font."""
+    runs = []
+    buf = []
+    buf_emoji = None
+    for ch in text:
+        e = _is_emoji_char(ch)
+        if buf_emoji is None or e == buf_emoji:
+            buf.append(ch)
+            buf_emoji = e
+        else:
+            runs.append(("".join(buf), buf_emoji))
+            buf = [ch]
+            buf_emoji = e
+    if buf:
+        runs.append(("".join(buf), buf_emoji))
+    return runs
+
+
+def _rich_width(text, font, emoji_font):
+    """Advance width of `text` drawn with per-run font switching."""
+    w = 0.0
+    for run, is_emoji in _segment_runs(text):
+        if not run:
+            continue
+        f = emoji_font if (is_emoji and emoji_font is not None) else font
+        w += f.getlength(run)
+    return w
+
+
+def _draw_rich(draw, x, baseline_y, text, font, emoji_font, fill):
+    """Draw `text` at the given baseline, switching to the colour-emoji font for
+    emoji runs. Both are anchored on the baseline ('ls') so text and emoji line
+    up. Returns the x advanced to."""
+    for run, is_emoji in _segment_runs(text):
+        if not run:
+            continue
+        if is_emoji and emoji_font is not None:
+            draw.text((x, baseline_y), run, font=emoji_font, anchor="ls", embedded_color=True)
+            x += emoji_font.getlength(run)
+        else:
+            draw.text((x, baseline_y), run, font=font, anchor="ls", fill=fill)
+            x += font.getlength(run)
+    return x
+
+
+def _wrap_text(text, font, emoji_font, max_width):
     words = text.split(" ")
     lines = []
     current = ""
     for word in words:
         candidate = f"{current} {word}" if current else word
-        if font.getlength(candidate) <= max_width:
+        if _rich_width(candidate, font, emoji_font) <= max_width:
             current = candidate
         else:
             if current:
@@ -296,7 +376,7 @@ def _build_image(user_input, ai_response):
     user_input = (user_input or "").strip()
     has_user = bool(user_input)
 
-    lines = _wrap_text(ai_response, _FONT_REPLY, MAX_TEXT_WIDTH)
+    lines = _wrap_text(ai_response, _FONT_REPLY, _FONT_EMOJI_REPLY, MAX_TEXT_WIDTH)
 
     u_asc, u_desc = _FONT_USER.getmetrics()
     r_asc, r_desc = _FONT_REPLY.getmetrics()
@@ -304,8 +384,8 @@ def _build_image(user_input, ai_response):
     reply_line_h = r_asc + r_desc
     reply_h = len(lines) * reply_line_h + (len(lines) - 1) * LINE_LEADING
 
-    text_w = max([_FONT_REPLY.getlength(l) for l in lines]
-                 + ([_FONT_USER.getlength(user_input)] if has_user else []))
+    text_w = max([_rich_width(l, _FONT_REPLY, _FONT_EMOJI_REPLY) for l in lines]
+                 + ([_rich_width(user_input, _FONT_USER, _FONT_EMOJI_USER)] if has_user else []))
     text_w = int(text_w)
     text_h = reply_h + (user_h + USER_REPLY_GAP if has_user else 0)
 
@@ -351,10 +431,11 @@ def _build_image(user_input, ai_response):
 
     ty = inner_y + (content_h - text_h) // 2
     if has_user:
-        draw.text((x, ty), user_input, font=_FONT_USER, fill=USER_COLOR)
+        # anchor="ls" draws on the baseline, so add the ascent to reach it.
+        _draw_rich(draw, x, ty + u_asc, user_input, _FONT_USER, _FONT_EMOJI_USER, USER_COLOR)
         ty += user_h + USER_REPLY_GAP
     for line in lines:
-        draw.text((x, ty), line, font=_FONT_REPLY, fill=REPLY_COLOR)
+        _draw_rich(draw, x, ty + r_asc, line, _FONT_REPLY, _FONT_EMOJI_REPLY, REPLY_COLOR)
         ty += reply_line_h + LINE_LEADING
 
     # Downsample once for anti-aliased corners, logo, and text.

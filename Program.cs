@@ -151,10 +151,11 @@ namespace Personal_Assistant
             // whatever the assistant is already saying. The widget host mirrors
             // each one as an on-screen floating countdown.
             var timerWidgets = new TimerWidgetHost();
-            // Empty userInput label: the speech bubble can't render emoji (shows
-            // as []), and a fired reminder has no user utterance to show anyway.
+            // A fired reminder has no user utterance, so use a clock as the
+            // bubble's "you said" label — a nice reminder indicator now that the
+            // bubble renders emoji. It's only shown, never spoken.
             var reminders = new ReminderService(
-                message => speechManager.Say("", message),
+                message => speechManager.Say("⏰", message),
                 timerWidgets);
 
             // Shared dependencies handed to every command handler.
@@ -304,6 +305,32 @@ namespace Personal_Assistant
                     string prefix = lower.StartsWith("search up") ? "search up" : "google";
                     string query = text.Substring(prefix.Length).Trim().TrimEnd('.', '?');
                     return new Dictionary<string, string> { ["query"] = query };
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("web_search",
+                    "Search the web and SPEAK the answer for anything needing current or " +
+                    "external information you don't already know — news, prices, sports scores, " +
+                    "recent events, weather in another city, or facts you're unsure about. Unlike " +
+                    "google_search (which just opens a browser tab), this reads results and answers " +
+                    "out loud. Only use this when the request actually needs a search — don't use it " +
+                    "for things another tool already handles, or for plain conversation.",
+                    new ToolParameter("query", "string", "What to search for.")),
+                lower => false, // LLM-only; no sensible keyword fallback for "look this up"
+                async (ctx, args) =>
+                {
+                    string query = args["query"];
+                    List<SearchHit> hits;
+                    try { hits = await SearxNGService.SearchAsync(query); }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("web_search: SearxNG search failed: " + ex.Message);
+                        hits = new List<SearchHit>();
+                    }
+                    // No conversation history here — handlers don't have access to it, and a
+                    // search-and-answer is naturally a one-off lookup anyway.
+                    string answer = await LocalLLMService.AnswerWithSearchResults(ctx.RecognizedText, hits, null);
+                    await ctx.Speech.Say(ctx.RecognizedText, answer);
                 }));
 
             registry.Add(new VoiceCommand(
