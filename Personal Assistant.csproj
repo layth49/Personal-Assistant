@@ -204,6 +204,9 @@
     <Reference Include="Microsoft.Scripting.Metadata, Version=1.3.5.0, Culture=neutral, PublicKeyToken=7f709c5b713576e1, processorArchitecture=MSIL">
       <HintPath>packages\DynamicLanguageRuntime.1.3.5\lib\net462\Microsoft.Scripting.Metadata.dll</HintPath>
     </Reference>
+    <Reference Include="MQTTnet, Version=4.3.7.1207, Culture=neutral, PublicKeyToken=fdb7629f2e364a63, processorArchitecture=MSIL">
+      <HintPath>packages\MQTTnet.4.3.7.1207\lib\net48\MQTTnet.dll</HintPath>
+    </Reference>
     <Reference Include="NAudio, Version=2.2.1.0, Culture=neutral, processorArchitecture=MSIL">
       <HintPath>packages\NAudio.2.2.1\lib\net472\NAudio.dll</HintPath>
     </Reference>
