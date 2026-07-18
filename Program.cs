@@ -631,9 +631,10 @@ namespace Personal_Assistant
 
             registry.Add(new VoiceCommand(
                 ToolDefinition.Create("open_app",
-                    "Open or launch a desktop application by name, e.g. Chrome, Spotify, " +
-                    "Notepad, Discord, or Calculator.",
-                    new ToolParameter("name", "string", "The application to open.")),
+                    "Open or launch ANY installed desktop application by name — it resolves " +
+                    "against the user's Start menu, so pass whatever app they said (e.g. " +
+                    "Chrome, Spotify, OBS, Blender, Photoshop, Steam, Discord).",
+                    new ToolParameter("name", "string", "The application name the user said.")),
                 lower => lower.StartsWith("open ") || lower.StartsWith("launch ") || lower.StartsWith("start "),
                 async (ctx, args) =>
                 {
