@@ -1,7 +1,9 @@
 ﻿using Microsoft.CognitiveServices.Speech;
 using Microsoft.CognitiveServices.Speech.Audio;
+using Personal_Assistant.Diagnostics;
 using Python.Runtime;
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Threading.Tasks;
 
@@ -30,11 +32,33 @@ namespace Personal_Assistant.SpeechManager
         private readonly KeywordRecognitionModel keywordModel;
         private readonly KeywordRecognizer keywordRecognizer;
 
+        // A SEPARATE keyword recognizer (with its own mic AudioConfig) used only
+        // for barge-in detection while the assistant is speaking. It must be
+        // distinct from the main-loop `keywordRecognizer`: borrowing that one and
+        // stopping it mid-flight invalidates its handle (SPXERR_INVALID_HANDLE),
+        // which permanently breaks the wakeword wait. Keeping interrupts on their
+        // own recognizer means the worst case is "barge-in stops working", never
+        // "the whole assistant breaks".
+        private readonly AudioConfig interruptAudioConfig;
+        private readonly KeywordRecognizer interruptKeywordRecognizer;
+
         private readonly dynamic textDisplay;
         private PyDict state;
 
-        public SpeechService()
+        // Serialises Say so overlapping callers never garble each other's audio
+        // or clobber the single shared bubble `state`. The main loop is already
+        // sequential; this matters when a background reminder/timer fires while
+        // the assistant happens to be speaking.
+        private readonly System.Threading.SemaphoreSlim sayGate =
+            new System.Threading.SemaphoreSlim(1, 1);
+
+        // Optional per-turn latency breakdown (null-safe — a caller that doesn't
+        // care about timing can just not pass one).
+        private readonly LatencyTracker latency;
+
+        public SpeechService(LatencyTracker latency = null)
         {
+            this.latency = latency;
             // Recognition config — EndpointId here targets a CUSTOM RECOGNITION model.
             // It must NOT be applied to the synthesizer, or TTS calls hit the wrong
             // endpoint and return immediately with no audio.
@@ -67,6 +91,9 @@ namespace Personal_Assistant.SpeechManager
             {
                 keywordModel = KeywordRecognitionModel.FromFile(@"..\..\keyword.table");
                 keywordRecognizer = new KeywordRecognizer(audioConfig);
+                // Dedicated recognizer + mic config for barge-in (see field docs).
+                interruptAudioConfig = AudioConfig.FromDefaultMicrophoneInput();
+                interruptKeywordRecognizer = new KeywordRecognizer(interruptAudioConfig);
             }
             catch (FileNotFoundException ex)
             {
@@ -79,22 +106,35 @@ namespace Personal_Assistant.SpeechManager
             }
         }
 
-        public async Task KeywordRecognizer()
+        // Waits for the wakeword. Returns true only if the keyword actually fired,
+        // so the caller can distinguish a real wake from an early/errored return.
+        // (Returning on error and letting the loop treat that as a wake is what
+        // caused a runaway re-greet loop.)
+        public async Task<bool> KeywordRecognizer()
         {
             if (keywordRecognizer == null || keywordModel == null)
             {
                 Console.WriteLine("KeywordRecognizer: not initialised (model load failed). Waiting forever.");
                 await Task.Delay(-1);
-                return;
+                return false;
             }
             try
             {
-                await keywordRecognizer.RecognizeOnceAsync(keywordModel);
-                Console.WriteLine("Keyword was recognized!");
+                var result = await keywordRecognizer.RecognizeOnceAsync(keywordModel);
+                if (result.Reason == ResultReason.RecognizedKeyword)
+                {
+                    Console.WriteLine("Keyword was recognized!");
+                    return true;
+                }
+                Console.WriteLine($"KeywordRecognizer: returned without a keyword ({result.Reason}).");
+                return false;
             }
             catch (Exception ex)
             {
                 Console.WriteLine("An unexpected error occurred in the KeywordRecognizer Method: " + ex.Message);
+                // Back off so a wedged recognizer can't hot-spin the wake loop.
+                await Task.Delay(1000);
+                return false;
             }
         }
 
@@ -121,6 +161,21 @@ namespace Personal_Assistant.SpeechManager
                         Console.WriteLine($"CANCELED: Did you set the speech resource key and region values?");
                     }
                     break;
+            }
+        }
+
+        // Captures one utterance and returns the recognised text (empty string on
+        // NoMatch, for which it also speaks a re-prompt — mirroring the local
+        // Whisper SpeechService's signature so shared callers like SMSController
+        // work identically on both backends). A fresh recognizer per call is fine
+        // for the infrequent interactive prompts that use this.
+        public async Task<string> RecognizeOnceAsync()
+        {
+            using (var recognizer = new SpeechRecognizer(speechConfig))
+            {
+                var result = await recognizer.RecognizeOnceAsync();
+                ConvertSpeechToText(result);
+                return result.Text ?? string.Empty;
             }
         }
 
@@ -155,8 +210,10 @@ namespace Personal_Assistant.SpeechManager
 
         public async Task SynthesizeTextToSpeech(string textToSynthesize)
         {
+            var sw = Stopwatch.StartNew();
             using (var result = await synthesizer.SpeakTextAsync(textToSynthesize))
             {
+                sw.Stop();
                 Console.WriteLine($"TTS: Reason={result.Reason}, AudioDuration={result.AudioDuration}");
 
                 if (result.Reason == ResultReason.Canceled)
@@ -168,6 +225,17 @@ namespace Personal_Assistant.SpeechManager
                         Console.WriteLine($"CANCELED: ErrorCode={cancellation.ErrorCode}");
                         Console.WriteLine($"CANCELED: ErrorDetails=[{cancellation.ErrorDetails}]");
                     }
+                }
+
+                if (result.Reason == ResultReason.SynthesizingAudioCompleted)
+                {
+                    // SpeakTextAsync's wall-clock time is synthesis + playback of
+                    // the default speaker output combined; AudioDuration is just
+                    // the natural length of the audio. Subtracting approximates
+                    // the "processing overhead" beyond simply playing the reply
+                    // out loud — the parallel to excluding STT's recording time.
+                    var overhead = sw.Elapsed - result.AudioDuration;
+                    latency?.RecordTts(overhead < TimeSpan.Zero ? TimeSpan.Zero : overhead);
                 }
 
                 // Signal the speech bubble to retract once audio finishes.
@@ -238,14 +306,143 @@ namespace Personal_Assistant.SpeechManager
         // threadpool so the main thread can immediately show the bubble.
         public async Task Say(string userInput, string response)
         {
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            Console.WriteLine($"[t+{sw.ElapsedMilliseconds}ms] Say: entered");
-            var synthTask = Task.Run(() => SynthesizeTextToSpeech(response));
-            Console.WriteLine($"[t+{sw.ElapsedMilliseconds}ms] Say: synth task scheduled, calling SpeechBubble");
-            SpeechBubble(userInput, response);
-            Console.WriteLine($"[t+{sw.ElapsedMilliseconds}ms] Say: SpeechBubble returned");
-            try { await synthTask; }
-            catch (Exception ex) { Console.WriteLine($"TTS error: {ex.Message}"); }
+            await sayGate.WaitAsync();
+            try
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                Console.WriteLine($"[t+{sw.ElapsedMilliseconds}ms] Say: entered");
+                var synthTask = Task.Run(() => SynthesizeTextToSpeech(response));
+                Console.WriteLine($"[t+{sw.ElapsedMilliseconds}ms] Say: synth task scheduled, calling SpeechBubble");
+                SpeechBubble(userInput, response);
+                Console.WriteLine($"[t+{sw.ElapsedMilliseconds}ms] Say: SpeechBubble returned");
+                try { await synthTask; }
+                catch (Exception ex) { Console.WriteLine($"TTS error: {ex.Message}"); }
+            }
+            finally
+            {
+                sayGate.Release();
+            }
+        }
+
+        // Like Say, but listens for the wakeword on the mic WHILE speaking. If the
+        // user says it mid-utterance, the speech is cut short and this returns
+        // true so the caller can jump straight to listening (barge-in). Returns
+        // false if the speech finished normally.
+        //
+        // TTS plays to the speaker and the keyword recogniser reads the mic, so
+        // they run on independent devices; the main acoustic caveat is speaker
+        // bleed into the mic (a non-issue on headphones).
+        public async Task<bool> SayInterruptible(string userInput, string response)
+        {
+            // No interrupt recognizer available -> behave exactly like Say.
+            if (interruptKeywordRecognizer == null || keywordModel == null)
+            {
+                await Say(userInput, response);
+                return false;
+            }
+
+            await sayGate.WaitAsync();
+            try
+            {
+                var synthTask = Task.Run(() => SynthesizeTextToSpeech(response));
+
+                // Start listening for the wakeword NOW, before the bubble. The
+                // bubble call below blocks the calling thread for the whole speech
+                // (it runs pygame until the synth signals done), so the barge-in
+                // race has to run on its own thread or it would only begin after
+                // the speech already finished.
+                Console.WriteLine("[interrupt] listening for wakeword during speech");
+                var interruptTcs = new TaskCompletionSource<bool>();
+                _ = Task.Run(async () =>
+                {
+                    bool interrupted = false;
+                    try
+                    {
+                        var keywordTask = interruptKeywordRecognizer.RecognizeOnceAsync(keywordModel);
+                        var finished = await Task.WhenAny(synthTask, keywordTask);
+
+                        if (finished == keywordTask)
+                        {
+                            KeywordRecognitionResult kw = null;
+                            try { kw = await keywordTask; }
+                            catch (Exception ex) { Console.WriteLine($"[interrupt] keyword await error: {ex.Message}"); }
+
+                            interrupted = kw != null && kw.Reason == ResultReason.RecognizedKeyword;
+                            if (interrupted)
+                            {
+                                Console.WriteLine("[interrupt] wakeword during speech -> cutting off");
+                                // Stopping the synth makes SpeakTextAsync return,
+                                // which flips state.running false and closes the
+                                // bubble on the main thread — same path as a
+                                // natural finish.
+                                try { await WithTimeout(synthesizer.StopSpeakingAsync(), 3000, "StopSpeaking"); } catch { }
+                            }
+                        }
+                        else
+                        {
+                            // Speech finished first -> stop listening. Bounded so a
+                            // stuck recognizer can't hang anything; and it's the
+                            // DEDICATED recognizer, so even if it's left in a bad
+                            // state only future barge-ins suffer, never the main loop.
+                            try { await WithTimeout(interruptKeywordRecognizer.StopRecognitionAsync(), 3000, "StopRecognition"); } catch { }
+                            try { await WithTimeout(keywordTask, 3000, "keywordTask drain"); } catch { }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[interrupt] race error: {ex.Message}");
+                    }
+                    interruptTcs.TrySetResult(interrupted);
+                });
+
+                // Bubble on the calling thread; returns when the synth completes
+                // (naturally or because it was stopped by a barge-in).
+                SpeechBubble(userInput, response);
+                try { await synthTask; } catch (Exception ex) { Console.WriteLine($"TTS error: {ex.Message}"); }
+
+                // Retract the bubble defensively (normally already closed).
+                if (state != null)
+                {
+                    using (Py.GIL()) { state.SetItem("running", PythonEngine.Eval("False")); }
+                }
+
+                bool wasInterrupted = false;
+                var settled = await Task.WhenAny(interruptTcs.Task, Task.Delay(4000));
+                if (settled == interruptTcs.Task) wasInterrupted = interruptTcs.Task.Result;
+                else Console.WriteLine("[interrupt] race did not settle in time");
+
+                Console.WriteLine($"[interrupt] returning interrupted = {wasInterrupted}");
+                return wasInterrupted;
+            }
+            finally
+            {
+                sayGate.Release();
+            }
+        }
+
+        // Awaits `task` but gives up after `ms`, logging a warning. Used to keep
+        // the interrupt teardown from ever blocking the assistant indefinitely on
+        // a recogniser that won't stop.
+        private static async Task WithTimeout(Task task, int ms, string label)
+        {
+            var completed = await Task.WhenAny(task, Task.Delay(ms));
+            if (completed != task)
+            {
+                Console.WriteLine($"[interrupt] {label} timed out after {ms}ms");
+                return;
+            }
+            await task; // surface any exception / result
+        }
+
+        private static async Task WithTimeout<T>(Task<T> task, int ms, string label)
+        {
+            var completed = await Task.WhenAny(task, Task.Delay(ms));
+            if (completed != task)
+            {
+                Console.WriteLine($"[interrupt] {label} timed out after {ms}ms");
+                return;
+            }
+            await task;
         }
     }
 }

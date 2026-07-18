@@ -1,11 +1,18 @@
 using Microsoft.CognitiveServices.Speech;
+using Personal_Assistant.AppLaunching;
 using Personal_Assistant.Arduino;
+using Personal_Assistant.AudioControl;
+using Personal_Assistant.Diagnostics;
 using Personal_Assistant.Dispatch;
 using Personal_Assistant.GeminiClient;
 using Personal_Assistant.Geolocator;
 using Personal_Assistant.LightAutomator;
+using Personal_Assistant.MediaControl;
 using Personal_Assistant.PlaystationController;
 using Personal_Assistant.PrayerTimesCalculator;
+using Personal_Assistant.ProcessControl;
+using Personal_Assistant.Reminders;
+using Personal_Assistant.ScreenCapture;
 using Personal_Assistant.SMSController;
 using Personal_Assistant.SpeechManager;
 using Personal_Assistant.WeatherService;
@@ -114,15 +121,29 @@ namespace Personal_Assistant
             using (Py.GIL())
             {
                 dynamic sys = Py.Import("sys");
-                sys.path.append(@"C:\Users\layth\LAITH\main");
+                sys.path.append(@"C:\Users\layth\LAITH\local");
             }
+
+            // Tracks per-turn stt/llm/tts latency so we can see what's actually
+            // the bottleneck. Reset before each recognition attempt, printed
+            // after the turn's dispatch completes.
+            var latency = new LatencyTracker();
 
             // Single-instance services. Speech recognizer and synthesizer reuse
             // websocket connections, so creating them once cuts handshake latency.
-            var speechManager = new SpeechService();
+            var speechManager = new SpeechService(latency);
             await speechManager.WarmUpAudioAsync(); // wakes the audio device so first greeting isn't clipped
             var speechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
             var phraseList = PhraseListGrammar.FromRecognizer(speechRecognizer);
+
+            // Azure's own VAD tells us when it thinks the user stopped talking
+            // (SpeechEndDetected). The time from there until RecognizeOnceAsync's
+            // task actually completes is the SDK's finalization/network latency —
+            // "how long it takes to understand", excluding however long the user
+            // spent speaking. Reset to null before each attempt; if the event
+            // never fires (e.g. NoMatch with no speech at all), STT records zero.
+            DateTime? speechEndDetectedAt = null;
+            speechRecognizer.SpeechEndDetected += (s, e) => { speechEndDetectedAt = DateTime.UtcNow; };
 
             var contacts = LoadContacts();
             if (contacts != null)
@@ -139,6 +160,23 @@ namespace Personal_Assistant
             var playstationControl = new PlaystationControl();
             var smsControl = new SMSControl();
             var arduino = new ArduinoService();
+            var audio = new AudioController();
+            var screenshot = new ScreenshotService();
+            var processes = new ProcessController();
+            var apps = new AppLauncher();
+            var media = new MediaController();
+            var nowPlaying = new NowPlayingReader();
+            // Fires timers/alarms/reminders by speaking them. Say is serialised
+            // internally, so a reminder firing mid-conversation won't garble
+            // whatever the assistant is already saying. The widget host mirrors
+            // each one as an on-screen floating countdown.
+            var timerWidgets = new TimerWidgetHost();
+            // A fired reminder has no user utterance, so use a clock as the
+            // bubble's "you said" label — a nice reminder indicator now that the
+            // bubble renders emoji. It's only shown, never spoken.
+            var reminders = new ReminderService(
+                message => speechManager.Say("⏰", message),
+                timerWidgets);
 
             // Shared dependencies handed to every command handler.
             var context = new CommandContext
@@ -150,6 +188,13 @@ namespace Personal_Assistant
                 Arduino = arduino,
                 Weather = weather,
                 Location = location,
+                Audio = audio,
+                Screenshot = screenshot,
+                Processes = processes,
+                Apps = apps,
+                Media = media,
+                NowPlaying = nowPlaying,
+                Reminders = reminders,
                 Contacts = contacts,
                 IpAddressPlug = ipAddressPlug,
                 IpAddressSwitch = ipAddressSwitch
@@ -160,25 +205,59 @@ namespace Personal_Assistant
             // matcher in the registry is only used as a fallback if Gemini is
             // unavailable / malformed / times out.
             var registry = BuildRegistry(context);
+            var conversationMemory = new ConversationMemory();
             var dispatcher = new IntentDispatcher(
                 registry,
                 context,
                 GeminiService.DetectToolAsync,
-                GeminiService.GenerateGeminiResponse);
+                GeminiService.GenerateGeminiResponse,
+                conversationMemory,
+                latency);
+
+            // Let the `repeat` tool run other tools by name (validated).
+            context.RunTool = dispatcher.RunToolByNameAsync;
+
+            // When the user barges in over a spoken reply with the wakeword, we
+            // skip the wakeword wait + greeting on the next turn and listen for
+            // their new command straight away.
+            bool listenImmediately = false;
 
             while (true)
             {
                 int hour = DateTime.Now.Hour;
 
-                await speechManager.KeywordRecognizer();
-                Console.WriteLine($"[loop] KeywordRecognizer awaited returned at {DateTime.Now:HH:mm:ss.fff}");
+                if (!listenImmediately)
+                {
+                    bool woke = await speechManager.KeywordRecognizer();
+                    Console.WriteLine($"[loop] KeywordRecognizer returned {woke} at {DateTime.Now:HH:mm:ss.fff}");
+                    // Only greet + listen when the wakeword actually fired. On an
+                    // errored/early return, loop back and keep waiting instead of
+                    // spuriously greeting (which previously ran away in a loop).
+                    if (!woke) continue;
 
-                string greeting = PickGreeting(hour);
-                Console.WriteLine($"[loop] about to call Say at {DateTime.Now:HH:mm:ss.fff}");
-                await speechManager.Say("Hey 49", greeting);
+                    string greeting = PickGreeting(hour);
+                    Console.WriteLine($"[loop] about to call Say at {DateTime.Now:HH:mm:ss.fff}");
+                    // Greeting is NOT interruptible: barge-in matters for long
+                    // conversational replies, not a two-second greeting.
+                    await speechManager.Say("Hey 49", greeting);
+                }
+                listenImmediately = false;
+
+                // Fresh latency counters for this turn.
+                latency.Reset();
+                speechEndDetectedAt = null;
 
                 var speechRecognitionResult = await speechRecognizer.RecognizeOnceAsync();
+                DateTime recognizedAt = DateTime.UtcNow;
                 speechManager.ConvertSpeechToText(speechRecognitionResult);
+
+                // "Understanding" time = however long it took AFTER Azure's VAD
+                // decided the user stopped talking. If the event never fired
+                // (no speech at all), there's nothing to attribute to STT.
+                if (speechEndDetectedAt.HasValue)
+                {
+                    latency.RecordStt(recognizedAt - speechEndDetectedAt.Value);
+                }
 
                 recognizedText = speechRecognitionResult.Text ?? string.Empty;
 
@@ -186,7 +265,9 @@ namespace Personal_Assistant
                 // dispatch real recognised speech.
                 if (speechRecognitionResult.Reason != ResultReason.NoMatch)
                 {
-                    await dispatcher.DispatchAsync(recognizedText);
+                    bool interrupted = await dispatcher.DispatchAsync(recognizedText);
+                    if (interrupted) listenImmediately = true;
+                    Console.WriteLine(latency.Summary());
                 }
             }
         }
@@ -312,12 +393,40 @@ namespace Personal_Assistant
 
             registry.Add(new VoiceCommand(
                 ToolDefinition.Create("get_weather",
-                    "Report the current weather."),
-                lower => lower.Contains("weather"),
+                    "Report the CURRENT weather conditions right now."),
+                lower => lower.Contains("weather") && !lower.Contains("forecast") &&
+                         !lower.Contains("tomorrow") && !lower.Contains("this week") && !lower.Contains("next few days"),
                 async (ctx, args) =>
                 {
                     try { await ctx.Weather.GetWeatherData(); }
                     catch (Exception ex) { Console.WriteLine("An error occurred: " + ex.Message); }
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("get_forecast",
+                    "Report the multi-day weather forecast (the days ahead, e.g. tomorrow " +
+                    "or the next few days) — not the current conditions.",
+                    new ToolParameter("days", "integer",
+                        "How many days ahead to forecast, from 1 to 5. Defaults to 3.",
+                        Required: false)),
+                lower => lower.Contains("forecast") ||
+                         (lower.Contains("weather") &&
+                          (lower.Contains("tomorrow") || lower.Contains("this week") ||
+                           lower.Contains("next few days") || lower.Contains("coming days"))),
+                async (ctx, args) =>
+                {
+                    int days = 3;
+                    if (args.TryGetValue("days", out string d) && int.TryParse(d, out int parsed))
+                        days = Math.Max(1, Math.Min(5, parsed));
+                    try { await ctx.Weather.GetForecastData(days); }
+                    catch (Exception ex) { Console.WriteLine("An error occurred: " + ex.Message); }
+                },
+                text =>
+                {
+                    var m = System.Text.RegularExpressions.Regex.Match(text, @"\d+");
+                    return m.Success
+                        ? new Dictionary<string, string> { ["days"] = m.Value }
+                        : VoiceCommand.EmptyArgs;
                 }));
 
             registry.Add(new VoiceCommand(
@@ -413,7 +522,495 @@ namespace Personal_Assistant
                     };
                 }));
 
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("control_volume",
+                    "Adjust the computer's audio volume: turn it up or down, mute, unmute, " +
+                    "or set it to a specific percentage.",
+                    new ToolParameter("action", "string",
+                        "What to do to the volume.",
+                        AllowedValues: new[] { "up", "down", "mute", "unmute", "set" }),
+                    new ToolParameter("level", "integer",
+                        "Target volume as a percentage from 0 to 100. Only used when action is 'set'.",
+                        Required: false)),
+                lower => lower.Contains("volume") || lower.Contains("mute"),
+                async (ctx, args) =>
+                {
+                    switch (args["action"])
+                    {
+                        case "up":
+                            await ctx.Speech.Say(ctx.RecognizedText,
+                                $"Volume's now at {ctx.Audio.VolumeUp()} percent.");
+                            break;
+                        case "down":
+                            await ctx.Speech.Say(ctx.RecognizedText,
+                                $"Volume's now at {ctx.Audio.VolumeDown()} percent.");
+                            break;
+                        case "mute":
+                            ctx.Audio.Mute();
+                            await ctx.Speech.Say(ctx.RecognizedText, "Muted.");
+                            break;
+                        case "unmute":
+                            ctx.Audio.Unmute();
+                            await ctx.Speech.Say(ctx.RecognizedText, "Unmuted.");
+                            break;
+                        case "set":
+                            if (args.TryGetValue("level", out string lvl) && int.TryParse(lvl, out int target))
+                                await ctx.Speech.Say(ctx.RecognizedText,
+                                    $"Volume set to {ctx.Audio.SetVolume(target)} percent.");
+                            else
+                                await ctx.Speech.Say(ctx.RecognizedText,
+                                    "What level would you like the volume set to?");
+                            break;
+                    }
+                },
+                text =>
+                {
+                    string lower = text.ToLower();
+                    var d = new Dictionary<string, string>();
+                    var num = System.Text.RegularExpressions.Regex.Match(lower, @"\d+");
+                    if (num.Success)
+                    {
+                        d["action"] = "set";
+                        d["level"] = num.Value;
+                    }
+                    else if (lower.Contains("unmute")) d["action"] = "unmute";
+                    else if (lower.Contains("mute")) d["action"] = "mute";
+                    else if (lower.Contains("down") || lower.Contains("lower") || lower.Contains("decrease"))
+                        d["action"] = "down";
+                    else d["action"] = "up";
+                    return d;
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("take_screenshot",
+                    "Capture a screenshot of the whole screen, save it, and open it."),
+                lower => lower.Contains("screenshot") || lower.Contains("screen shot") ||
+                         (lower.Contains("capture") && lower.Contains("screen")),
+                async (ctx, args) =>
+                {
+                    try
+                    {
+                        string path = ctx.Screenshot.Capture();
+                        ctx.Screenshot.Open(path);
+                        await ctx.Speech.Say(ctx.RecognizedText, "Done! I took a screenshot and opened it for you.");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("Screenshot failed: " + ex.Message);
+                        await ctx.Speech.Say(ctx.RecognizedText, "Sorry, I couldn't take the screenshot.");
+                    }
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("kill_process",
+                    "Force-close a running program by its process or application name.",
+                    new ToolParameter("name", "string",
+                        "The process or application name to terminate, e.g. 'chrome' or 'spotify'.")),
+                lower => (lower.Contains("kill") || lower.Contains("terminate") || lower.Contains("force close") ||
+                          lower.Contains("force quit")) &&
+                         (lower.Contains("process") || lower.Contains("task") || lower.Contains("program") ||
+                          lower.Contains("app")),
+                async (ctx, args) =>
+                {
+                    var result = ctx.Processes.KillByName(args["name"]);
+                    if (result.Killed > 0)
+                        await ctx.Speech.Say(ctx.RecognizedText,
+                            $"Closed {result.Killed} {result.MatchedName} " +
+                            $"{(result.Killed == 1 ? "process" : "processes")}.");
+                    else
+                        await ctx.Speech.Say(ctx.RecognizedText,
+                            $"I couldn't find a running process called {result.MatchedName}.");
+                },
+                text =>
+                {
+                    string name = text.ToLower().TrimEnd('.', '!', '?');
+                    foreach (var verb in new[] { "terminate", "force close", "force quit", "kill", "close", "end", "stop", "quit" })
+                    {
+                        int i = name.IndexOf(verb);
+                        if (i >= 0) { name = name.Substring(i + verb.Length); break; }
+                    }
+                    foreach (var filler in new[] { "the process", "the task", "the program", "the app",
+                                                   "process", "task", "program", "application", "app", "the" })
+                        name = name.Replace(filler, " ");
+                    return new Dictionary<string, string> { ["name"] = name.Trim() };
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("open_app",
+                    "Open or launch ANY installed desktop application by name — it resolves " +
+                    "against the user's Start menu, so pass whatever app they said (e.g. " +
+                    "Chrome, Spotify, OBS, Blender, Photoshop, Steam, Discord).",
+                    new ToolParameter("name", "string", "The application name the user said.")),
+                lower => lower.StartsWith("open ") || lower.StartsWith("launch ") || lower.StartsWith("start "),
+                async (ctx, args) =>
+                {
+                    if (ctx.Apps.TryLaunch(args["name"], out string launched))
+                        await ctx.Speech.Say(ctx.RecognizedText, $"Opening {launched}.");
+                    else
+                        await ctx.Speech.Say(ctx.RecognizedText,
+                            $"Sorry, I couldn't find an app called {args["name"]}.");
+                },
+                text =>
+                {
+                    string name = text.TrimEnd('.', '!', '?');
+                    foreach (var verb in new[] { "open ", "launch ", "start " })
+                    {
+                        int i = name.ToLower().IndexOf(verb);
+                        if (i >= 0) { name = name.Substring(i + verb.Length); break; }
+                    }
+                    return new Dictionary<string, string> { ["name"] = name.Trim() };
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("switch_audio_output",
+                    "Switch the default audio output device, e.g. to speakers or headphones.",
+                    new ToolParameter("device", "string",
+                        "Name (or part of the name) of the output device to switch to, e.g. 'headphones' or 'speakers'.")),
+                lower => (lower.Contains("switch") || lower.Contains("change") || lower.Contains("set")) &&
+                         (lower.Contains("headphone") || lower.Contains("speaker") ||
+                          lower.Contains("output") || lower.Contains("audio device") || lower.Contains("sound device")),
+                async (ctx, args) =>
+                {
+                    string matched = ctx.Audio.SwitchOutputDevice(args["device"]);
+                    if (matched != null)
+                    {
+                        await ctx.Speech.Say(ctx.RecognizedText, $"Switched audio output to {matched}.");
+                    }
+                    else
+                    {
+                        var available = ctx.Audio.ListOutputDevices();
+                        string list = available.Count > 0
+                            ? string.Join(", ", available)
+                            : "no active output devices";
+                        await ctx.Speech.Say(ctx.RecognizedText,
+                            $"I couldn't find an output device matching {args["device"]}. Available devices are: {list}.");
+                    }
+                },
+                text =>
+                {
+                    string lower = text.ToLower();
+                    string device = lower.Contains("headphone") ? "headphone"
+                        : lower.Contains("speaker") ? "speaker"
+                        : string.Empty;
+                    return new Dictionary<string, string> { ["device"] = device };
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("control_media",
+                    "Control the currently playing music or video: play/pause, skip to the " +
+                    "next track, go back to the previous track, or stop.",
+                    new ToolParameter("action", "string",
+                        "The media action to perform.",
+                        AllowedValues: new[] { "playpause", "play", "pause", "next", "previous", "stop" })),
+                lower => lower.Contains("music") || lower.Contains("song") || lower.Contains("track") ||
+                         lower.Contains("play ") || lower == "play" || lower == "play." ||
+                         lower.Contains("pause") || lower.Contains("resume") ||
+                         lower.Contains("skip") || lower.Contains("next") || lower.Contains("previous"),
+                async (ctx, args) =>
+                {
+                    switch (args["action"])
+                    {
+                        case "next":
+                            ctx.Media.Next();
+                            await ctx.Speech.Say(ctx.RecognizedText, "Skipping ahead.");
+                            break;
+                        case "previous":
+                            ctx.Media.Previous();
+                            await ctx.Speech.Say(ctx.RecognizedText, "Going back.");
+                            break;
+                        case "stop":
+                            ctx.Media.Stop();
+                            await ctx.Speech.Say(ctx.RecognizedText, "Stopped.");
+                            break;
+                        // play, pause, and playpause all map to the play/pause
+                        // toggle — the media key is a single toggle regardless.
+                        default:
+                            ctx.Media.PlayPause();
+                            await ctx.Speech.Say(ctx.RecognizedText, "Done.");
+                            break;
+                    }
+                },
+                text =>
+                {
+                    string lower = text.ToLower();
+                    string action;
+                    if (lower.Contains("next") || lower.Contains("skip")) action = "next";
+                    else if (lower.Contains("previous") || lower.Contains("back") || lower.Contains("last")) action = "previous";
+                    else if (lower.Contains("stop")) action = "stop";
+                    else if (lower.Contains("pause")) action = "pause";
+                    else action = "play";
+                    return new Dictionary<string, string> { ["action"] = action };
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("whats_playing",
+                    "Say what song, track, or video is currently playing."),
+                lower => (lower.Contains("what") || lower.Contains("who")) &&
+                         (lower.Contains("playing") || lower.Contains("song") || lower.Contains("this")),
+                async (ctx, args) =>
+                {
+                    var np = await ctx.NowPlaying.GetCurrentAsync();
+                    string spoken = np?.Spoken();
+                    if (spoken != null)
+                        await ctx.Speech.Say(ctx.RecognizedText, $"This is {spoken}.");
+                    else
+                        await ctx.Speech.Say(ctx.RecognizedText, "Nothing seems to be playing right now.");
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("set_timer",
+                    "Set a countdown timer or a reminder that fires after a delay, e.g. " +
+                    "'set a timer for 10 minutes' or 'remind me to check the oven in 20 minutes'.",
+                    new ToolParameter("duration_seconds", "integer",
+                        "The countdown length in seconds (convert minutes/hours yourself, " +
+                        "e.g. 10 minutes = 600)."),
+                    new ToolParameter("label", "string",
+                        "What to remind the user about when it fires, if they said. Omit for a plain timer.",
+                        Required: false)),
+                lower => lower.Contains("timer") ||
+                         (lower.Contains("remind") && (lower.Contains(" in ") || lower.Contains("minute") ||
+                                                       lower.Contains("hour") || lower.Contains("second"))),
+                async (ctx, args) =>
+                {
+                    if (!args.TryGetValue("duration_seconds", out string ds) ||
+                        !int.TryParse(ds, out int secs) || secs < 1)
+                    {
+                        await ctx.Speech.Say(ctx.RecognizedText, "How long would you like the timer for?");
+                        return;
+                    }
+                    string label = args.TryGetValue("label", out string l) ? l : null;
+                    ctx.Reminders.AddTimer(secs, label);
+                    string what = string.IsNullOrWhiteSpace(label) ? "" : $" to {label}";
+                    await ctx.Speech.Say(ctx.RecognizedText,
+                        $"Okay, I'll remind you{what} in {DescribeDuration(secs)}.");
+                },
+                text =>
+                {
+                    string lower = text.ToLower();
+                    var d = new Dictionary<string, string>();
+                    int total = 0;
+                    var mh = System.Text.RegularExpressions.Regex.Match(lower, @"(\d+)\s*(hour|hr)");
+                    if (mh.Success) total += int.Parse(mh.Groups[1].Value) * 3600;
+                    var mm = System.Text.RegularExpressions.Regex.Match(lower, @"(\d+)\s*(minute|min)");
+                    if (mm.Success) total += int.Parse(mm.Groups[1].Value) * 60;
+                    var msec = System.Text.RegularExpressions.Regex.Match(lower, @"(\d+)\s*(second|sec)");
+                    if (msec.Success) total += int.Parse(msec.Groups[1].Value);
+                    if (total == 0)
+                    {
+                        var bare = System.Text.RegularExpressions.Regex.Match(lower, @"(\d+)");
+                        if (bare.Success) total = int.Parse(bare.Groups[1].Value) * 60; // bare number => minutes
+                    }
+                    if (total > 0) d["duration_seconds"] = total.ToString();
+                    int ti = lower.IndexOf(" to ");
+                    if (ti >= 0) d["label"] = text.Substring(ti + 4).TrimEnd('.', '!', '?');
+                    return d;
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("set_alarm",
+                    "Set an alarm or reminder for a specific clock time, e.g. 'set an alarm " +
+                    "for 7 AM' or 'remind me to leave at 5:30 PM'.",
+                    new ToolParameter("time", "string",
+                        "The target time in 24-hour HH:mm format (e.g. 07:00 or 17:30)."),
+                    new ToolParameter("label", "string",
+                        "What to remind the user about when it fires, if they said. Omit for a plain alarm.",
+                        Required: false)),
+                lower => lower.Contains("alarm") || lower.Contains("wake me") ||
+                         (lower.Contains("remind") && lower.Contains(" at ")),
+                async (ctx, args) =>
+                {
+                    if (!args.TryGetValue("time", out string timeText) || string.IsNullOrWhiteSpace(timeText))
+                    {
+                        await ctx.Speech.Say(ctx.RecognizedText, "What time should I set it for?");
+                        return;
+                    }
+                    string label = args.TryGetValue("label", out string l) ? l : null;
+                    DateTime? fireAt = ctx.Reminders.AddAlarm(timeText, label);
+                    if (fireAt == null)
+                    {
+                        await ctx.Speech.Say(ctx.RecognizedText, $"Sorry, I didn't catch what time you meant.");
+                        return;
+                    }
+                    string what = string.IsNullOrWhiteSpace(label) ? "" : $" to {label}";
+                    string when = fireAt.Value.Date == DateTime.Today
+                        ? $"at {fireAt.Value:t}"
+                        : $"tomorrow at {fireAt.Value:t}";
+                    await ctx.Speech.Say(ctx.RecognizedText, $"Okay, I'll remind you{what} {when}.");
+                },
+                text =>
+                {
+                    var d = new Dictionary<string, string>();
+                    var tm = System.Text.RegularExpressions.Regex.Match(
+                        text, @"\d{1,2}(:\d{2})?\s*(am|pm|AM|PM)?");
+                    if (tm.Success) d["time"] = tm.Value.Trim();
+                    int ti = text.ToLower().IndexOf(" to ");
+                    if (ti >= 0) d["label"] = text.Substring(ti + 4).TrimEnd('.', '!', '?');
+                    return d;
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("list_reminders",
+                    "List the user's pending timers, alarms, and reminders."),
+                lower => (lower.Contains("list") || lower.Contains("what") || lower.Contains("any")) &&
+                         (lower.Contains("timer") || lower.Contains("alarm") || lower.Contains("reminder")),
+                async (ctx, args) =>
+                {
+                    var pending = ctx.Reminders.Pending();
+                    if (pending.Count == 0)
+                    {
+                        await ctx.Speech.Say(ctx.RecognizedText, "You have no timers or alarms set.");
+                        return;
+                    }
+                    var sb = new System.Text.StringBuilder();
+                    sb.Append($"You have {pending.Count} {(pending.Count == 1 ? "reminder" : "reminders")}: ");
+                    for (int i = 0; i < pending.Count; i++)
+                    {
+                        var p = pending[i];
+                        string when = p.FireAt.Date == DateTime.Today
+                            ? p.FireAt.ToString("t")
+                            : $"tomorrow at {p.FireAt:t}";
+                        sb.Append(string.IsNullOrWhiteSpace(p.Label) ? when : $"{p.Label} at {when}");
+                        sb.Append(i < pending.Count - 1 ? "; " : ".");
+                    }
+                    await ctx.Speech.Say(ctx.RecognizedText, sb.ToString());
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("cancel_reminders",
+                    "Cancel all pending timers, alarms, and reminders."),
+                lower => lower.Contains("cancel") &&
+                         (lower.Contains("timer") || lower.Contains("alarm") || lower.Contains("reminder")),
+                async (ctx, args) =>
+                {
+                    int n = ctx.Reminders.CancelAll();
+                    await ctx.Speech.Say(ctx.RecognizedText,
+                        n == 0
+                            ? "There was nothing to cancel."
+                            : $"Cancelled {n} {(n == 1 ? "reminder" : "reminders")}.");
+                }));
+
+            // --- Composition primitives (LLM-only; no keyword path) ------------------
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("wait",
+                    "Pause for a number of seconds. Use it BETWEEN other tool calls to make " +
+                    "timed effects, e.g. turning a light on, waiting, then off so a flash is " +
+                    "visible. Keep the wait short.",
+                    new ToolParameter("seconds", "integer", "Seconds to pause, from 1 to 30.")),
+                lower => false, // composition-only — the model calls it, not the keyword path
+                async (ctx, args) =>
+                {
+                    int secs = 1;
+                    if (args.TryGetValue("seconds", out string s) && int.TryParse(s, out int parsed)) secs = parsed;
+                    secs = Math.Max(0, Math.Min(30, secs));
+                    await Task.Delay(secs * 1000);
+                },
+                ephemeral: true));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("repeat",
+                    "Repeat a sequence of tool calls several times — use for looping effects " +
+                    "like flashing a light N times. 'actions' is a JSON array of steps, each an " +
+                    "object {\"tool\":\"<tool name>\",\"args\":{...}}. Example to flash the bedroom " +
+                    "light 3 times: times=3, actions=" +
+                    "[{\"tool\":\"control_lights\",\"args\":{\"state\":\"on\",\"room\":\"bedroom\"}}," +
+                    "{\"tool\":\"wait\",\"args\":{\"seconds\":\"1\"}}," +
+                    "{\"tool\":\"control_lights\",\"args\":{\"state\":\"off\",\"room\":\"bedroom\"}}," +
+                    "{\"tool\":\"wait\",\"args\":{\"seconds\":\"1\"}}].",
+                    new ToolParameter("times", "integer", "How many times to repeat the sequence, from 1 to 10."),
+                    new ToolParameter("actions", "string",
+                        "JSON array of steps to repeat, each {\"tool\":\"<name>\",\"args\":{...}}.")),
+                lower => false,
+                async (ctx, args) =>
+                {
+                    if (ctx.RunTool == null) return;
+                    int times = 1;
+                    if (args.TryGetValue("times", out string t) && int.TryParse(t, out int parsedT)) times = parsedT;
+                    times = Math.Max(1, Math.Min(10, times));
+
+                    if (!args.TryGetValue("actions", out string actionsJson) || string.IsNullOrWhiteSpace(actionsJson))
+                        return;
+                    var steps = ParseRepeatActions(actionsJson);
+                    if (steps.Count == 0) return;
+
+                    for (int i = 0; i < times; i++)
+                    {
+                        foreach (var step in steps)
+                        {
+                            // No nesting — a repeat inside a repeat could block for a long time.
+                            if (string.Equals(step.Tool, "repeat", StringComparison.OrdinalIgnoreCase)) continue;
+                            await ctx.RunTool(step.Tool, step.Args);
+                        }
+                    }
+                },
+                ephemeral: true));
+
             return registry;
+        }
+
+        private sealed class RepeatStep
+        {
+            public string Tool;
+            public Dictionary<string, string> Args;
+        }
+
+        // Parses the `repeat` tool's `actions` argument (a JSON array of
+        // {tool, args} steps) into a runnable list. Defensive: malformed input
+        // yields an empty list rather than throwing.
+        private static List<RepeatStep> ParseRepeatActions(string json)
+        {
+            var result = new List<RepeatStep>();
+            try
+            {
+                using (var doc = JsonDocument.Parse(json))
+                {
+                    if (doc.RootElement.ValueKind != JsonValueKind.Array) return result;
+                    foreach (var el in doc.RootElement.EnumerateArray())
+                    {
+                        if (el.ValueKind != JsonValueKind.Object) continue;
+                        if (!el.TryGetProperty("tool", out var toolEl) ||
+                            toolEl.ValueKind != JsonValueKind.String) continue;
+
+                        var step = new RepeatStep
+                        {
+                            Tool = toolEl.GetString(),
+                            Args = new Dictionary<string, string>()
+                        };
+                        if (el.TryGetProperty("args", out var argsEl) &&
+                            argsEl.ValueKind == JsonValueKind.Object)
+                        {
+                            foreach (var p in argsEl.EnumerateObject())
+                            {
+                                step.Args[p.Name] = p.Value.ValueKind == JsonValueKind.String
+                                    ? p.Value.GetString()
+                                    : p.Value.GetRawText();
+                            }
+                        }
+                        result.Add(step);
+                    }
+                }
+            }
+            catch (JsonException)
+            {
+                // Malformed actions -> nothing to run.
+            }
+            return result;
+        }
+
+        // Human-friendly spoken duration, e.g. "5 minutes", "1 hour and 30 minutes".
+        private static string DescribeDuration(int seconds)
+        {
+            int hours = seconds / 3600;
+            int minutes = (seconds % 3600) / 60;
+            int secs = seconds % 60;
+
+            var parts = new List<string>();
+            if (hours > 0) parts.Add($"{hours} {(hours == 1 ? "hour" : "hours")}");
+            if (minutes > 0) parts.Add($"{minutes} {(minutes == 1 ? "minute" : "minutes")}");
+            if (secs > 0 && hours == 0) parts.Add($"{secs} {(secs == 1 ? "second" : "seconds")}");
+            if (parts.Count == 0) return "a moment";
+            if (parts.Count == 1) return parts[0];
+            return string.Join(" and ", parts);
         }
 
         private static Dictionary<string, string> LoadContacts()

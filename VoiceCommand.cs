@@ -1,10 +1,16 @@
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using Personal_Assistant.AppLaunching;
 using Personal_Assistant.Arduino;
+using Personal_Assistant.AudioControl;
 using Personal_Assistant.Geolocator;
 using Personal_Assistant.LightAutomator;
+using Personal_Assistant.MediaControl;
 using Personal_Assistant.PlaystationController;
+using Personal_Assistant.ProcessControl;
+using Personal_Assistant.Reminders;
+using Personal_Assistant.ScreenCapture;
 using Personal_Assistant.SMSController;
 using Personal_Assistant.SpeechManager;
 using Personal_Assistant.WeatherService;
@@ -50,9 +56,20 @@ namespace Personal_Assistant.Dispatch
         public ArduinoService Arduino { get; init; }
         public GetWeather Weather { get; init; }
         public GetLocation Location { get; init; }
+        public AudioController Audio { get; init; }
+        public ScreenshotService Screenshot { get; init; }
+        public ProcessController Processes { get; init; }
+        public AppLauncher Apps { get; init; }
+        public MediaController Media { get; init; }
+        public NowPlayingReader NowPlaying { get; init; }
+        public ReminderService Reminders { get; init; }
         public IReadOnlyDictionary<string, string> Contacts { get; init; }
         public string IpAddressPlug { get; init; }
         public string IpAddressSwitch { get; init; }
+
+        // Runs another tool by name (validated) — how the `repeat` tool executes
+        // the actions it loops over. Wired from the dispatcher after construction.
+        public Func<string, IReadOnlyDictionary<string, string>, Task> RunTool { get; set; }
 
         // The raw text the user actually said for this turn. Handlers pass it to
         // SpeechService.Say so the on-screen bubble shows what was heard.
@@ -84,17 +101,24 @@ namespace Personal_Assistant.Dispatch
         // Executes the command. Args are already validated against Tool.Parameters.
         public Func<CommandContext, IReadOnlyDictionary<string, string>, Task> Handler { get; }
 
+        // Ephemeral tools (wait, repeat) are control-flow primitives, not real
+        // actions — they're skipped from conversation memory to avoid cluttering
+        // it (a flash = many wait/light calls).
+        public bool Ephemeral { get; }
+
         public VoiceCommand(
             ToolDefinition tool,
             Func<string, bool> matches,
             Func<CommandContext, IReadOnlyDictionary<string, string>, Task> handler,
-            Func<string, IReadOnlyDictionary<string, string>> extractArgs = null)
+            Func<string, IReadOnlyDictionary<string, string>> extractArgs = null,
+            bool ephemeral = false)
         {
             Tool = tool ?? throw new ArgumentNullException(nameof(tool));
             Name = tool.Name;
             Matches = matches ?? throw new ArgumentNullException(nameof(matches));
             Handler = handler ?? throw new ArgumentNullException(nameof(handler));
             ExtractArgs = extractArgs ?? (_ => EmptyArgs);
+            Ephemeral = ephemeral;
         }
 
         public static readonly IReadOnlyDictionary<string, string> EmptyArgs =

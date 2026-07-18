@@ -1,30 +1,46 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading.Tasks;
+using Personal_Assistant.Diagnostics;
 
 namespace Personal_Assistant.Dispatch
 {
+    // A single tool the model chose, with its extracted arguments. A decision can
+    // carry several of these when the user asked for multiple things at once
+    // ("turn off the lights and close the door").
+    public sealed class ToolInvocation
+    {
+        public string Name { get; }
+        public IReadOnlyDictionary<string, string> Arguments { get; }
+
+        public ToolInvocation(string name, IReadOnlyDictionary<string, string> args)
+        {
+            Name = name;
+            Arguments = args ?? VoiceCommand.EmptyArgs;
+        }
+    }
+
     // The outcome of asking the LLM what to do with a turn of user input.
     // Exactly one of three states:
-    //   ToolCall  - the model picked a tool and gave arguments
-    //   Reply     - the model answered conversationally (no tool)
-    //   Failure   - the call timed out / errored / returned malformed JSON
+    //   ToolCall(s) - the model picked one or more tools and gave arguments
+    //   Reply       - the model answered conversationally (no tool)
+    //   Failure     - the call timed out / errored / returned malformed JSON
     // Failure is what triggers the keyword-matching fallback.
     public sealed class LlmDecision
     {
-        public bool IsToolCall { get; private set; }
         public bool Failed { get; private set; }
-        public string ToolName { get; private set; }
-        public IReadOnlyDictionary<string, string> Arguments { get; private set; }
+        public IReadOnlyList<ToolInvocation> ToolCalls { get; private set; }
         public string Text { get; private set; }
 
+        public bool IsToolCall => ToolCalls != null && ToolCalls.Count > 0;
+
+        // Convenience for the common single-tool case.
         public static LlmDecision ToolCall(string name, IReadOnlyDictionary<string, string> args) =>
-            new LlmDecision
-            {
-                IsToolCall = true,
-                ToolName = name,
-                Arguments = args ?? VoiceCommand.EmptyArgs
-            };
+            new LlmDecision { ToolCalls = new[] { new ToolInvocation(name, args) } };
+
+        public static LlmDecision Tools(IReadOnlyList<ToolInvocation> calls) =>
+            new LlmDecision { ToolCalls = calls };
 
         public static LlmDecision Reply(string text) =>
             new LlmDecision { Text = text ?? string.Empty };
@@ -34,12 +50,17 @@ namespace Personal_Assistant.Dispatch
     }
 
     // Asks the LLM to map input -> tool call or conversational reply, given the
-    // available tool schemas. Implemented per branch (Gemini on main, LM Studio
-    // on local) and injected, so this dispatcher stays provider-agnostic.
-    public delegate Task<LlmDecision> ToolDetector(string input, IReadOnlyList<ToolDefinition> tools);
+    // available tool schemas and prior conversation turns. Implemented per branch
+    // (Gemini on main, LM Studio on local) and injected, so this dispatcher stays
+    // provider-agnostic.
+    public delegate Task<LlmDecision> ToolDetector(
+        string input,
+        IReadOnlyList<ToolDefinition> tools,
+        IReadOnlyList<ConversationTurn> history);
 
-    // Produces a plain conversational answer (the existing grounded chat path).
-    public delegate Task<string> Conversationalist(string input);
+    // Produces a plain conversational answer (the existing grounded chat path),
+    // given prior conversation turns for context.
+    public delegate Task<string> Conversationalist(string input, IReadOnlyList<ConversationTurn> history);
 
     // LLM-first intent dispatch.
     //
@@ -57,30 +78,46 @@ namespace Personal_Assistant.Dispatch
         private readonly CommandContext context;
         private readonly ToolDetector detector;
         private readonly Conversationalist conversationalist;
+        private readonly ConversationMemory memory;
+        private readonly LatencyTracker latency;
 
         public IntentDispatcher(
             ToolRegistry registry,
             CommandContext context,
             ToolDetector detector,
-            Conversationalist conversationalist)
+            Conversationalist conversationalist,
+            ConversationMemory memory = null,
+            LatencyTracker latency = null)
         {
             this.registry = registry ?? throw new ArgumentNullException(nameof(registry));
             this.context = context ?? throw new ArgumentNullException(nameof(context));
             this.detector = detector ?? throw new ArgumentNullException(nameof(detector));
             this.conversationalist = conversationalist ?? throw new ArgumentNullException(nameof(conversationalist));
+            this.memory = memory ?? new ConversationMemory();
+            this.latency = latency;
         }
 
-        public async Task DispatchAsync(string userInput)
+        // Returns true if the assistant's spoken reply was interrupted by the
+        // wakeword (barge-in), so the caller can listen again without requiring
+        // the wakeword. Tool actions and their short confirmations aren't
+        // interruptible, so those paths return false.
+        public async Task<bool> DispatchAsync(string userInput)
         {
-            if (string.IsNullOrWhiteSpace(userInput)) return;
+            if (string.IsNullOrWhiteSpace(userInput)) return false;
 
             context.RecognizedText = userInput;
             string lower = userInput.ToLower();
 
+            // Snapshot BEFORE recording this turn's input, so history never
+            // includes the very input it's meant to give context for.
+            var history = memory.Snapshot();
+            memory.AddUser(userInput);
+
             LlmDecision decision;
+            var detectSw = Stopwatch.StartNew();
             try
             {
-                decision = await detector(userInput, registry.ToolDefinitions)
+                decision = await detector(userInput, registry.ToolDefinitions, history)
                            ?? LlmDecision.Failure();
             }
             catch (Exception ex)
@@ -88,47 +125,89 @@ namespace Personal_Assistant.Dispatch
                 Console.WriteLine($"[dispatch] detector threw, falling back to keywords: {ex.Message}");
                 decision = LlmDecision.Failure();
             }
+            finally
+            {
+                latency?.RecordLlm(detectSw.Elapsed);
+            }
 
             // Malformed / timeout / error -> legacy keyword matcher.
             if (decision.Failed)
             {
                 Console.WriteLine("[dispatch] LLM unavailable/malformed -> keyword fallback");
-                await FallbackAsync(userInput, lower);
-                return;
+                return await FallbackAsync(userInput, lower, history);
             }
 
-            // The LLM chose a tool.
+            // The LLM chose one or more tools.
             if (decision.IsToolCall)
             {
-                var command = registry.FindByName(decision.ToolName);
-                if (command == null)
-                {
-                    Console.WriteLine($"[dispatch] LLM picked unknown tool '{decision.ToolName}' -> fallback");
-                    await FallbackAsync(userInput, lower);
-                    return;
-                }
-
-                if (!TryValidate(command.Tool, decision.Arguments, out var cleanArgs, out string error))
-                {
-                    Console.WriteLine($"[dispatch] invalid args for '{command.Name}': {error} -> fallback");
-                    await FallbackAsync(userInput, lower);
-                    return;
-                }
-
-                Console.WriteLine($"[dispatch] tool '{command.Name}' args=[{Describe(cleanArgs)}]");
-                await command.Handler(context, cleanArgs);
-                return;
+                return await RunToolCallsAsync(decision.ToolCalls, userInput, lower, history);
             }
 
             // The LLM chose no tool. Fall through to the grounded conversational
             // path (which keeps Google Search grounding) rather than speaking the
             // classifier's ungrounded text — preserving the app's original
             // answer quality for chit-chat and current-events questions.
-            await ConversationalAsync(userInput);
+            return await ConversationalAsync(userInput, history);
+        }
+
+        // Runs each tool the model asked for, in order (compound requests like
+        // "turn off the lights and close the door" arrive as several calls).
+        // Unknown/invalid calls are skipped rather than aborting the batch. If
+        // NOTHING ran — a lone bogus call — we fall back to keyword matching,
+        // preserving the single-tool miss behaviour.
+        private async Task<bool> RunToolCallsAsync(
+            IReadOnlyList<ToolInvocation> calls,
+            string userInput,
+            string lower,
+            IReadOnlyList<ConversationTurn> history)
+        {
+            int ran = 0;
+            foreach (var call in calls)
+            {
+                var command = registry.FindByName(call.Name);
+                if (command == null)
+                {
+                    Console.WriteLine($"[dispatch] LLM picked unknown tool '{call.Name}' -> skip");
+                    continue;
+                }
+                if (!TryValidate(command.Tool, call.Arguments, out var cleanArgs, out string error))
+                {
+                    Console.WriteLine($"[dispatch] invalid args for '{command.Name}': {error} -> skip");
+                    continue;
+                }
+
+                Console.WriteLine($"[dispatch] tool '{command.Name}' args=[{Describe(cleanArgs)}]");
+                await command.Handler(context, cleanArgs);
+                if (!command.Ephemeral) memory.AddToolCall(command.Name, cleanArgs);
+                ran++;
+            }
+
+            if (ran == 0) return await FallbackAsync(userInput, lower, history);
+            return false;
+        }
+
+        // Runs a single tool by name with the given args, validated — used by the
+        // `repeat` tool to execute the actions it loops over. Does not touch
+        // conversation memory (the top-level call already records what ran).
+        public async Task RunToolByNameAsync(string name, IReadOnlyDictionary<string, string> args)
+        {
+            var command = registry.FindByName(name);
+            if (command == null)
+            {
+                Console.WriteLine($"[dispatch] RunTool: unknown tool '{name}'");
+                return;
+            }
+            if (!TryValidate(command.Tool, args, out var cleanArgs, out string error))
+            {
+                Console.WriteLine($"[dispatch] RunTool: invalid args for '{name}': {error}");
+                return;
+            }
+            Console.WriteLine($"[dispatch] RunTool '{name}' args=[{Describe(cleanArgs)}]");
+            await command.Handler(context, cleanArgs);
         }
 
         // Legacy keyword path: first matching command wins, else conversational AI.
-        private async Task FallbackAsync(string userInput, string lower)
+        private async Task<bool> FallbackAsync(string userInput, string lower, IReadOnlyList<ConversationTurn> history)
         {
             var command = registry.MatchKeyword(lower);
             if (command != null)
@@ -139,18 +218,24 @@ namespace Personal_Assistant.Dispatch
                 {
                     Console.WriteLine($"[dispatch] keyword match '{command.Name}' args=[{Describe(cleanArgs)}]");
                     await command.Handler(context, cleanArgs);
-                    return;
+                    memory.AddToolCall(command.Name, cleanArgs);
+                    return false;
                 }
                 Console.WriteLine($"[dispatch] keyword match '{command.Name}' had invalid args: {error}");
             }
 
-            await ConversationalAsync(userInput);
+            return await ConversationalAsync(userInput, history);
         }
 
-        private async Task ConversationalAsync(string userInput)
+        // Speaks the AI answer interruptibly — long replies are exactly when the
+        // user wants to be able to barge in with the wakeword.
+        private async Task<bool> ConversationalAsync(string userInput, IReadOnlyList<ConversationTurn> history)
         {
-            string response = await conversationalist(userInput);
-            await context.Speech.Say(userInput, response);
+            var sw = Stopwatch.StartNew();
+            string response = await conversationalist(userInput, history);
+            latency?.RecordLlm(sw.Elapsed);
+            memory.AddModel(response);
+            return await context.Speech.SayInterruptible(userInput, response);
         }
 
         // Validates raw args against a tool's parameter schema: required params must
