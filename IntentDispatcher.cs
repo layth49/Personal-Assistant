@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Threading;
 using System.Threading.Tasks;
 using Personal_Assistant.Diagnostics;
+using Personal_Assistant.SpeechManager;
 
 namespace Personal_Assistant.Dispatch
 {
@@ -62,6 +64,16 @@ namespace Personal_Assistant.Dispatch
     // given prior conversation turns for context.
     public delegate Task<string> Conversationalist(string input, IReadOnlyList<ConversationTurn> history);
 
+    // Streaming form of the same thing: invokes `onSentence` for each speakable
+    // chunk as the model produces it, and returns the complete text. Optional —
+    // when supplied, the dispatcher speaks replies as they generate instead of
+    // waiting for the whole answer.
+    public delegate Task<string> StreamingConversationalist(
+        string input,
+        IReadOnlyList<ConversationTurn> history,
+        Func<string, Task> onSentence,
+        CancellationToken ct);
+
     // LLM-first intent dispatch.
     //
     // Flow for a turn of recognised text:
@@ -78,6 +90,7 @@ namespace Personal_Assistant.Dispatch
         private readonly CommandContext context;
         private readonly ToolDetector detector;
         private readonly Conversationalist conversationalist;
+        private readonly StreamingConversationalist streamingConversationalist;
         private readonly ConversationMemory memory;
         private readonly LatencyTracker latency;
 
@@ -87,12 +100,16 @@ namespace Personal_Assistant.Dispatch
             ToolDetector detector,
             Conversationalist conversationalist,
             ConversationMemory memory = null,
-            LatencyTracker latency = null)
+            LatencyTracker latency = null,
+            StreamingConversationalist streamingConversationalist = null)
         {
             this.registry = registry ?? throw new ArgumentNullException(nameof(registry));
             this.context = context ?? throw new ArgumentNullException(nameof(context));
             this.detector = detector ?? throw new ArgumentNullException(nameof(detector));
             this.conversationalist = conversationalist ?? throw new ArgumentNullException(nameof(conversationalist));
+            // Optional: without it the dispatcher keeps the old wait-for-the-whole-
+            // answer behaviour, which is also the fallback if streaming is broken.
+            this.streamingConversationalist = streamingConversationalist;
             this.memory = memory ?? new ConversationMemory();
             this.latency = latency;
         }
@@ -231,6 +248,23 @@ namespace Personal_Assistant.Dispatch
         // user wants to be able to barge in with the wakeword.
         private async Task<bool> ConversationalAsync(string userInput, IReadOnlyList<ConversationTurn> history)
         {
+            if (streamingConversationalist != null)
+            {
+                // The producer times only generation, so `llm` stays comparable
+                // with the non-streamed path (it must not absorb playback time).
+                SentenceProducer producer = async (onSentence, ct) =>
+                {
+                    var genSw = Stopwatch.StartNew();
+                    string text = await streamingConversationalist(userInput, history, onSentence, ct);
+                    latency?.RecordLlm(genSw.Elapsed);
+                    return text;
+                };
+
+                var streamed = await context.Speech.SayStreamingInterruptible(userInput, producer);
+                memory.AddModel(streamed.Text);
+                return streamed.Interrupted;
+            }
+
             var sw = Stopwatch.StartNew();
             string response = await conversationalist(userInput, history);
             latency?.RecordLlm(sw.Elapsed);
@@ -242,7 +276,9 @@ namespace Personal_Assistant.Dispatch
         // be present and non-empty, and any param with AllowedValues must match one
         // (case-insensitively, canonicalised to the declared casing). Unknown args
         // are dropped. This is the guard the task requires before handlers run.
-        private static bool TryValidate(
+        // Internal (not private) only so the bake-off harness can score argument
+        // validity with the exact same rules the dispatcher enforces.
+        internal static bool TryValidate(
             ToolDefinition tool,
             IReadOnlyDictionary<string, string> raw,
             out IReadOnlyDictionary<string, string> clean,

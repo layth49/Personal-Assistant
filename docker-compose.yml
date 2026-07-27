@@ -10,6 +10,12 @@ services:
       - ./searxng:/etc/searxng:rw
 
   # 2. Kokoro FastAPI - Text-to-Speech
+  #
+  # Stays on the GPU. Measured 22-34x realtime here (7.3s of audio in ~250ms),
+  # so it only touches the card in short bursts; moving it to the CPU freed
+  # ~1 GB of VRAM but tripled time-to-first-audio (783ms -> 2717ms), which is
+  # the wrong trade for a voice assistant. If VRAM ever has to be reclaimed,
+  # DEVICE=cpu + USE_GPU=false switch this same image over with no image pull.
   kokoro:
     container_name: kokoro
     image: ghcr.io/remsky/kokoro-fastapi-gpu:latest

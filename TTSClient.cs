@@ -1,5 +1,6 @@
 using NAudio.Wave;
 using System;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
@@ -23,6 +24,29 @@ namespace Personal_Assistant.TTSClient
         private WaveOutEvent activeOutput;
         private CancellationTokenSource activeCts;
 
+        // ── Streaming playback state ────────────────────────────────────────
+        // One WaveOutEvent fed by a single BufferedWaveProvider for the whole
+        // reply: sentences are appended as they finish synthesising, so playback
+        // runs continuously instead of stopping and restarting per chunk.
+        private BlockingCollection<string> streamQueue;
+        private CancellationTokenSource streamCts;
+        private Task streamPump;
+        private BufferedWaveProvider streamBuffer;
+        private WaveOutEvent streamOutput;
+        private Stopwatch streamClock;
+        private volatile bool inputEnded;
+        private bool playbackStarted;
+
+        // How much audio to bank before playback starts. Buys synthesis a head
+        // start so a slow chunk doesn't become an audible gap; also the ceiling on
+        // what this adds to time-to-first-audio (usually nothing, since the first
+        // chunk is normally longer than this on its own).
+        private static readonly TimeSpan PlaybackLead = TimeSpan.FromMilliseconds(700);
+
+        // Time from BeginStream() to the instant the first chunk started playing —
+        // the number Session D exists to shrink. Null if nothing played.
+        public TimeSpan? FirstAudioLatency { get; private set; }
+
         // Wall-clock time of the last synthesis request only — the network round
         // trip to Kokoro to get WAV bytes back. Deliberately excludes playback
         // (started after this point), which scales with reply length and isn't a
@@ -45,23 +69,7 @@ namespace Personal_Assistant.TTSClient
             var sw = Stopwatch.StartNew();
             try
             {
-                var payload = new
-                {
-                    model = "kokoro",
-                    input = text,
-                    voice = voice,
-                    response_format = "wav"
-                };
-                var json = JsonSerializer.Serialize(payload);
-                using (var req = new HttpRequestMessage(HttpMethod.Post, kokoroUrl.TrimEnd('/') + "/v1/audio/speech"))
-                {
-                    req.Content = new StringContent(json, Encoding.UTF8, "application/json");
-                    using (var resp = await http.SendAsync(req, HttpCompletionOption.ResponseContentRead, cts.Token).ConfigureAwait(false))
-                    {
-                        resp.EnsureSuccessStatusCode();
-                        wavBytes = await resp.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-                    }
-                }
+                wavBytes = await RequestWavAsync(text, cts.Token).ConfigureAwait(false);
                 LastSynthesisElapsed = sw.Elapsed;
             }
             catch (OperationCanceledException)
@@ -127,6 +135,245 @@ namespace Personal_Assistant.TTSClient
             }
         }
 
+        // One Kokoro synthesis round trip. Shared by the one-shot and streaming
+        // paths so the payload/endpoint live in exactly one place.
+        private static async Task<byte[]> RequestWavAsync(string text, CancellationToken ct)
+        {
+            var payload = new
+            {
+                model = "kokoro",
+                input = text,
+                voice = voice,
+                response_format = "wav"
+            };
+            var json = JsonSerializer.Serialize(payload);
+            using (var req = new HttpRequestMessage(HttpMethod.Post, kokoroUrl.TrimEnd('/') + "/v1/audio/speech"))
+            {
+                req.Content = new StringContent(json, Encoding.UTF8, "application/json");
+                using (var resp = await http
+                    .SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct)
+                    .ConfigureAwait(false))
+                {
+                    resp.EnsureSuccessStatusCode();
+                    return await resp.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+                }
+            }
+        }
+
+        // ── Streaming API ───────────────────────────────────────────────────
+        // Usage: BeginStream() -> EnqueueSentence(..) xN -> EndStreamInput() ->
+        // await CompleteStreamAsync(). StopSpeaking() aborts the whole thing at
+        // any point.
+
+        public void BeginStream()
+        {
+            lock (playbackLock)
+            {
+                StopSpeakingInternal();
+                streamQueue = new BlockingCollection<string>();
+                streamCts = new CancellationTokenSource();
+                streamBuffer = null;
+                streamOutput = null;
+                inputEnded = false;
+                playbackStarted = false;
+                FirstAudioLatency = null;
+                streamClock = Stopwatch.StartNew();
+
+                var queue = streamQueue;
+                var cts = streamCts;
+                // GetConsumingEnumerable blocks, so the pump owns a threadpool
+                // thread for the duration of the reply rather than an async slot.
+                streamPump = Task.Run(() => PumpAsync(queue, cts));
+            }
+        }
+
+        // Hands one sentence to the synthesiser. Returns immediately — synthesis
+        // of the next sentence overlaps playback of the current one.
+        public void EnqueueSentence(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return;
+            BlockingCollection<string> queue;
+            lock (playbackLock) { queue = streamQueue; }
+            if (queue == null) return;
+            try { queue.Add(text); }
+            catch (Exception) { /* completed or disposed by a concurrent stop */ }
+        }
+
+        // No more sentences are coming; the pump may finish once it drains.
+        public void EndStreamInput()
+        {
+            inputEnded = true;
+            BlockingCollection<string> queue;
+            lock (playbackLock) { queue = streamQueue; }
+            if (queue == null) return;
+            try { queue.CompleteAdding(); } catch (ObjectDisposedException) { }
+
+            // Nothing more is coming, so there's no reason to keep banking audio
+            // for a head start — release whatever is held.
+            lock (playbackLock)
+            {
+                if (!playbackStarted && streamBuffer != null && streamOutput != null)
+                {
+                    playbackStarted = true;
+                    streamOutput.Play();
+                    FirstAudioLatency = streamClock.Elapsed;
+                }
+            }
+        }
+
+        // Waits for every queued sentence to be synthesised AND played out.
+        public async Task CompleteStreamAsync()
+        {
+            Task pump;
+            CancellationTokenSource cts;
+            lock (playbackLock) { pump = streamPump; cts = streamCts; }
+
+            EndStreamInput();
+            if (pump != null)
+            {
+                try { await pump.ConfigureAwait(false); } catch { }
+            }
+
+            // Then let the audio already handed to NAudio drain.
+            while (cts != null && !cts.IsCancellationRequested)
+            {
+                BufferedWaveProvider buffer;
+                lock (playbackLock) { buffer = streamBuffer; }
+                if (buffer == null || buffer.BufferedBytes == 0) break;
+                await Task.Delay(30).ConfigureAwait(false);
+            }
+
+            // BufferedBytes hits zero while the driver still holds ~DesiredLatency
+            // of audio; without this the last syllable gets clipped.
+            if (cts != null && !cts.IsCancellationRequested)
+            {
+                bool played;
+                lock (playbackLock) { played = streamBuffer != null; }
+                if (played) await Task.Delay(150).ConfigureAwait(false);
+            }
+
+            TeardownStream();
+        }
+
+        private async Task PumpAsync(BlockingCollection<string> queue, CancellationTokenSource cts)
+        {
+            var synthTotal = TimeSpan.Zero;
+            try
+            {
+                foreach (string sentence in queue.GetConsumingEnumerable(cts.Token))
+                {
+                    if (cts.IsCancellationRequested) return;
+
+                    byte[] wav;
+                    var sw = Stopwatch.StartNew();
+                    try
+                    {
+                        wav = await RequestWavAsync(sentence, cts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) { return; }
+                    catch (Exception ex)
+                    {
+                        // Skip the sentence rather than dropping the rest of the reply.
+                        Console.WriteLine("Kokoro chunk synth failed: " + ex.Message);
+                        continue;
+                    }
+                    synthTotal += sw.Elapsed;
+                    LastSynthesisElapsed = synthTotal;
+
+                    if (wav == null || cts.IsCancellationRequested) continue;
+                    AppendChunk(wav, cts);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Kokoro stream pump failed: " + ex.Message);
+            }
+        }
+
+        // Decodes one synthesised chunk and appends its PCM to the shared output.
+        private void AppendChunk(byte[] wav, CancellationTokenSource cts)
+        {
+            FixWavHeaderSizes(wav);
+            try
+            {
+                using (var reader = new WaveFileReader(new MemoryStream(wav)))
+                {
+                    var pcm = new byte[reader.Length];
+                    int read = reader.Read(pcm, 0, pcm.Length);
+                    if (read <= 0) return;
+
+                    lock (playbackLock)
+                    {
+                        if (cts.IsCancellationRequested || streamCts != cts) return;
+
+                        if (streamBuffer == null)
+                        {
+                            // First chunk decides the format — no need to hardcode
+                            // Kokoro's sample rate, and a server-side voice change
+                            // can't desync us.
+                            streamBuffer = new BufferedWaveProvider(reader.WaveFormat)
+                            {
+                                BufferDuration = TimeSpan.FromMinutes(5),
+                                DiscardOnBufferOverflow = false
+                            };
+                            // Bluetooth/wireless output needs a deeper device
+                            // buffer than the 100ms the one-shot path used: there
+                            // audio arrived as one finished WAV, whereas here it
+                            // trickles in and a short buffer underruns audibly.
+                            streamOutput = new WaveOutEvent
+                            {
+                                DesiredLatency = 250,
+                                NumberOfBuffers = 3,
+                            };
+                            streamOutput.Init(streamBuffer);
+                        }
+
+                        streamBuffer.AddSamples(pcm, 0, read);
+
+                        // Hold a little audio back before starting, so synthesis
+                        // has a head start on playback. Without this the very
+                        // first chunk starts playing immediately and any hiccup
+                        // synthesising the second one is heard as a gap.
+                        if (!playbackStarted &&
+                            (streamBuffer.BufferedDuration >= PlaybackLead || inputEnded))
+                        {
+                            playbackStarted = true;
+                            streamOutput.Play();
+                            FirstAudioLatency = streamClock.Elapsed;
+                            Console.WriteLine(
+                                $"[tts] first audio at {streamClock.ElapsedMilliseconds}ms "
+                                + $"({streamBuffer.BufferedDuration.TotalMilliseconds:F0}ms buffered)");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Kokoro chunk decode failed: " + ex.Message);
+            }
+        }
+
+        private void TeardownStream()
+        {
+            WaveOutEvent output;
+            lock (playbackLock)
+            {
+                output = streamOutput;
+                streamOutput = null;
+                streamBuffer = null;
+                if (streamQueue != null) { try { streamQueue.Dispose(); } catch { } }
+                streamQueue = null;
+                streamPump = null;
+                streamCts = null;
+            }
+            if (output != null)
+            {
+                try { output.Stop(); } catch { }
+                try { output.Dispose(); } catch { }
+            }
+        }
+
         public void StopSpeaking()
         {
             lock (playbackLock) { StopSpeakingInternal(); }
@@ -141,6 +388,28 @@ namespace Personal_Assistant.TTSClient
             if (activeOutput != null)
             {
                 try { activeOutput.Stop(); } catch { }
+            }
+
+            // Streaming path: cancel in-flight synthesis, drop everything still
+            // queued, and clear audio already buffered but not yet played — so a
+            // barge-in leaves no "ghost" sentences trailing after the cut.
+            if (streamCts != null)
+            {
+                try { streamCts.Cancel(); } catch { }
+            }
+            if (streamQueue != null)
+            {
+                try { streamQueue.CompleteAdding(); } catch { }
+                string discarded;
+                while (streamQueue.TryTake(out discarded)) { }
+            }
+            if (streamBuffer != null)
+            {
+                try { streamBuffer.ClearBuffer(); } catch { }
+            }
+            if (streamOutput != null)
+            {
+                try { streamOutput.Stop(); } catch { }
             }
         }
 

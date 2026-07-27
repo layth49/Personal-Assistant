@@ -1,6 +1,7 @@
 using Personal_Assistant.AppLaunching;
 using Personal_Assistant.Arduino;
 using Personal_Assistant.AudioControl;
+using Personal_Assistant.Bakeoff;
 using Personal_Assistant.Diagnostics;
 using Personal_Assistant.Dispatch;
 using Personal_Assistant.Geolocator;
@@ -105,8 +106,20 @@ namespace Personal_Assistant
             return pool[random.Next(pool.Length)];
         }
 
-        public static async Task Main()
+        public static async Task Main(string[] args)
         {
+            // Model bake-off mode (`--bakeoff` / LAITH_BAKEOFF=1): score whichever
+            // model LM Studio has loaded against bakeoff/llm/cases.json using the
+            // real tool registry and the real DetectToolAsync, then exit. Built
+            // before anything else so it needs no mic, speakers, Python, or API
+            // keys — only the LLM endpoint. See bakeoff/llm/README.md.
+            if (BakeoffHarness.IsRequested(args))
+            {
+                await BakeoffHarness.RunAsync(
+                    BuildRegistry(new CommandContext { Contacts = LoadContacts() }), args);
+                return;
+            }
+
             CheckEnvironmentVariables();
 
             // 49 (ASCII art)
@@ -192,21 +205,27 @@ namespace Personal_Assistant
                 LocalLLMService.DetectToolAsync,
                 LocalLLMService.GenerateResponse,
                 conversationMemory,
-                latency);
+                latency,
+                // Streamed replies: speech starts after the first sentence rather
+                // than after the whole answer. GenerateResponse above stays as the
+                // non-streamed fallback.
+                LocalLLMService.StreamResponse);
 
             // Let the `repeat` tool run other tools by name (validated).
             context.RunTool = dispatcher.RunToolByNameAsync;
 
-            // When the user barges in over a spoken reply with the wakeword, we
-            // skip the wakeword wait + greeting on the next turn and listen for
-            // their new command straight away.
-            bool listenImmediately = false;
+            // Always-on mic + Silero VAD. From here the assistant can hear while
+            // it speaks, which is what makes talk-over barge-in work.
+            speechManager.StartListening();
+
+            // A conversation stays open after the wakeword so follow-ups don't
+            // need re-waking; it closes when the user goes quiet this long.
+            var followUpWindow = TimeSpan.FromSeconds(12);
+            bool conversationOpen = false;
 
             while (true)
             {
-                int hour = DateTime.Now.Hour;
-
-                if (!listenImmediately)
+                if (!conversationOpen)
                 {
                     bool woke = await speechManager.KeywordRecognizer();
                     Console.WriteLine($"[loop] KeywordRecognizer returned {woke} at {DateTime.Now:HH:mm:ss.fff}");
@@ -215,28 +234,35 @@ namespace Personal_Assistant
                     // spuriously greeting (which previously ran away in a loop).
                     if (!woke) continue;
 
-                    string greeting = PickGreeting(hour);
-                    Console.WriteLine($"[loop] about to call Say at {DateTime.Now:HH:mm:ss.fff}");
-                    // Greeting is NOT interruptible: barge-in matters for long
-                    // conversational replies, not a two-second greeting.
-                    await speechManager.Say("Hey 49", greeting);
+                    // Arm BEFORE the greeting: anything said over it is captured
+                    // and answered rather than lost, even though the greeting
+                    // itself is too short to be worth cutting.
+                    speechManager.Listener.Arm();
+                    await speechManager.Say("Hey 49", PickGreeting(DateTime.Now.Hour));
+                    conversationOpen = true;
                 }
-                listenImmediately = false;
 
-                // Fresh latency counters for this turn — RecognizeOnceAsync
+                // Fresh latency counters for this turn — ListenForTurnAsync
                 // records STT (understanding-only) internally.
                 latency.Reset();
 
-                // Whisper STT returns the transcript, or empty for NoMatch (which
-                // RecognizeOnceAsync has already spoken a re-prompt for).
-                recognizedText = await speechManager.RecognizeOnceAsync();
+                // Silence here means the user is done talking to us, not that we
+                // misheard, so this deliberately doesn't re-prompt.
+                recognizedText = await speechManager.ListenForTurnAsync(followUpWindow);
 
-                if (!string.IsNullOrEmpty(recognizedText))
+                if (string.IsNullOrEmpty(recognizedText))
                 {
-                    bool interrupted = await dispatcher.DispatchAsync(recognizedText);
-                    if (interrupted) listenImmediately = true;
-                    Console.WriteLine(latency.Summary());
+                    Console.WriteLine("[loop] no follow-up — closing the conversation");
+                    speechManager.Listener.Disarm();
+                    conversationOpen = false;
+                    continue;
                 }
+
+                // A barge-in needs no special handling any more: the utterance the
+                // user interrupted with is already recorded and queued, so the next
+                // pass through this loop picks it straight up.
+                await dispatcher.DispatchAsync(recognizedText);
+                Console.WriteLine(latency.Summary());
             }
         }
 
@@ -262,6 +288,9 @@ namespace Personal_Assistant
                 async (ctx, args) =>
                 {
                     await ctx.Speech.Say(ctx.RecognizedText, "Alright goodbye!");
+                    // Close the mic before tearing the interpreter down — the
+                    // listener calls into Python on every audio frame.
+                    ctx.Speech.StopListening();
                     PythonEngine.Shutdown();
                     Environment.Exit(0);
                 }));
@@ -329,8 +358,11 @@ namespace Personal_Assistant
                     }
                     // No conversation history here — handlers don't have access to it, and a
                     // search-and-answer is naturally a one-off lookup anyway.
-                    string answer = await LocalLLMService.AnswerWithSearchResults(ctx.RecognizedText, hits, null);
-                    await ctx.Speech.Say(ctx.RecognizedText, answer);
+                    // Streamed: grounded answers are the longest replies the
+                    // assistant gives, so they benefit most from early first audio.
+                    await ctx.Speech.SayStreaming(ctx.RecognizedText,
+                        (onSentence, ct) => LocalLLMService.StreamWithSearchResults(
+                            ctx.RecognizedText, hits, null, onSentence, ct));
                 }));
 
             registry.Add(new VoiceCommand(

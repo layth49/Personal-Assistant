@@ -2,6 +2,7 @@ using Personal_Assistant.Dispatch;
 using Personal_Assistant.SearxNGClient;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -11,6 +12,142 @@ using System.Threading.Tasks;
 
 namespace Personal_Assistant.LLMClient
 {
+    // Cuts a growing token buffer into speakable pieces. Kokoro sounds best when
+    // handed whole sentences (it gets the prosody right and the seams between
+    // chunks land where a speaker would naturally pause), so we buffer tokens
+    // until a sentence actually closes rather than synthesising per token.
+    internal static class SentenceChunker
+    {
+        // Only the FIRST chunk needs to be short — it sets time-to-first-audio.
+        // After that, short chunks are actively harmful: each one is its own
+        // Kokoro round trip (GPU work) and leaves less synthesis lead time before
+        // the previous chunk finishes playing, which is what makes streamed audio
+        // stutter on a loaded machine. So later chunks are deliberately bigger.
+        private const int FirstMinChars = 30;
+        private const int FirstMaxChars = 220;
+        private const int LaterMinChars = 140;
+        private const int LaterMaxChars = 400;
+
+        // Removes and returns the next speakable chunk. `flush` drains whatever
+        // is left once the model has stopped emitting. `isFirst` selects the
+        // low-latency sizing for the opening chunk.
+        public static bool TryTake(StringBuilder buffer, bool flush, bool isFirst, out string sentence)
+        {
+            int minChars = isFirst ? FirstMinChars : LaterMinChars;
+            int maxChars = isFirst ? FirstMaxChars : LaterMaxChars;
+            sentence = null;
+            while (buffer.Length > 0)
+            {
+                string text = buffer.ToString();
+                int cut;
+
+                if (flush)
+                {
+                    cut = text.Length;
+                }
+                else
+                {
+                    cut = FindSentenceEnd(text, minChars);
+                    if (cut < 0) cut = FindOverflowCut(text, minChars, maxChars);
+                    if (cut < 0) return false;
+                }
+
+                buffer.Remove(0, cut);
+                string candidate = Normalize(text.Substring(0, cut));
+                if (candidate.Length > 0)
+                {
+                    sentence = candidate;
+                    return true;
+                }
+                // Whitespace-only slice — consume it and keep looking.
+            }
+            return false;
+        }
+
+        // Index just past a sentence terminator that is genuinely followed by
+        // whitespace, so "72.5 degrees" and "3. Turn" aren't mistaken for ends.
+        private static int FindSentenceEnd(string text, int minChars)
+        {
+            for (int i = 0; i < text.Length; i++)
+            {
+                char c = text[i];
+
+                if (c == '\n')
+                {
+                    if (i + 1 >= minChars) return i + 1;
+                    continue;
+                }
+
+                if (c != '.' && c != '!' && c != '?') continue;
+                if (c == '.' && IsAbbreviation(text, i)) continue;
+
+                // Let closing quotes/brackets ride along with the sentence.
+                int j = i + 1;
+                while (j < text.Length && (text[j] == '"' || text[j] == '\'' || text[j] == ')')) j++;
+
+                // Terminator is the last thing we have so far — wait for the next
+                // token before deciding, so we can see what follows it.
+                if (j >= text.Length) return -1;
+                if (!char.IsWhiteSpace(text[j])) continue;
+                if (j >= minChars) return j;
+            }
+            return -1;
+        }
+
+        // Abbreviations that end in a period without ending a sentence. Splitting
+        // on these puts an audible pause inside a name ("Dr. | Smith"), which is
+        // worse than the opposite mistake of running two sentences together.
+        private static readonly string[] Abbreviations =
+        {
+            "mr", "mrs", "ms", "dr", "prof", "st", "jr", "sr",
+            "vs", "etc", "inc", "ltd", "fig", "approx"
+        };
+
+        private static bool IsAbbreviation(string text, int dotIndex)
+        {
+            int start = dotIndex;
+            while (start > 0 && char.IsLetter(text[start - 1])) start--;
+            int len = dotIndex - start;
+            if (len == 0) return false;
+
+            // "J. Smith" — a lone capital is an initial, not a sentence end.
+            if (len == 1 && char.IsUpper(text[start])) return true;
+            // A letter already preceded by a dot: the tail of "e.g." / "a.m." / "U.S.A."
+            if (len == 1 && start > 0 && text[start - 1] == '.') return true;
+            if (len > 6) return false;
+
+            string word = text.Substring(start, len).ToLowerInvariant();
+            foreach (string a in Abbreviations)
+            {
+                if (a == word) return true;
+            }
+            return false;
+        }
+
+        private static int FindOverflowCut(string text, int minChars, int maxChars)
+        {
+            if (text.Length < maxChars) return -1;
+            int space = text.LastIndexOf(' ', maxChars - 1);
+            return space > minChars ? space + 1 : maxChars;
+        }
+
+        // Collapses newlines and runs of spaces to single spaces: the model's line
+        // breaks mean nothing to Kokoro, and the bubble wraps on spaces only.
+        private static string Normalize(string s)
+        {
+            var sb = new StringBuilder(s.Length);
+            bool pendingSpace = false;
+            foreach (char c in s)
+            {
+                if (char.IsWhiteSpace(c)) { pendingSpace = true; continue; }
+                if (pendingSpace && sb.Length > 0) sb.Append(' ');
+                pendingSpace = false;
+                sb.Append(c);
+            }
+            return sb.ToString();
+        }
+    }
+
     public class LocalLLMService
     {
         public static readonly string lmStudioUrl =
@@ -96,6 +233,158 @@ namespace Personal_Assistant.LLMClient
             List<SearchHit> hits,
             IReadOnlyList<ConversationTurn> history) =>
             AnswerAsync(inputText, hits, history);
+
+        // Streaming twins of the two methods above. They invoke `onSentence` for
+        // each speakable chunk the moment it is complete, so TTS can start on
+        // sentence one instead of waiting out the whole generation, and return the
+        // full text for the bubble / conversation memory. Tool detection stays
+        // non-streamed — it needs the entire tool_calls JSON before it means
+        // anything.
+        public static Task<string> StreamResponse(
+            string inputText,
+            IReadOnlyList<ConversationTurn> history,
+            Func<string, Task> onSentence,
+            CancellationToken ct) =>
+            StreamAnswerAsync(inputText, null, history, onSentence, ct);
+
+        public static Task<string> StreamWithSearchResults(
+            string inputText,
+            List<SearchHit> hits,
+            IReadOnlyList<ConversationTurn> history,
+            Func<string, Task> onSentence,
+            CancellationToken ct) =>
+            StreamAnswerAsync(inputText, hits, history, onSentence, ct);
+
+        private static async Task<string> StreamAnswerAsync(
+            string inputText,
+            List<SearchHit> hits,
+            IReadOnlyList<ConversationTurn> history,
+            Func<string, Task> onSentence,
+            CancellationToken ct)
+        {
+            var requestBody = new
+            {
+                messages = BuildMessages(BuildSystemPrompt(hits), history, inputText),
+                max_tokens = 200,
+                temperature = 0.5,
+                top_p = 0.5,
+                stream = true
+            };
+
+            string endpoint = $"{lmStudioUrl.TrimEnd('/')}/chat/completions";
+            var full = new StringBuilder();
+            var pending = new StringBuilder();
+            bool firstChunk = true;
+
+            try
+            {
+                using (var req = new HttpRequestMessage(HttpMethod.Post, endpoint))
+                {
+                    req.Content = new StringContent(
+                        JsonSerializer.Serialize(requestBody, JsonOpts),
+                        Encoding.UTF8,
+                        "application/json");
+
+                    // ResponseHeadersRead is what makes this a stream — without it
+                    // HttpClient buffers the whole response and we're back to
+                    // waiting for the last token.
+                    using (var response = await httpClient
+                        .SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct)
+                        .ConfigureAwait(false))
+                    {
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            return $"Error: {(int)response.StatusCode} {response.ReasonPhrase}";
+                        }
+
+                        using (var stream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false))
+                        using (var reader = new StreamReader(stream, Encoding.UTF8))
+                        {
+                            while (!reader.EndOfStream)
+                            {
+                                ct.ThrowIfCancellationRequested();
+
+                                string line = await reader.ReadLineAsync().ConfigureAwait(false);
+                                if (line == null) break;
+                                if (line.Length == 0) continue;
+                                if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
+
+                                string data = line.Substring(5).Trim();
+                                if (data == "[DONE]") break;
+
+                                string delta = ExtractDelta(data);
+                                if (string.IsNullOrEmpty(delta)) continue;
+
+                                full.Append(delta);
+                                pending.Append(delta);
+
+                                string sentence;
+                                while (SentenceChunker.TryTake(pending, false, firstChunk, out sentence))
+                                {
+                                    firstChunk = false;
+                                    await onSentence(sentence).ConfigureAwait(false);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Whatever is left over after [DONE] is the final (possibly
+                // unterminated) sentence.
+                string tail;
+                while (SentenceChunker.TryTake(pending, true, firstChunk, out tail))
+                {
+                    firstChunk = false;
+                    await onSentence(tail).ConfigureAwait(false);
+                }
+
+                return full.ToString();
+            }
+            catch (OperationCanceledException)
+            {
+                // Barge-in / shutdown: keep whatever was already spoken so the
+                // bubble and conversation memory stay consistent with the audio.
+                return full.ToString();
+            }
+            catch (Exception ex)
+            {
+                // Cancelling mid-read surfaces as an IOException on the response
+                // stream rather than OperationCanceledException, so a barge-in
+                // lands here too — that's expected, not a failure worth logging.
+                if (ct.IsCancellationRequested) return full.ToString();
+
+                Console.WriteLine($"[llm] stream failed: {ex.Message}");
+                return full.Length > 0 ? full.ToString() : $"Error: {ex.Message}";
+            }
+        }
+
+        // Pulls choices[0].delta.content out of one SSE payload. Chunks without a
+        // content delta (role announcements, finish_reason) are normal and yield "".
+        private static string ExtractDelta(string json)
+        {
+            try
+            {
+                using (JsonDocument doc = JsonDocument.Parse(json))
+                {
+                    if (!doc.RootElement.TryGetProperty("choices", out var choices) ||
+                        choices.GetArrayLength() == 0)
+                    {
+                        return string.Empty;
+                    }
+                    if (!choices[0].TryGetProperty("delta", out var delta) ||
+                        !delta.TryGetProperty("content", out var contentEl) ||
+                        contentEl.ValueKind != JsonValueKind.String)
+                    {
+                        return string.Empty;
+                    }
+                    return contentEl.GetString() ?? string.Empty;
+                }
+            }
+            catch (JsonException)
+            {
+                return string.Empty;
+            }
+        }
 
         private static async Task<string> AnswerAsync(
             string inputText,

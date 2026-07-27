@@ -38,6 +38,11 @@ namespace Personal_Assistant.STTClient
         // long it took to "understand" the already-recorded audio.
         public TimeSpan LastTranscribeElapsed { get; private set; }
 
+        // Legacy one-shot capture: opens the mic, records a single utterance with
+        // an RMS gate, transcribes it. Superseded by ContinuousListener, which
+        // owns the mic permanently and uses Silero VAD — nothing in the app calls
+        // this any more. Kept as a mic-free-of-VAD fallback for bringing up a new
+        // STT endpoint (Session F); delete it once that's settled.
         public async Task<string> RecognizeOnceAsync(int maxSeconds = 15)
         {
             byte[] wavBytes;
@@ -195,7 +200,9 @@ namespace Personal_Assistant.STTClient
         private static Dictionary<string, string> _cachedContacts;
         private static string _dynamicPrompt;
 
-        private static async Task<string> TranscribeAsync(byte[] wavBytes)
+        // Exposed so the always-on listener can reuse the exact same request
+        // (model, language, contact-name prompt) as the one-shot path.
+        internal static async Task<string> TranscribeAsync(byte[] wavBytes)
         {
             string url = whisperUrl.TrimEnd('/') + "/v1/audio/transcriptions";
 

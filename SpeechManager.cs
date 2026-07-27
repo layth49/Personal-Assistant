@@ -5,13 +5,23 @@ using Personal_Assistant.STTClient;
 using Personal_Assistant.TTSClient;
 using Python.Runtime;
 using System;
+using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
 
 namespace Personal_Assistant.SpeechManager
 {
+    // Produces an answer incrementally: calls `onSentence` for each speakable
+    // chunk the moment it's complete, and returns the whole text when done.
+    // Lets SpeechService drive streamed speech without knowing which LLM
+    // client (or which prompt) is behind it.
+    public delegate Task<string> SentenceProducer(
+        Func<string, Task> onSentence,
+        CancellationToken ct);
+
     public class SpeechService
     {
         // Default mic — used by the on-device KeywordRecognizer (wake word).
@@ -21,7 +31,6 @@ namespace Personal_Assistant.SpeechManager
 
         // Local-stack clients. Replace Azure Neural TTS / Speech-to-Text.
         private readonly KokoroTTSService kokoroTTS = new KokoroTTSService();
-        private readonly WhisperSTTService whisper = new WhisperSTTService();
 
         // Imported lazily in the constructor under Py.GIL — field initializers
         // run before Main has acquired the GIL, and Py.Import without the GIL
@@ -42,7 +51,20 @@ namespace Personal_Assistant.SpeechManager
 
         // Serialises Say / SayInterruptible so a background reminder firing while
         // the assistant is speaking can't garble audio or clobber the bubble state.
+        // It guards SPEAKING only — the listener runs on its own thread and is
+        // never blocked by it, which is what lets the two happen at once.
         private readonly SemaphoreSlim sayGate = new SemaphoreSlim(1, 1);
+
+        // Always-on microphone + Silero VAD. Owns the mic for the app's lifetime,
+        // so listening no longer stops while the assistant talks.
+        private readonly ContinuousListener listener = new ContinuousListener();
+        public ContinuousListener Listener => listener;
+
+        // The reply currently being generated/spoken, so a barge-in can cancel the
+        // whole pipeline (LLM stream + TTS queue + playback) at once.
+        private CancellationTokenSource activeResponseCts;
+        private volatile bool speaking;
+        private volatile bool bargedIn;
 
         // Optional per-turn latency breakdown (null-safe — a caller that doesn't
         // care about timing can just not pass one).
@@ -69,6 +91,49 @@ namespace Personal_Assistant.SpeechManager
             using (Py.GIL())
             {
                 text_display = Py.Import("SpeechBubble");
+            }
+
+            listener.SpeechOnset += OnSpeechOnset;
+        }
+
+        // Begins always-on capture. Separate from the constructor so the caller
+        // controls when the mic opens.
+        public void StartListening()
+        {
+            try
+            {
+                listener.Start();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Continuous listener failed to start: " + ex.Message);
+            }
+        }
+
+        public void StopListening()
+        {
+            try { listener.Dispose(); } catch { }
+        }
+
+        // The barge-in trigger: the user started talking while the assistant was
+        // mid-reply, so cut everything and let their utterance become the next
+        // turn (the listener is already recording it).
+        //
+        // TODO(G): echo/AEC. On speakers, Kokoro's own output bleeds into the mic
+        // and will trip this, making the assistant interrupt itself. Session G
+        // owns that; until then this assumes a headset, as the code always has.
+        private void OnSpeechOnset()
+        {
+            if (!speaking) return;
+
+            Console.WriteLine("[barge-in] user spoke over the reply -> cutting off");
+            bargedIn = true;
+            StopSpeaking();
+
+            var cts = activeResponseCts;
+            if (cts != null)
+            {
+                try { cts.Cancel(); } catch (ObjectDisposedException) { }
             }
         }
 
@@ -105,17 +170,26 @@ namespace Personal_Assistant.SpeechManager
             }
         }
 
-        // Captures speech via faster-whisper-server. An empty return value is the
-        // new NoMatch signal — callers check string.IsNullOrEmpty() the same way
-        // they used to check ResultReason.NoMatch.
+        // Waits for the user's next utterance, which the always-on listener has
+        // been capturing all along (including while the assistant was speaking).
+        // Empty return == they stayed quiet; callers check string.IsNullOrEmpty()
+        // the same way they used to check ResultReason.NoMatch.
         public async Task<string> RecognizeOnceAsync(int maxSeconds = 15)
         {
-            string text = await whisper.RecognizeOnceAsync(maxSeconds);
-            latency?.RecordStt(whisper.LastTranscribeElapsed);
+            string text = await ListenForTurnAsync(TimeSpan.FromSeconds(maxSeconds));
             if (string.IsNullOrEmpty(text))
             {
                 await Say(string.Empty, "Sorry I didn't get that. Can you say it again?");
             }
+            return text;
+        }
+
+        // Same wait, without the re-prompt. The main loop uses this: silence there
+        // means "the conversation is over", not "I misheard you".
+        public async Task<string> ListenForTurnAsync(TimeSpan timeout)
+        {
+            string text = await listener.NextUtteranceAsync(timeout);
+            latency?.RecordStt(listener.LastTranscribeElapsed);
             return text;
         }
 
@@ -129,14 +203,18 @@ namespace Personal_Assistant.SpeechManager
             finally
             {
                 // Retract the speech bubble once playback completes (or fails).
-                if (state != null)
-                {
-                    using (Py.GIL())
-                    {
-                        var pyFalse = PythonEngine.Eval("False");
-                        state.SetItem("running", pyFalse);
-                    }
-                }
+                RetractBubble();
+            }
+        }
+
+        // Flips the current bubble's shared state so the Python daemon animates
+        // it out. Safe to call more than once.
+        private void RetractBubble()
+        {
+            if (state == null) return;
+            using (Py.GIL())
+            {
+                state.SetItem("running", PythonEngine.Eval("False"));
             }
         }
 
@@ -146,13 +224,18 @@ namespace Personal_Assistant.SpeechManager
             kokoroTTS.StopSpeaking();
         }
 
+        // Posts the bubble to the persistent Python daemon and returns immediately.
+        // The pygame window lives on its own long-lived Python thread, so this no
+        // longer parks the calling thread for the length of the utterance. The
+        // daemon holds the bubble while state["running"] is true and animates it
+        // out when SynthesizeTextToSpeech flips it to false.
         public void SpeechBubble(string userInput, string response)
         {
+            var sw = Stopwatch.StartNew();
             using (Py.GIL())
             {
                 state = new PyDict();
                 state.SetItem("running", PythonEngine.Eval("True"));
-                IntPtr gil = PythonEngine.BeginAllowThreads();
                 try
                 {
                     text_display.show_bubble(userInput, response, state);
@@ -164,9 +247,23 @@ namespace Personal_Assistant.SpeechManager
                     Console.WriteLine("Message: " + ex.Message);
                     Console.WriteLine("StackTrace: " + ex.StackTrace);
                 }
-                finally
+            }
+            Console.WriteLine($"[bubble] posted in {sw.ElapsedMilliseconds}ms");
+        }
+
+        // Swaps the text of the bubble already on screen, with no exit/enter
+        // animation — how a streamed reply grows as sentences arrive.
+        public void UpdateBubble(string userInput, string response)
+        {
+            using (Py.GIL())
+            {
+                try
                 {
-                    PythonEngine.EndAllowThreads(gil);
+                    text_display.update_bubble(userInput, response);
+                }
+                catch (PythonException ex)
+                {
+                    Console.WriteLine("Bubble update failed: " + ex.Message);
                 }
             }
         }
@@ -194,8 +291,11 @@ namespace Personal_Assistant.SpeechManager
             await sayGate.WaitAsync();
             try
             {
-                var synthTask = Task.Run(() => SynthesizeTextToSpeech(response));
+                // Bubble first: posting it is non-blocking now, and doing it before
+                // the synth starts means the synth's retract signal can never land
+                // on a stale state dict.
                 SpeechBubble(userInput, response);
+                var synthTask = Task.Run(() => SynthesizeTextToSpeech(response));
                 try { await synthTask; }
                 catch (Exception ex) { Console.WriteLine($"TTS error: {ex.Message}"); }
             }
@@ -222,12 +322,13 @@ namespace Personal_Assistant.SpeechManager
             await sayGate.WaitAsync();
             try
             {
+                // Bubble first (non-blocking), then the synth — same ordering as
+                // Say, so the retract signal always targets this turn's state dict.
+                SpeechBubble(userInput, response);
                 var synthTask = Task.Run(() => SynthesizeTextToSpeech(response));
 
-                // Start listening for the wakeword NOW, before the bubble. The
-                // bubble call below blocks the calling thread for the whole speech,
-                // so the barge-in race must run on its own thread or it would only
-                // begin after the speech already finished.
+                // The barge-in race runs on its own thread so it stays independent
+                // of whatever the caller does while the reply plays.
                 Console.WriteLine("[interrupt] listening for wakeword during speech");
                 var interruptTcs = new TaskCompletionSource<bool>();
                 _ = Task.Run(async () =>
@@ -271,9 +372,6 @@ namespace Personal_Assistant.SpeechManager
                     interruptTcs.TrySetResult(interrupted);
                 });
 
-                // Bubble on the calling thread; returns when the synth completes
-                // (naturally or because it was stopped by a barge-in).
-                SpeechBubble(userInput, response);
                 try { await synthTask; }
                 catch (Exception ex) { Console.WriteLine($"TTS error: {ex.Message}"); }
 
@@ -298,6 +396,136 @@ namespace Personal_Assistant.SpeechManager
             {
                 sayGate.Release();
             }
+        }
+
+        // Speaks an answer AS IT IS GENERATED. Each sentence is synthesised and
+        // queued the moment the model finishes it, so audio starts after sentence
+        // one instead of after the whole reply — the Session D latency win.
+        // Returns the complete text (for conversation memory).
+        public async Task<string> SayStreaming(string userInput, SentenceProducer produce)
+        {
+            await sayGate.WaitAsync();
+            var cts = new CancellationTokenSource();
+            try
+            {
+                return await SpeakStreamAsync(userInput, produce, cts);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"TTS stream error: {ex.Message}");
+                return string.Empty;
+            }
+            finally
+            {
+                RetractBubble();
+                sayGate.Release();
+            }
+        }
+
+        // Streaming reply that the user can simply talk over. The interrupt no
+        // longer needs the wakeword: the always-on listener raises SpeechOnset,
+        // OnSpeechOnset cuts playback and cancels this reply's token, and the
+        // utterance already being recorded becomes the next turn.
+        public async Task<(string Text, bool Interrupted)> SayStreamingInterruptible(
+            string userInput, SentenceProducer produce)
+        {
+            await sayGate.WaitAsync();
+            var cts = new CancellationTokenSource();
+            try
+            {
+                string text = string.Empty;
+                try { text = await SpeakStreamAsync(userInput, produce, cts); }
+                catch (OperationCanceledException) { }
+                catch (Exception ex) { Console.WriteLine($"TTS stream error: {ex.Message}"); }
+
+                RetractBubble();
+
+                bool wasInterrupted = bargedIn;
+                if (wasInterrupted) Console.WriteLine("[barge-in] reply cut; next turn is already being recorded");
+                return (text, wasInterrupted);
+            }
+            finally
+            {
+                sayGate.Release();
+            }
+        }
+
+        // Shared core: drives the producer, feeding each sentence to the TTS queue
+        // and growing the bubble in step, then waits for playback to drain.
+        private async Task<string> SpeakStreamAsync(
+            string userInput, SentenceProducer produce, CancellationTokenSource cts)
+        {
+            // Publish this reply so OnSpeechOnset can cancel it from the listener
+            // thread. Streamed replies are the long ones — exactly what the user
+            // wants to be able to talk over.
+            bargedIn = false;
+            activeResponseCts = cts;
+            speaking = true;
+
+            kokoroTTS.BeginStream();
+
+            var spoken = new StringBuilder();
+            bool bubbleShown = false;
+
+            Func<string, Task> onSentence = sentence =>
+            {
+                if (string.IsNullOrWhiteSpace(sentence)) return Task.CompletedTask;
+
+                // A chunk that's pure emoji/punctuation still belongs in the
+                // bubble but must not reach Kokoro — the system prompt promises
+                // emoji are shown, not spoken, and synthesising one costs a whole
+                // round trip to produce a noise at the end of the reply.
+                if (HasSpeakableContent(sentence)) kokoroTTS.EnqueueSentence(sentence);
+
+                if (spoken.Length > 0) spoken.Append(' ');
+                spoken.Append(sentence.Trim());
+                string soFar = spoken.ToString();
+
+                // The bubble appears with the first sentence — roughly when audio
+                // starts — then grows in place as the rest arrives.
+                if (!bubbleShown) { SpeechBubble(userInput, soFar); bubbleShown = true; }
+                else UpdateBubble(userInput, soFar);
+
+                return Task.CompletedTask;
+            };
+
+            string full;
+            try
+            {
+                try
+                {
+                    full = await produce(onSentence, cts.Token);
+                }
+                finally
+                {
+                    kokoroTTS.EndStreamInput();
+                }
+
+                await kokoroTTS.CompleteStreamAsync();
+
+                latency?.RecordTts(kokoroTTS.LastSynthesisElapsed);
+                if (kokoroTTS.FirstAudioLatency.HasValue)
+                {
+                    latency?.RecordFirstAudio(kokoroTTS.FirstAudioLatency.Value);
+                }
+            }
+            finally
+            {
+                speaking = false;
+                activeResponseCts = null;
+            }
+
+            return full;
+        }
+
+        // True if there's anything a voice could actually pronounce.
+        private static bool HasSpeakableContent(string text)
+        {
+            foreach (char c in text)
+            {
+                if (char.IsLetterOrDigit(c)) return true;
+            }
+            return false;
         }
 
         // Awaits `task` but gives up after `ms`, so interrupt teardown can never
