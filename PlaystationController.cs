@@ -15,7 +15,8 @@ namespace Personal_Assistant.PlaystationController
 {
     public class PlaystationControl
     {
-        private readonly SpeechService speechManager = new SpeechService();
+        // The app's shared instance — never `new` one here. See SpeechService.Current.
+        private static SpeechService speechManager { get { return SpeechService.Current; } }
 
         public async Task TurnOnPlaystation()
         {

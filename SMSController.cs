@@ -20,7 +20,8 @@ namespace Personal_Assistant.SMSController
         [DllImport("user32.dll")]
         static extern bool SetForegroundWindow(IntPtr hWnd);
 
-        private readonly SpeechService speechManager = new SpeechService();
+        // The app's shared instance — never `new` one here. See SpeechService.Current.
+        private static SpeechService speechManager { get { return SpeechService.Current; } }
 
         public async Task SendSMS(string contactName, string contactNumber)
         {
@@ -40,6 +41,14 @@ namespace Personal_Assistant.SMSController
                     await speechManager.Say(Program.recognizedText, $"Okay! What would you like to send {contactName}?");
 
                     string userText = await speechManager.RecognizeOnceAsync();
+
+                    // Nothing heard: retry the prompt rather than falling
+                    // through to send whatever this is (which was "").
+                    if (string.IsNullOrWhiteSpace(userText))
+                    {
+                        Console.WriteLine("[sms] no message dictated — retrying");
+                        continue;
+                    }
 
                     if (userText.IndexOf("Introduce yourself", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
@@ -84,6 +93,17 @@ namespace Personal_Assistant.SMSController
 
         public void SendMessageToContact(string contactNumber, string message)
         {
+            // Last line of defence before something leaves the machine. An empty
+            // body meant the dictation step got nothing back and nobody noticed
+            // — which is exactly what happened when this class was talking to a
+            // SpeechService whose microphone had never been opened. A text to a
+            // real number is not recallable, so refuse rather than guess.
+            if (string.IsNullOrWhiteSpace(message))
+            {
+                Console.WriteLine($"[sms] refusing to send an empty message to {contactNumber}");
+                return;
+            }
+
             Console.WriteLine($"Sending message to {contactNumber}: {message}");
 
             // Phone Link usually runs under this process name

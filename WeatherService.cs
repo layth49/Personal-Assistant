@@ -25,7 +25,7 @@ namespace Personal_Assistant.WeatherService
         public async Task GetWeatherData()
         {
             var location = new GetLocation();
-            var speechManager = new SpeechService();
+            var speechManager = SpeechService.Current;   // never `new` one here
 
             try
             {
@@ -75,7 +75,7 @@ namespace Personal_Assistant.WeatherService
         public async Task GetForecastData(int days = 3)
         {
             var location = new GetLocation();
-            var speechManager = new SpeechService();
+            var speechManager = SpeechService.Current;   // never `new` one here
 
             try
             {

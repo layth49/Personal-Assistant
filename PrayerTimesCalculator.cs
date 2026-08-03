@@ -7,7 +7,8 @@ namespace Personal_Assistant.PrayerTimesCalculator
 {
     public class GetPrayerTimes
     {
-        private readonly SpeechService speechManager = new SpeechService();
+        // The app's shared instance — never `new` one here. See SpeechService.Current.
+        private static SpeechService speechManager { get { return SpeechService.Current; } }
 
         private readonly double latitude;
         private readonly double longitude;
