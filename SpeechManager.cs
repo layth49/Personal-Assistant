@@ -420,6 +420,56 @@ namespace Personal_Assistant.SpeechManager
             }
         }
 
+        // Runs the on-device keyword spotter until it fires or `cancellationToken`
+        // is cancelled, and reports whether the wakeword was actually heard.
+        //
+        // SayInterruptible above owns the same race for Azure TTS, where the thing
+        // being cut is a synthesizer this class holds. The Live session's audio
+        // belongs to LiveAudioPlayback instead, so it needs the detection without
+        // the cutting — hence this rather than another copy of the race.
+        //
+        // Uses the DEDICATED interrupt recognizer for the reason documented on the
+        // field: borrowing the main-loop one and stopping it mid-flight invalidates
+        // its handle and permanently breaks the wakeword wait. The worst case here
+        // stays "barge-in stops working", never "the assistant stops waking up".
+        public async Task<bool> WatchForWakewordAsync(System.Threading.CancellationToken cancellationToken)
+        {
+            if (interruptKeywordRecognizer == null || keywordModel == null) return false;
+
+            try
+            {
+                var keywordTask = interruptKeywordRecognizer.RecognizeOnceAsync(keywordModel);
+                var cancelled = new TaskCompletionSource<bool>();
+                using (cancellationToken.Register(() => cancelled.TrySetResult(true)))
+                {
+                    var finished = await Task.WhenAny(keywordTask, cancelled.Task);
+                    if (finished != keywordTask) return false;
+                }
+
+                var kw = await keywordTask;
+                return kw != null && kw.Reason == ResultReason.RecognizedKeyword;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[interrupt] wakeword watch error: {ex.Message}");
+                return false;
+            }
+        }
+
+        // Stops the interrupt recognizer so the next WatchForWakewordAsync starts
+        // clean. Fire-and-forget on purpose: the caller is usually finishing a turn
+        // and must not be held up by a recogniser that won't stop — and because
+        // it's the dedicated instance, a wedged one costs later barge-ins only.
+        public void StopWakewordWatch()
+        {
+            if (interruptKeywordRecognizer == null) return;
+            _ = Task.Run(async () =>
+            {
+                try { await WithTimeout(interruptKeywordRecognizer.StopRecognitionAsync(), 3000, "StopRecognition"); }
+                catch (Exception ex) { Console.WriteLine($"[interrupt] stop failed: {ex.Message}"); }
+            });
+        }
+
         // Awaits `task` but gives up after `ms`, logging a warning. Used to keep
         // the interrupt teardown from ever blocking the assistant indefinitely on
         // a recogniser that won't stop.

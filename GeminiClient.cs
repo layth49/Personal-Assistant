@@ -205,12 +205,15 @@ namespace Personal_Assistant.GeminiClient
             return contents.ToArray();
         }
 
-        private static object BuildToolRequest(
-            string inputText,
-            IReadOnlyList<ToolDefinition> tools,
-            IReadOnlyList<ConversationTurn> history)
+        // Serialises tool schemas into Gemini `function_declarations` entries.
+        // Shared by the turn-based path below and the Live API session's `setup`
+        // message (LiveClient.cs) so there is exactly one tool serialiser — the
+        // two transports must never disagree about what a tool looks like.
+        public static List<object> BuildFunctionDeclarations(IReadOnlyList<ToolDefinition> tools)
         {
             var functionDeclarations = new List<object>();
+            if (tools == null) return functionDeclarations;
+
             foreach (var tool in tools)
             {
                 var properties = new Dictionary<string, object>();
@@ -245,6 +248,16 @@ namespace Personal_Assistant.GeminiClient
                     ["parameters"] = parameters
                 });
             }
+
+            return functionDeclarations;
+        }
+
+        private static object BuildToolRequest(
+            string inputText,
+            IReadOnlyList<ToolDefinition> tools,
+            IReadOnlyList<ConversationTurn> history)
+        {
+            List<object> functionDeclarations = BuildFunctionDeclarations(tools);
 
             var contents = new List<object>();
             if (history != null)

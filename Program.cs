@@ -7,6 +7,7 @@ using Personal_Assistant.Dispatch;
 using Personal_Assistant.GeminiClient;
 using Personal_Assistant.Geolocator;
 using Personal_Assistant.LightAutomator;
+using Personal_Assistant.Live;
 using Personal_Assistant.MediaControl;
 using Personal_Assistant.PlaystationController;
 using Personal_Assistant.PrayerTimesCalculator;
@@ -114,6 +115,14 @@ namespace Personal_Assistant
             // 49 (ASCII art)
             Console.WriteLine("                                    \r\n     ,AM  .d*\"*bg.\r\n    AVMM 6MP    Mb\r\n  ,W' MM YMb    MM\r\n,W'   MM  `MbmmdM9\r\nAmmmmmMMmm     .M'\r\n      MM     .d9  \r\n      MM   m\"'    \n\n");
 
+            // Teardown for the Live session, registered before anything can open
+            // one. ProcessExit covers both an ordinary return and the
+            // Environment.Exit(0) the `exit_assistant` tool calls after
+            // PythonEngine.Shutdown(); CancelKeyPress covers Ctrl+C. Neither path
+            // may leave a WebSocket streaming silence behind it.
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => CloseActiveSession("process exiting");
+            Console.CancelKeyPress += (s, e) => CloseActiveSession("Ctrl+C");
+
             Runtime.PythonDLL = @"C:\Users\layth\AppData\Local\Programs\Python\Python312\python312.dll";
             PythonEngine.Initialize();
             PythonEngine.BeginAllowThreads();
@@ -133,6 +142,11 @@ namespace Personal_Assistant
             // websocket connections, so creating them once cuts handshake latency.
             var speechManager = new SpeechService(latency);
             await speechManager.WarmUpAudioAsync(); // wakes the audio device so first greeting isn't clipped
+
+            // Azure STT no longer runs the conversation — the Live session does its
+            // own — but the recognizer and its contact phrase list are kept built
+            // and warm because Phase 5's fallback drops straight back onto them
+            // when a Live session ends dirty. Azure keeps the wake word either way.
             var speechRecognizer = new SpeechRecognizer(speechManager.speechConfig);
             var phraseList = PhraseListGrammar.FromRecognizer(speechRecognizer);
 
@@ -220,59 +234,172 @@ namespace Personal_Assistant
             // bind whatever the default happened to be.
             context.RunTool = (name, args) => dispatcher.RunToolByNameAsync(name, args, speak: true);
 
-            // When the user barges in over a spoken reply with the wakeword, we
-            // skip the wakeword wait + greeting on the next turn and listen for
-            // their new command straight away.
-            bool listenImmediately = false;
+            // The `listenImmediately` flag the turn-based loop used for barge-in is
+            // gone from THIS loop — a Live conversation stays open across follow-ups
+            // on its own, so there is no "skip the wakeword next time" state to keep
+            // between wakes. It still exists inside the fallback below, which is the
+            // old turn-based path and still barges in the old way.
+
+            // Latched so the "switching to the backup" notice is said once, not on
+            // every turn of a broken evening. Cleared by a Live conversation that
+            // ends cleanly, so a SECOND outage after a recovery is announced again
+            // — the alternative is an assistant that silently runs degraded for the
+            // rest of the process run and never says so.
+            bool fallbackNoticeGiven = false;
+
+            // The fallback: the ORIGINAL turn-based conversation, unchanged.
+            // RecognizeOnceAsync (Azure STT) -> IntentDispatcher.DispatchAsync ->
+            // Say (Azure TTS), with the same barge-in continuation the old loop had,
+            // the same per-turn latency summary, and the same recognizer and warm
+            // contact phrase list built at startup. Nothing about this path is new,
+            // which is the point: it is known to work, so it is what a failed Live
+            // session falls back ONTO.
+            //
+            // One conversation's worth, i.e. one turn plus however many follow-ups
+            // the user barges in for — then control returns to the wake word, and
+            // the next wake tries Live again.
+            async Task RunFallbackConversationAsync()
+            {
+                if (!fallbackNoticeGiven)
+                {
+                    fallbackNoticeGiven = true;
+                    // Through the SAME SpeechService the rest of the app uses. A
+                    // second instance silently breaks the echo gate and dictation;
+                    // it once sent a real empty SMS to a real number.
+                    await speechManager.Say(
+                        "Hey 49",
+                        "I'm having trouble with the live connection, switching to the backup.");
+                }
+
+                bool listenImmediately;
+                do
+                {
+                    listenImmediately = false;
+
+                    // Fresh latency counters for this turn.
+                    latency.Reset();
+                    speechEndDetectedAt = null;
+
+                    var speechRecognitionResult = await speechRecognizer.RecognizeOnceAsync();
+                    DateTime recognizedAt = DateTime.UtcNow;
+                    speechManager.ConvertSpeechToText(speechRecognitionResult);
+
+                    // "Understanding" time = however long it took AFTER Azure's VAD
+                    // decided the user stopped talking. If the event never fired
+                    // (no speech at all), there's nothing to attribute to STT.
+                    if (speechEndDetectedAt.HasValue)
+                    {
+                        latency.RecordStt(recognizedAt - speechEndDetectedAt.Value);
+                    }
+
+                    recognizedText = speechRecognitionResult.Text ?? string.Empty;
+
+                    // NoMatch is already handled (spoken) by ConvertSpeechToText;
+                    // only dispatch real recognised speech.
+                    if (speechRecognitionResult.Reason != ResultReason.NoMatch)
+                    {
+                        bool interrupted = await dispatcher.DispatchAsync(recognizedText);
+                        if (interrupted) listenImmediately = true;
+                        Console.WriteLine(latency.Summary());
+                    }
+                } while (listenImmediately);
+            }
 
             while (true)
             {
-                int hour = DateTime.Now.Hour;
+                bool woke = await speechManager.KeywordRecognizer();
+                Console.WriteLine($"[loop] KeywordRecognizer returned {woke} at {DateTime.Now:HH:mm:ss.fff}");
+                // Only greet + listen when the wakeword actually fired. On an
+                // errored/early return, loop back and keep waiting instead of
+                // spuriously greeting (which previously ran away in a loop).
+                if (!woke) continue;
 
-                if (!listenImmediately)
+                string greeting = PickGreeting(DateTime.Now.Hour);
+                Console.WriteLine($"[loop] about to call Say at {DateTime.Now:HH:mm:ss.fff}");
+                // Greeting is NOT interruptible: barge-in matters for long
+                // conversational replies, not a two-second greeting. It also has to
+                // finish before the session opens its microphone, or the Live model
+                // hears the greeting as the user's first utterance.
+                await speechManager.Say("Hey 49", greeting);
+
+                // One Gemini Live conversation, wake word to close. It owns STT,
+                // reasoning, tool calls and TTS over a single WebSocket, so there
+                // is no RecognizeOnceAsync / DispatchAsync turn to run here — the
+                // session drives tools through the same dispatcher directly.
+                //
+                // `using` is the outermost of several guarantees that the socket
+                // closes: RunConversationAsync's own finally already tore it down
+                // before this ever runs, and Dispose is idempotent. Belt and braces
+                // is the right amount of caution for the one failure mode that can
+                // exhaust the free tier.
+                bool clean = false;
+                LiveSessionOutcome outcome = LiveSessionOutcome.Faulted;
+                using (var session = new LiveSession(
+                    dispatcher, context, registry.ToolDefinitions, speechManager, latency: latency))
                 {
-                    bool woke = await speechManager.KeywordRecognizer();
-                    Console.WriteLine($"[loop] KeywordRecognizer returned {woke} at {DateTime.Now:HH:mm:ss.fff}");
-                    // Only greet + listen when the wakeword actually fired. On an
-                    // errored/early return, loop back and keep waiting instead of
-                    // spuriously greeting (which previously ran away in a loop).
-                    if (!woke) continue;
-
-                    string greeting = PickGreeting(hour);
-                    Console.WriteLine($"[loop] about to call Say at {DateTime.Now:HH:mm:ss.fff}");
-                    // Greeting is NOT interruptible: barge-in matters for long
-                    // conversational replies, not a two-second greeting.
-                    await speechManager.Say("Hey 49", greeting);
+                    activeSession = session;
+                    try
+                    {
+                        clean = await session.RunConversationAsync();
+                    }
+                    finally
+                    {
+                        outcome = session.Outcome;
+                        activeSession = null;
+                    }
                 }
-                listenImmediately = false;
 
-                // Fresh latency counters for this turn.
-                latency.Reset();
-                speechEndDetectedAt = null;
-
-                var speechRecognitionResult = await speechRecognizer.RecognizeOnceAsync();
-                DateTime recognizedAt = DateTime.UtcNow;
-                speechManager.ConvertSpeechToText(speechRecognitionResult);
-
-                // "Understanding" time = however long it took AFTER Azure's VAD
-                // decided the user stopped talking. If the event never fired
-                // (no speech at all), there's nothing to attribute to STT.
-                if (speechEndDetectedAt.HasValue)
+                // The session logs its own close line with duration, turn count and
+                // audio totals, plus the [session] accounting lines. The per-turn
+                // latency summary the turn-based loop printed here is deliberately
+                // not printed for a Live conversation: nothing on the Live path
+                // feeds the stt/llm/tts counters — the model does all three inside
+                // one socket — so it would only ever print zeros. It comes back on
+                // the fallback path below, where those three stages are real again.
+                if (clean)
                 {
-                    latency.RecordStt(recognizedAt - speechEndDetectedAt.Value);
+                    // Live is working, so re-arm the notice. See the latch above.
+                    fallbackNoticeGiven = false;
                 }
-
-                recognizedText = speechRecognitionResult.Text ?? string.Empty;
-
-                // NoMatch is already handled (spoken) by ConvertSpeechToText; only
-                // dispatch real recognised speech.
-                if (speechRecognitionResult.Reason != ResultReason.NoMatch)
+                else
                 {
-                    bool interrupted = await dispatcher.DispatchAsync(recognizedText);
-                    if (interrupted) listenImmediately = true;
-                    Console.WriteLine(latency.Summary());
+                    // A dirty outcome is Faulted (handshake failed, or the session
+                    // died mid-turn) or HardCap. Either way the conversation did not
+                    // end the way one is supposed to, and the user is standing there
+                    // having been greeted, so give them a working assistant rather
+                    // than silence.
+                    //
+                    // NOT sticky: the next wake word tries Live again. A transient
+                    // socket failure shouldn't permanently downgrade the assistant,
+                    // and the wake word is a natural, free retry point. There is
+                    // deliberately no retry ladder, backoff, health monitor or quota
+                    // detection here — Layth's usage bounds steady-state quota well
+                    // inside any plausible free tier, and the failure that CAN burn
+                    // it is a stuck session, which the watchdog in LiveSession owns.
+                    Console.WriteLine(
+                        $"[loop] Live session ended abnormally (outcome={outcome}) — " +
+                        "falling back to the turn-based path for this conversation");
+                    await RunFallbackConversationAsync();
                 }
             }
+        }
+
+        // The conversation currently open, if any. Exists so process teardown can
+        // close its socket: a leaked WebSocket streaming silence costs ~115k input
+        // tokens an hour, and "the app was killed mid-conversation" is the ordinary
+        // way that happens. Registered at the top of Main.
+        //
+        // Dispose rather than a cancellation token on purpose: ProcessExit gives
+        // roughly two seconds, and Dispose aborts the socket outright where a
+        // graceful close would still be waiting on a round trip.
+        private static LiveSession activeSession;
+
+        private static void CloseActiveSession(string why)
+        {
+            LiveSession session = System.Threading.Interlocked.Exchange(ref activeSession, null);
+            if (session == null) return;
+            Console.WriteLine($"[loop] {why} — closing the open Live session");
+            try { session.Dispose(); } catch { }
         }
 
         // Builds the command catalogue. Each VoiceCommand carries its LLM tool
