@@ -30,10 +30,53 @@ services:
               count: all
               capabilities: [gpu]
 
-  # 3. Faster Whisper Server - Speech-to-Text
+  # 3. Parakeet - Speech-to-Text (what the assistant listens through)
+  #
+  # CPU-only by design: it beat whisper on the numbers that decide whether a
+  # tool call is right AND leaves the whole 6 GB card to the LLM and Kokoro.
+  # See stt-server/README.md for the bake-off table.
+  #
+  # CONTACTS_FILE (from .env) is the host path to the contacts JSON, mounted
+  # read-only. Without it the decoder loses its contact-name boosting and name
+  # recall drops from 75% to 41.7% — `curl http://localhost:8001/health` reports
+  # `boost_phrases`, which reads 0 when that has happened.
+  #
+  # Deliberately NOT named CONTACTS_PATH: compose prefers a shell variable over
+  # .env, so reusing the app's variable name means whatever is set in the user
+  # environment silently wins over this file.
+  stt:
+    container_name: parakeet-stt
+    build: ./stt-server
+    ports:
+      - "8001:8001"
+    restart: unless-stopped
+    environment:
+      CONTACTS_PATH: /run/secrets/contacts.json
+    volumes:
+      - type: bind
+        source: ${CONTACTS_FILE:?set CONTACTS_FILE in .env - see .env.example}
+        target: /run/secrets/contacts.json
+        read_only: true
+        bind:
+          # Never invent the source: a typo would otherwise get silently mounted
+          # as an empty directory and the service would come up unboosted.
+          create_host_path: false
+      # The model is a ~2.4 GB download; keep it out of the image and alive
+      # across rebuilds.
+      - parakeet-models:/models
+
+  # 4. Faster Whisper Server - Speech-to-Text (superseded)
+  #
+  # No longer what the assistant transcribes through: the bake-off picked
+  # Parakeet. Kept behind a profile so it doesn't start by default and doesn't
+  # hold ~2.2 GB of VRAM the LLM wants, but stays one command away for A/B runs:
+  #
+  #   docker compose --profile whisper up -d whisper
+  #   $env:STT_URL = "http://localhost:8000"
   whisper:
     container_name: whisper
     image: fedirz/faster-whisper-server:latest-cuda
+    profiles: ["whisper"]
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -44,3 +87,6 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+volumes:
+  parakeet-models:

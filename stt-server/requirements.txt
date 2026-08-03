@@ -1,0 +1,13 @@
+# Parakeet STT service.
+#
+# nemo_toolkit is the heavy one, and it is here for a single feature: word
+# boosting at decode time (see README). The much lighter onnx-asr build of the
+# same model has no way to reach it, and boosting is worth 33 points of
+# contact-name recall.
+#
+# torch comes with NeMo. A CPU-only build is enough — the service runs on the
+# CPU on purpose, to leave the 6 GB card to the LLM and Kokoro.
+nemo_toolkit[asr]>=2.7
+fastapi>=0.115
+uvicorn>=0.30
+python-multipart>=0.0.9

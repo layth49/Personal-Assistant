@@ -1,8 +1,5 @@
-using NAudio.Wave;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text.Json;
@@ -10,201 +7,51 @@ using System.Threading.Tasks;
 
 namespace Personal_Assistant.STTClient
 {
-    public class WhisperSTTService
+    // Speech-to-text over the OpenAI transcription API.
+    //
+    // Points at the Parakeet service (stt-server/, :8001) by default — the
+    // bake-off winner: better on contact names and critical WER than
+    // faster-whisper-large-v3-turbo, ~40% faster, and it runs on the CPU, which
+    // returns whisper's ~1.7 GB of VRAM to the LLM and Kokoro.
+    //
+    // The request below is deliberately whisper-shaped and is sent unchanged to
+    // either engine: the Parakeet service ignores the fields that mean nothing
+    // to it (prompt, beam_size, temperature) and biases decoding with a boosting
+    // tree instead. So going back to whisper is one environment variable:
+    //     STT_URL=http://localhost:8000
+    //
+    // Capture lives in ContinuousListener, which owns the mic for the life of the
+    // app; this class only turns finished WAV bytes into text.
+    public class SpeechToTextService
     {
         private static readonly HttpClient http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
 
-        private static readonly string whisperUrl =
-            Environment.GetEnvironmentVariable("WHISPER_URL") ?? "http://localhost:8000";
+        // WHISPER_URL / WHISPER_MODEL still work: they're what's set on machines
+        // configured before the engine swap.
+        //
+        // 127.0.0.1, deliberately, not "localhost": that name resolves to ::1
+        // first on Windows, and the Parakeet service binds IPv4 only, so every
+        // transcription would spend ~2s waiting for the IPv6 connect to be
+        // refused before falling back. Measured 2247ms vs 205ms for the same
+        // 264ms of inference.
+        private static readonly string sttUrl =
+            Environment.GetEnvironmentVariable("STT_URL")
+            ?? Environment.GetEnvironmentVariable("WHISPER_URL")
+            ?? "http://127.0.0.1:8001";
         private static readonly string model =
-            Environment.GetEnvironmentVariable("WHISPER_MODEL") ?? "everyscribe/faster-whisper-large-v3-turbo-ct2";
+            Environment.GetEnvironmentVariable("STT_MODEL")
+            ?? Environment.GetEnvironmentVariable("WHISPER_MODEL")
+            ?? "everyscribe/faster-whisper-large-v3-turbo-ct2";
 
-        // 16kHz mono 16-bit PCM — matches Whisper's native sample rate.
-        private static readonly WaveFormat captureFormat = new WaveFormat(16000, 16, 1);
-
-        // RMS threshold (in 16-bit signed sample units) below which a chunk counts as silence.
-        private const double SilenceThresholdRms = 1000.0;
-
-        // Trailing silence required to consider speech finished.
-        private static readonly TimeSpan TrailingSilence = TimeSpan.FromMilliseconds(1500);
-
-        // How long to wait for the user to start speaking before giving up.
-        private static readonly TimeSpan InitialSilenceTimeout = TimeSpan.FromSeconds(5);
-
-        // Wall-clock time of the last TranscribeAsync call only — the network
-        // round trip to the Whisper server. Deliberately excludes
-        // CaptureAudioAsync (which is dominated by however long the user took to
-        // speak, plus the fixed trailing-silence wait), so this reflects only how
-        // long it took to "understand" the already-recorded audio.
-        public TimeSpan LastTranscribeElapsed { get; private set; }
-
-        // Legacy one-shot capture: opens the mic, records a single utterance with
-        // an RMS gate, transcribes it. Superseded by ContinuousListener, which
-        // owns the mic permanently and uses Silero VAD — nothing in the app calls
-        // this any more. Kept as a mic-free-of-VAD fallback for bringing up a new
-        // STT endpoint (Session F); delete it once that's settled.
-        public async Task<string> RecognizeOnceAsync(int maxSeconds = 15)
-        {
-            byte[] wavBytes;
-            try
-            {
-                wavBytes = await CaptureAudioAsync(maxSeconds).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("Whisper STT capture failed: " + ex.Message);
-                return string.Empty;
-            }
-
-            if (wavBytes == null || wavBytes.Length <= 44)
-            {
-                return string.Empty;
-            }
-
-            var sw = Stopwatch.StartNew();
-            try
-            {
-                string text = await TranscribeAsync(wavBytes).ConfigureAwait(false);
-                sw.Stop();
-                LastTranscribeElapsed = sw.Elapsed;
-                if (!string.IsNullOrWhiteSpace(text))
-                {
-                    Console.WriteLine($"RECOGNIZED: {text}");
-                }
-                return text;
-            }
-            catch (Exception ex)
-            {
-                sw.Stop();
-                LastTranscribeElapsed = sw.Elapsed;
-                Console.WriteLine("Whisper STT transcription failed: " + ex.Message);
-                return string.Empty;
-            }
-        }
-
-        private static Task<byte[]> CaptureAudioAsync(int maxSeconds)
-        {
-            var tcs = new TaskCompletionSource<byte[]>();
-            var memStream = new MemoryStream();
-
-            WaveFileWriter writer;
-            WaveInEvent waveIn;
-            try
-            {
-                writer = new WaveFileWriter(new IgnoreCloseStream(memStream), captureFormat);
-                waveIn = new WaveInEvent
-                {
-                    WaveFormat = captureFormat,
-                    BufferMilliseconds = 50,
-                };
-            }
-            catch (Exception ex)
-            {
-                tcs.TrySetException(ex);
-                return tcs.Task;
-            }
-
-            DateTime captureStart = DateTime.UtcNow;
-            DateTime lastVoiceTime = DateTime.MinValue;
-            bool stopRequested = false;
-
-            waveIn.DataAvailable += (s, e) =>
-            {
-                if (stopRequested) return;
-                try
-                {
-                    writer.Write(e.Buffer, 0, e.BytesRecorded);
-
-                    DateTime now = DateTime.UtcNow;
-                    if (ChunkHasVoice(e.Buffer, e.BytesRecorded))
-                    {
-                        lastVoiceTime = now;
-                    }
-
-                    TimeSpan elapsed = now - captureStart;
-                    bool maxReached = elapsed.TotalSeconds >= maxSeconds;
-                    bool trailingSilenceDone =
-                        lastVoiceTime != DateTime.MinValue &&
-                        (now - lastVoiceTime) >= TrailingSilence;
-                    bool initialSilenceDone =
-                        lastVoiceTime == DateTime.MinValue &&
-                        elapsed >= InitialSilenceTimeout;
-
-                    if (maxReached || trailingSilenceDone || initialSilenceDone)
-                    {
-                        stopRequested = true;
-                        waveIn.StopRecording();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    stopRequested = true;
-                    try { waveIn.StopRecording(); } catch { }
-                    tcs.TrySetException(ex);
-                }
-            };
-
-            waveIn.RecordingStopped += (s, e) =>
-            {
-                try { writer.Flush(); } catch { }
-                try { writer.Dispose(); } catch { }
-                try { waveIn.Dispose(); } catch { }
-
-                if (e.Exception != null)
-                {
-                    tcs.TrySetException(e.Exception);
-                    return;
-                }
-
-                // Only return the captured bytes if there was at least one voiced chunk.
-                if (lastVoiceTime == DateTime.MinValue)
-                {
-                    tcs.TrySetResult(Array.Empty<byte>());
-                }
-                else
-                {
-                    tcs.TrySetResult(memStream.ToArray());
-                }
-            };
-
-            try
-            {
-                waveIn.StartRecording();
-            }
-            catch (Exception ex)
-            {
-                try { writer.Dispose(); } catch { }
-                try { waveIn.Dispose(); } catch { }
-                tcs.TrySetException(ex);
-            }
-
-            return tcs.Task;
-        }
-
-        private static bool ChunkHasVoice(byte[] buffer, int count)
-        {
-            int sampleCount = count / 2;
-            if (sampleCount == 0) return false;
-
-            long sumSquares = 0;
-            for (int i = 0; i + 1 < count; i += 2)
-            {
-                short sample = (short)(buffer[i] | (buffer[i + 1] << 8));
-                sumSquares += (long)sample * sample;
-            }
-            double rms = Math.Sqrt(sumSquares / (double)sampleCount);
-            return rms >= SilenceThresholdRms;
-        }
-
-        // Cache these at the class level so you aren't hitting the disk on every audio chunk
+        // Cached so the contacts file isn't re-read per utterance.
         private static Dictionary<string, string> _cachedContacts;
         private static string _dynamicPrompt;
 
-        // Exposed so the always-on listener can reuse the exact same request
-        // (model, language, contact-name prompt) as the one-shot path.
+        // WAV bytes in, transcript out. Empty string on failure — callers check
+        // for that rather than for an exception.
         internal static async Task<string> TranscribeAsync(byte[] wavBytes)
         {
-            string url = whisperUrl.TrimEnd('/') + "/v1/audio/transcriptions";
+            string url = sttUrl.TrimEnd('/') + "/v1/audio/transcriptions";
 
             using (var form = new MultipartFormDataContent())
             {
@@ -219,14 +66,16 @@ namespace Personal_Assistant.STTClient
                 form.Add(new StringContent("1"), "beam_size");
                 form.Add(new StringContent("0"), "temperature");
 
-                // 1. Load and cache contacts on the very first run
+                // Contact names as a decoder prompt. This is what carries
+                // whisper's contact-name accuracy (it more than halved its WER on
+                // names in the bake-off); Parakeet ignores the field and biases
+                // decoding with a boosting tree built from the same file instead.
                 if (_dynamicPrompt == null)
                 {
                     _cachedContacts = Program.LoadContacts();
 
                     string jargon = "Arduino, Home Assistant.";
 
-                    // 3. Flatten the dictionary keys into a comma-separated string
                     if (_cachedContacts != null && _cachedContacts.Count > 0)
                     {
                         _dynamicPrompt = string.Join(", ", _cachedContacts.Keys) + ", " + jargon;
@@ -237,7 +86,6 @@ namespace Personal_Assistant.STTClient
                     }
                 }
 
-                // 4. Inject the final string into the API payload
                 form.Add(new StringContent(_dynamicPrompt), "prompt");
 
                 using (var resp = await http.PostAsync(url, form).ConfigureAwait(false))
@@ -254,25 +102,6 @@ namespace Personal_Assistant.STTClient
                     return string.Empty;
                 }
             }
-        }
-
-        // WaveFileWriter closes its underlying stream on Dispose, but we need the
-        // MemoryStream alive afterwards to read back the finalized WAV bytes.
-        private sealed class IgnoreCloseStream : Stream
-        {
-            private readonly Stream inner;
-            public IgnoreCloseStream(Stream inner) { this.inner = inner; }
-            public override bool CanRead => inner.CanRead;
-            public override bool CanSeek => inner.CanSeek;
-            public override bool CanWrite => inner.CanWrite;
-            public override long Length => inner.Length;
-            public override long Position { get => inner.Position; set => inner.Position = value; }
-            public override void Flush() => inner.Flush();
-            public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
-            public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
-            public override void SetLength(long value) => inner.SetLength(value);
-            public override void Write(byte[] buffer, int offset, int count) => inner.Write(buffer, offset, count);
-            protected override void Dispose(bool disposing) { }
         }
     }
 }
