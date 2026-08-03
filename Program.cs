@@ -87,8 +87,7 @@ namespace Personal_Assistant
                 Console.WriteLine("Optional overrides (defaults used if unset):");
                 Console.WriteLine($"  LMSTUDIO_URL  (default {LocalLLMService.lmStudioUrl})");
                 Console.WriteLine($"  SEARXNG_URL   (default {SearxNGService.searxNGUrl})");
-                Console.WriteLine("  WHISPER_URL   (default http://localhost:8000)");
-                Console.WriteLine("  WHISPER_MODEL (default Systran/faster-whisper-large-v3)");
+                Console.WriteLine("  STT_URL       (default http://127.0.0.1:8001 - the Parakeet service)");
                 Console.WriteLine("  KOKORO_URL    (default http://localhost:8880)");
                 Console.WriteLine("  KOKORO_VOICE  (default am_onyx)");
                 Console.ReadLine();
@@ -143,7 +142,25 @@ namespace Personal_Assistant
             // Single-instance services. Kokoro / Whisper clients each reuse a
             // single HttpClient so creating SpeechService once keeps requests warm.
             var speechManager = new SpeechService(latency);
-            await speechManager.WarmUpAudioAsync(); // wakes the audio device so first greeting isn't clipped
+
+            // Mic first, warm-up second — deliberately in this order. The audio
+            // warm-up plays real audio out of the real output device, so with
+            // the mic already open it doubles as the echo gate's calibration
+            // pass: the listener measures the quiet room, then hears the bleed,
+            // and decides whether speakers are in play before the user has said
+            // anything. Without this the FIRST reply of every session is
+            // ungated and interrupts itself, because `auto` mode has to observe
+            // bleed once before it can gate any.
+            speechManager.StartListening();
+
+            // Warm both cold starts at once, before the first wakeword can fire:
+            // the audio device + Kokoro (so the greeting isn't clipped), and LM
+            // Studio, whose first completion after a model load is much slower
+            // than the rest. They're independent services, so serialising them
+            // would only make launch slower. Both are best-effort.
+            await Task.WhenAll(
+                speechManager.WarmUpAudioAsync(),
+                LocalLLMService.WarmUpAsync());
 
             var contacts = LoadContacts();
 
@@ -213,10 +230,6 @@ namespace Personal_Assistant
 
             // Let the `repeat` tool run other tools by name (validated).
             context.RunTool = dispatcher.RunToolByNameAsync;
-
-            // Always-on mic + Silero VAD. From here the assistant can hear while
-            // it speaks, which is what makes talk-over barge-in work.
-            speechManager.StartListening();
 
             // A conversation stays open after the wakeword so follow-ups don't
             // need re-waking; it closes when the user goes quiet this long.
@@ -1049,18 +1062,6 @@ namespace Personal_Assistant
             try
             {
                 var contacts = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(contactsPath));
-
-                // Debug: Print every key loaded from the JSON
-                if (contacts != null)
-                {
-                    Console.WriteLine("--- DEBUG: Loaded Contact Names ---");
-                    foreach (var key in contacts.Keys)
-                    {
-                        Console.WriteLine($"> {key}");
-                    }
-                    Console.WriteLine("-----------------------------------");
-                }
-
                 return contacts;
             }
             catch (Exception ex)

@@ -43,6 +43,23 @@ namespace Personal_Assistant.TTSClient
         // chunk is normally longer than this on its own).
         private static readonly TimeSpan PlaybackLead = TimeSpan.FromMilliseconds(700);
 
+        // Raised the moment playback actually starts, on every path.
+        //
+        // The listener's echo gate needs to know when sound begins coming out of
+        // the speakers, and it must not try to work that out from the microphone:
+        // the VAD recognises the assistant's voice before the frame level has
+        // risen far enough to be sure it isn't room noise, so a level-based latch
+        // loses the race and the gate is still inactive when the echo's onset
+        // fires. This side of the pipeline knows the answer exactly.
+        public event Action PlaybackStarted;
+
+        private void RaisePlaybackStarted()
+        {
+            var handler = PlaybackStarted;
+            if (handler == null) return;
+            try { handler(); } catch (Exception ex) { Console.WriteLine("[tts] PlaybackStarted handler: " + ex.Message); }
+        }
+
         // Time from BeginStream() to the instant the first chunk started playing —
         // the number Session D exists to shrink. Null if nothing played.
         public TimeSpan? FirstAudioLatency { get; private set; }
@@ -82,7 +99,7 @@ namespace Personal_Assistant.TTSClient
                 return;
             }
 
-            if (cts.IsCancellationRequested) return;
+            if (cts.IsCancellationRequested || wavBytes == null) return;
 
             FixWavHeaderSizes(wavBytes);
 
@@ -125,6 +142,7 @@ namespace Personal_Assistant.TTSClient
             }))
             {
                 output.Play();
+                RaisePlaybackStarted();
                 await tcs.Task.ConfigureAwait(false);
             }
 
@@ -135,14 +153,79 @@ namespace Personal_Assistant.TTSClient
             }
         }
 
+        // Emoji reach the bubble but must never reach the voice: the system
+        // prompt tells the model they're shown and not spoken, and Kokoro has no
+        // idea — hand it "😊" and it says "smiling face with smiling eyes" out
+        // loud. That also poisoned the echo gate, since those invented words
+        // come back through the microphone as text no reply ever contained.
+        //
+        // Everything above the BMP goes, which is where essentially all emoji
+        // live, plus the BMP symbol/dingbat blocks and the joiners that glue
+        // sequences together.
+        internal static string StripUnspeakable(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return text;
+
+            var sb = new StringBuilder(text.Length);
+            for (int i = 0; i < text.Length; i++)
+            {
+                char c = text[i];
+                if (char.IsHighSurrogate(c))
+                {
+                    if (i + 1 < text.Length && char.IsLowSurrogate(text[i + 1])) i++;
+                    continue;
+                }
+                if (IsSymbolBlock(c)) continue;
+                sb.Append(c);
+            }
+
+            // Removing a trailing emoji tends to leave " ." or a double space.
+            var outp = new StringBuilder(sb.Length);
+            bool lastWasSpace = false;
+            foreach (char c in sb.ToString())
+            {
+                bool isSpace = char.IsWhiteSpace(c);
+                if (isSpace && lastWasSpace) continue;
+                outp.Append(c);
+                lastWasSpace = isSpace;
+            }
+            return outp.ToString().Trim();
+        }
+
+        private static bool IsSymbolBlock(char c)
+        {
+            return (c >= '←' && c <= '⇿')   // arrows
+                || (c >= '⌀' && c <= '⏿')   // misc technical (⏰, ⌚)
+                || (c >= '■' && c <= '➿')   // shapes, misc symbols, dingbats
+                || (c >= '⬀' && c <= '⯿')   // more arrows/shapes
+                || (c >= '︀' && c <= '️')   // variation selectors
+                || (c >= '⃐' && c <= '⃿')   // combining marks (keycaps)
+                || c == '‍';                     // zero-width joiner
+        }
+
+        // True if there's anything left for a voice to pronounce.
+        private static bool HasSpeakable(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return false;
+            foreach (char c in text)
+            {
+                if (char.IsLetterOrDigit(c)) return true;
+            }
+            return false;
+        }
+
         // One Kokoro synthesis round trip. Shared by the one-shot and streaming
-        // paths so the payload/endpoint live in exactly one place.
+        // paths so the payload/endpoint live in exactly one place. Returns null
+        // if nothing speakable survives the strip.
         private static async Task<byte[]> RequestWavAsync(string text, CancellationToken ct)
         {
+            string spoken = StripUnspeakable(text);
+            if (!HasSpeakable(spoken)) return null;
+
             var payload = new
             {
                 model = "kokoro",
-                input = text,
+                input = spoken,
                 voice = voice,
                 response_format = "wav"
             };
@@ -210,6 +293,7 @@ namespace Personal_Assistant.TTSClient
 
             // Nothing more is coming, so there's no reason to keep banking audio
             // for a head start — release whatever is held.
+            bool justStarted = false;
             lock (playbackLock)
             {
                 if (!playbackStarted && streamBuffer != null && streamOutput != null)
@@ -217,8 +301,11 @@ namespace Personal_Assistant.TTSClient
                     playbackStarted = true;
                     streamOutput.Play();
                     FirstAudioLatency = streamClock.Elapsed;
+                    justStarted = true;
                 }
             }
+            // Outside the lock: handlers are someone else's code.
+            if (justStarted) RaisePlaybackStarted();
         }
 
         // Waits for every queued sentence to be synthesised AND played out.
@@ -295,6 +382,7 @@ namespace Personal_Assistant.TTSClient
         private void AppendChunk(byte[] wav, CancellationTokenSource cts)
         {
             FixWavHeaderSizes(wav);
+            bool justStarted = false;
             try
             {
                 using (var reader = new WaveFileReader(new MemoryStream(wav)))
@@ -341,6 +429,7 @@ namespace Personal_Assistant.TTSClient
                             playbackStarted = true;
                             streamOutput.Play();
                             FirstAudioLatency = streamClock.Elapsed;
+                            justStarted = true;
                             Console.WriteLine(
                                 $"[tts] first audio at {streamClock.ElapsedMilliseconds}ms "
                                 + $"({streamBuffer.BufferedDuration.TotalMilliseconds:F0}ms buffered)");
@@ -352,6 +441,8 @@ namespace Personal_Assistant.TTSClient
             {
                 Console.WriteLine("Kokoro chunk decode failed: " + ex.Message);
             }
+            // Outside the lock: handlers are someone else's code.
+            if (justStarted) RaisePlaybackStarted();
         }
 
         private void TeardownStream()

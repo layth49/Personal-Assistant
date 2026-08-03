@@ -445,6 +445,7 @@
     <Compile Include="bakeoff\llm\BakeoffHarness.cs" />
     <Compile Include="ContinuousListener.cs" />
     <Compile Include="ConversationMemory.cs" />
+    <Compile Include="EchoGuard.cs" />
     <Compile Include="Geolocator.cs" />
     <Compile Include="IntentDispatcher.cs" />
     <Compile Include="IsExternalInit.cs" />

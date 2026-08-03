@@ -39,6 +39,12 @@ namespace Personal_Assistant.SpeechManager
 
         private PyDict state;
 
+        // Cached instead of PythonEngine.Eval("True"/"False") per call: the
+        // listener's audio callback needs the GIL every 30ms, so anything the
+        // turn thread does while holding it comes straight out of capture.
+        private readonly PyObject pyTrue;
+        private readonly PyObject pyFalse;
+
         // Wakeword model, loaded once and shared by the main-loop wait and the
         // barge-in listener.
         private readonly KeywordRecognitionModel keywordModel;
@@ -49,10 +55,15 @@ namespace Personal_Assistant.SpeechManager
         private readonly AudioConfig interruptAudioConfig;
         private readonly KeywordRecognizer interruptKeywordRecognizer;
 
-        // Serialises Say / SayInterruptible so a background reminder firing while
-        // the assistant is speaking can't garble audio or clobber the bubble state.
-        // It guards SPEAKING only — the listener runs on its own thread and is
-        // never blocked by it, which is what lets the two happen at once.
+        // Serialises every speech path so a background reminder firing while the
+        // assistant is speaking can't garble audio or clobber the bubble state.
+        // It guards SPEAKING only — the listener owns its own thread and never
+        // touches this, which is what lets the two happen at once: a reminder
+        // queued behind a long reply delays the announcement, never the mic.
+        //
+        // Because BeginSpeaking/EndSpeaking are both inside the gate on every
+        // path, `speaking` and the listener's echo reference can't be clobbered
+        // by an overlapping speaker either.
         private readonly SemaphoreSlim sayGate = new SemaphoreSlim(1, 1);
 
         // Always-on microphone + Silero VAD. Owns the mic for the app's lifetime,
@@ -65,13 +76,34 @@ namespace Personal_Assistant.SpeechManager
         private CancellationTokenSource activeResponseCts;
         private volatile bool speaking;
         private volatile bool bargedIn;
+        private volatile bool wakewordWatchActive;
+        private volatile bool replyNamesAssistant;
 
         // Optional per-turn latency breakdown (null-safe — a caller that doesn't
         // care about timing can just not pass one).
         private readonly LatencyTracker latency;
 
+        // The one instance the app is actually running — the one whose
+        // microphone is open, whose echo reference the listener reads, and whose
+        // playback the barge-in path is watching.
+        //
+        // Command handlers MUST use this rather than newing their own. Six of
+        // them used to, and a second instance is silently useless in both
+        // directions: its `BeginSpeaking` updates a ContinuousListener that was
+        // never started, so the real listener never learns the assistant is
+        // talking and every prompt it speaks escapes the echo gate wholesale;
+        // and its `RecognizeOnceAsync` waits on that same dead listener, so it
+        // always times out. In the SMS flow that meant an empty message body was
+        // handed to Phone Link and actually sent, while the escaped prompts
+        // queued up as turns and the assistant talked to itself for a minute.
+        public static SpeechService Current { get; private set; }
+
         public SpeechService(LatencyTracker latency = null)
         {
+            // First one wins: Program.Main builds the real one before any
+            // handler exists, so a stray `new` elsewhere can't steal the slot.
+            if (Current == null) Current = this;
+
             this.latency = latency;
             try
             {
@@ -91,9 +123,15 @@ namespace Personal_Assistant.SpeechManager
             using (Py.GIL())
             {
                 text_display = Py.Import("SpeechBubble");
+                pyTrue = PythonEngine.Eval("True");
+                pyFalse = PythonEngine.Eval("False");
             }
 
             listener.SpeechOnset += OnSpeechOnset;
+            listener.UtteranceReady += OnUtteranceReady;
+            // The echo gate can't infer this from the microphone without losing a
+            // race against the VAD, so the TTS reports it directly.
+            kokoroTTS.PlaybackStarted += listener.NotifyAudioStarted;
         }
 
         // Begins always-on capture. Separate from the constructor so the caller
@@ -119,14 +157,29 @@ namespace Personal_Assistant.SpeechManager
         // mid-reply, so cut everything and let their utterance become the next
         // turn (the listener is already recording it).
         //
-        // TODO(G): echo/AEC. On speakers, Kokoro's own output bleeds into the mic
-        // and will trip this, making the assistant interrupt itself. Session G
-        // owns that; until then this assumes a headset, as the code always has.
+        // The listener only raises this for onsets that cleared its echo gate,
+        // so on speakers Kokoro's own output no longer interrupts the assistant
+        // mid-sentence. See the echo notes in ContinuousListener.
         private void OnSpeechOnset()
+        {
+            CutOffReply("user spoke over the reply");
+        }
+
+        // Late barge-in. If the echo gate judged an onset too quiet to be sure
+        // about, the reply kept playing — but the utterance was still captured,
+        // and by the time it comes back transcribed the listener has confirmed
+        // it wasn't the assistant. Cut then, so a genuine interruption that the
+        // energy test was cautious about still lands rather than being ignored.
+        private void OnUtteranceReady(string text)
+        {
+            CutOffReply("utterance landed mid-reply");
+        }
+
+        private void CutOffReply(string why)
         {
             if (!speaking) return;
 
-            Console.WriteLine("[barge-in] user spoke over the reply -> cutting off");
+            Console.WriteLine($"[barge-in] {why} -> cutting off");
             bargedIn = true;
             StopSpeaking();
 
@@ -135,6 +188,94 @@ namespace Personal_Assistant.SpeechManager
             {
                 try { cts.Cancel(); } catch (ObjectDisposedException) { }
             }
+        }
+
+        // Runs the on-device keyword spotter for the length of a streamed reply,
+        // so saying "49" cuts it.
+        //
+        // This is the barge-in that survives loud speakers, and it exists
+        // because the level-based one can't. Once the speakers are loud enough,
+        // the microphone hears the assistant continuously: the VAD never sees a
+        // gap, so the whole reply comes back as ONE utterance with the user's
+        // interruption buried inside it, and the echo check then drops the lot.
+        // Text can't rescue it either — a reply necessarily reuses the question's
+        // vocabulary, so "tell me how a jet engine works" against a reply opening
+        // "A jet engine works by…" is a verbatim four-word run.
+        //
+        // The keyword spotter sidesteps all of it by matching one specific
+        // acoustic pattern instead of measuring loudness, so bleed doesn't fool
+        // it and no threshold needs tuning.
+        private Task StartWakewordWatch()
+        {
+            if (interruptKeywordRecognizer == null || keywordModel == null) return null;
+
+            wakewordWatchActive = true;
+            return Task.Run(async () =>
+            {
+                try
+                {
+                    var kw = await interruptKeywordRecognizer.RecognizeOnceAsync(keywordModel);
+                    if (!wakewordWatchActive) return;   // the reply already ended
+                    if (kw == null || kw.Reason != ResultReason.RecognizedKeyword) return;
+
+                    // The assistant saying its own name would otherwise cut its
+                    // own reply off — "L.A.I.T.H. 49" through the speakers is a
+                    // perfectly good wakeword as far as the spotter is concerned.
+                    if (replyNamesAssistant)
+                    {
+                        Console.WriteLine("[barge-in] wakeword ignored — the reply says it itself");
+                        return;
+                    }
+
+                    CutOffReply("wakeword heard over the reply");
+                    // Start the capture over: what's buffered is the reply's own
+                    // echo, and keeping it would get the command that follows
+                    // the wakeword dropped along with it.
+                    listener.RestartCapture();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[interrupt] wakeword watch error: {ex.Message}");
+                }
+            });
+        }
+
+        private async Task StopWakewordWatch(Task watch)
+        {
+            if (watch == null) return;
+            wakewordWatchActive = false;
+            // Bounded: a wedged recognizer must never hold up the turn loop. It's
+            // the dedicated instance, so the worst case is that later barge-ins
+            // suffer, never the main wakeword wait.
+            try { await WithTimeout(interruptKeywordRecognizer.StopRecognitionAsync(), 3000, "StopRecognition"); }
+            catch { }
+            try { await WithTimeout(watch, 3000, "wakeword watch drain"); }
+            catch { }
+        }
+
+        // True if the wakeword appears in what the assistant is saying.
+        private static bool NamesAssistant(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return false;
+            return text.IndexOf("49", StringComparison.Ordinal) >= 0
+                || text.IndexOf("laith", StringComparison.OrdinalIgnoreCase) >= 0
+                || text.IndexOf("l.a.i.t.h", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // Brackets every source of assistant audio — streamed replies, canned
+        // Say() lines, and reminders firing in the background alike. Both the
+        // barge-in check and the listener's echo gate key off this, so a path
+        // that skips it is a path where the assistant can hear itself.
+        private void BeginSpeaking(string text)
+        {
+            listener.BeginAssistantSpeech(text);
+            speaking = true;
+        }
+
+        private void EndSpeaking()
+        {
+            speaking = false;
+            listener.EndAssistantSpeech();
         }
 
         // Waits for the wakeword. Returns true only if the keyword actually fired,
@@ -214,7 +355,7 @@ namespace Personal_Assistant.SpeechManager
             if (state == null) return;
             using (Py.GIL())
             {
-                state.SetItem("running", PythonEngine.Eval("False"));
+                state.SetItem("running", pyFalse);
             }
         }
 
@@ -235,7 +376,7 @@ namespace Personal_Assistant.SpeechManager
             using (Py.GIL())
             {
                 state = new PyDict();
-                state.SetItem("running", PythonEngine.Eval("True"));
+                state.SetItem("running", pyTrue);
                 try
                 {
                     text_display.show_bubble(userInput, response, state);
@@ -274,13 +415,23 @@ namespace Personal_Assistant.SpeechManager
         // Doubles as a Kokoro server warm-up so the first real synth is fast.
         public async Task WarmUpAudioAsync()
         {
+            await sayGate.WaitAsync();
             try
             {
+                // Goes through the same brackets as every other speech path even
+                // though it runs before the mic is open: the invariant is worth
+                // more than the one line it costs here.
+                BeginSpeaking("Laith Online");
                 await kokoroTTS.SpeakAsync("Laith Online");
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Audio warm-up failed (non-fatal): {ex.Message}");
+            }
+            finally
+            {
+                EndSpeaking();
+                sayGate.Release();
             }
         }
 
@@ -295,12 +446,14 @@ namespace Personal_Assistant.SpeechManager
                 // the synth starts means the synth's retract signal can never land
                 // on a stale state dict.
                 SpeechBubble(userInput, response);
+                BeginSpeaking(response);
                 var synthTask = Task.Run(() => SynthesizeTextToSpeech(response));
                 try { await synthTask; }
                 catch (Exception ex) { Console.WriteLine($"TTS error: {ex.Message}"); }
             }
             finally
             {
+                EndSpeaking();
                 sayGate.Release();
             }
         }
@@ -325,6 +478,7 @@ namespace Personal_Assistant.SpeechManager
                 // Bubble first (non-blocking), then the synth — same ordering as
                 // Say, so the retract signal always targets this turn's state dict.
                 SpeechBubble(userInput, response);
+                BeginSpeaking(response);
                 var synthTask = Task.Run(() => SynthesizeTextToSpeech(response));
 
                 // The barge-in race runs on its own thread so it stays independent
@@ -394,6 +548,7 @@ namespace Personal_Assistant.SpeechManager
             }
             finally
             {
+                EndSpeaking();
                 sayGate.Release();
             }
         }
@@ -460,7 +615,15 @@ namespace Personal_Assistant.SpeechManager
             // wants to be able to talk over.
             bargedIn = false;
             activeResponseCts = cts;
-            speaking = true;
+            replyNamesAssistant = false;
+            // No reference text yet — a streamed reply doesn't exist until the
+            // model produces it, so the echo reference grows sentence by
+            // sentence in onSentence below.
+            BeginSpeaking(null);
+
+            // Say "49" to cut a reply. Independent of the level gate, which on
+            // loud speakers can't tell the user from the bleed at all.
+            Task wakewordWatch = StartWakewordWatch();
 
             kokoroTTS.BeginStream();
 
@@ -475,7 +638,17 @@ namespace Personal_Assistant.SpeechManager
                 // bubble but must not reach Kokoro — the system prompt promises
                 // emoji are shown, not spoken, and synthesising one costs a whole
                 // round trip to produce a noise at the end of the reply.
-                if (HasSpeakableContent(sentence)) kokoroTTS.EnqueueSentence(sentence);
+                if (HasSpeakableContent(sentence))
+                {
+                    kokoroTTS.EnqueueSentence(sentence);
+                    // Only what's actually voiced can come back as echo, so the
+                    // emoji-only chunks skipped above are skipped here too.
+                    listener.AppendAssistantSpeech(sentence);
+                    // Latches for the rest of the reply: once the assistant has
+                    // said its own name, anything the spotter hears afterwards
+                    // could be that coming back.
+                    if (NamesAssistant(sentence)) replyNamesAssistant = true;
+                }
 
                 if (spoken.Length > 0) spoken.Append(' ');
                 spoken.Append(sentence.Trim());
@@ -511,8 +684,9 @@ namespace Personal_Assistant.SpeechManager
             }
             finally
             {
-                speaking = false;
+                EndSpeaking();
                 activeResponseCts = null;
+                await StopWakewordWatch(wakewordWatch);
             }
 
             return full;

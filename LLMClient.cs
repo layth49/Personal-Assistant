@@ -2,6 +2,7 @@ using Personal_Assistant.Dispatch;
 using Personal_Assistant.SearxNGClient;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -150,8 +151,17 @@ namespace Personal_Assistant.LLMClient
 
     public class LocalLLMService
     {
+        // 127.0.0.1, not "localhost" — the same trap the STT client documents, and
+        // LM Studio is the only other service it applies to: it's a GUI process on
+        // the host binding 127.0.0.1 only, so it has no IPv6 socket, while the
+        // Docker-published services (SearxNG, Kokoro) do and are unaffected.
+        // "localhost" resolves to ::1 first on Windows, so the connect waits for
+        // that refusal. Measured on this box: 2125ms for the first call against
+        // localhost vs 14ms against 127.0.0.1. It's paid once per process rather
+        // than per request — the connection pool reuses the socket afterwards, and
+        // WarmUpAsync eats it — but it's ~2s of startup for a one-word fix.
         public static readonly string lmStudioUrl =
-            Environment.GetEnvironmentVariable("LMSTUDIO_URL") ?? "http://localhost:1234/v1";
+            Environment.GetEnvironmentVariable("LMSTUDIO_URL") ?? "http://127.0.0.1:1234/v1";
 
         // Reused across the app's lifetime to avoid socket exhaustion / TLS handshake costs
         // (Microsoft guidance: do not new-up HttpClient per request on .NET Framework).
@@ -212,6 +222,56 @@ namespace Personal_Assistant.LLMClient
             var client = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
             client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
             return client;
+        }
+
+        // Pokes LM Studio with a throwaway one-token completion at startup.
+        //
+        // The first request after a model load pays for weights being paged in
+        // and the KV cache being allocated; on the 4050 that's seconds the very
+        // first real turn would otherwise spend, on top of an already-cold STT
+        // and TTS. Same idea as SpeechService.WarmUpAudioAsync, and equally
+        // best-effort: LM Studio being down at launch is not a startup failure,
+        // it just means the first answer is slow (or an error, as before).
+        public static async Task WarmUpAsync()
+        {
+            var requestBody = new
+            {
+                messages = new List<object>
+                {
+                    new Dictionary<string, object> { ["role"] = "user", ["content"] = "hi" }
+                },
+                max_tokens = 1,
+                temperature = 0,
+                stream = false
+            };
+
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                var content = new StringContent(
+                    JsonSerializer.Serialize(requestBody, JsonOpts),
+                    Encoding.UTF8,
+                    "application/json");
+
+                using (var response = await httpClient
+                    .PostAsync($"{lmStudioUrl.TrimEnd('/')}/chat/completions", content)
+                    .ConfigureAwait(false))
+                {
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        Console.WriteLine(
+                            $"[llm] warm-up skipped: {(int)response.StatusCode} {response.ReasonPhrase}");
+                        return;
+                    }
+                    // Drain the body so the connection goes back to the pool warm.
+                    await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                }
+                Console.WriteLine($"[llm] warm-up done in {sw.ElapsedMilliseconds}ms");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[llm] warm-up failed (non-fatal): {ex.Message}");
+            }
         }
 
         // Conversational answer, matching the Conversationalist delegate
@@ -275,6 +335,7 @@ namespace Personal_Assistant.LLMClient
             var full = new StringBuilder();
             var pending = new StringBuilder();
             bool firstChunk = true;
+            bool toolCallSuppressed = false;
 
             try
             {
@@ -318,6 +379,27 @@ namespace Personal_Assistant.LLMClient
                                 full.Append(delta);
                                 pending.Append(delta);
 
+                                // A small model sometimes emits a tool call as
+                                // plain TEXT rather than through the tool_calls
+                                // channel — most often when the tool it wants
+                                // isn't registered at all, as `send_sms` isn't
+                                // whenever CONTACTS_PATH fails to resolve.
+                                // Streamed straight to Kokoro, that gets read
+                                // out loud: "...send text, arguments,
+                                // recipient, message, slash tool call".
+                                // Everything from the marker on is protocol,
+                                // not speech, so stop here.
+                                int cut = ToolCallStart(full);
+                                if (cut >= 0)
+                                {
+                                    Console.WriteLine(
+                                        "[llm] tool call emitted as text — suppressed from speech");
+                                    full.Length = cut;
+                                    pending.Clear();
+                                    toolCallSuppressed = true;
+                                    break;
+                                }
+
                                 string sentence;
                                 while (SentenceChunker.TryTake(pending, false, firstChunk, out sentence))
                                 {
@@ -338,6 +420,19 @@ namespace Personal_Assistant.LLMClient
                     await onSentence(tail).ConfigureAwait(false);
                 }
 
+                // A reply that was ONLY a tool call leaves nothing to say, and
+                // saying nothing is the worst outcome: the user gets no audio,
+                // no bubble, and no idea whether they were even heard. Say so
+                // instead. This is what a missing tool sounds like — most often
+                // `send_sms`, which isn't registered at all when CONTACTS_PATH
+                // fails to resolve, leaving the model nothing real to call.
+                if (toolCallSuppressed && full.ToString().Trim().Length == 0)
+                {
+                    const string fallback = "Sorry, I don't have a way to do that one.";
+                    await onSentence(fallback).ConfigureAwait(false);
+                    return fallback;
+                }
+
                 return full.ToString();
             }
             catch (OperationCanceledException)
@@ -356,6 +451,42 @@ namespace Personal_Assistant.LLMClient
                 Console.WriteLine($"[llm] stream failed: {ex.Message}");
                 return full.Length > 0 ? full.ToString() : $"Error: {ex.Message}";
             }
+        }
+
+        // Openers various local models use when they hand back a tool call as
+        // text. Matched case-insensitively and without their closing bracket, so
+        // a half-arrived marker still counts.
+        private static readonly string[] ToolCallMarkers =
+        {
+            "<tool_call", "</tool_call", "<|tool_call", "<function_call",
+            "<function=", "<tools>", "[TOOL_CALL", "<|python_tag|>",
+        };
+
+        // Index where a text-emitted tool call starts, or -1. Internal so the
+        // case set in bakeoff/echo can exercise it.
+        internal static int ToolCallStart(StringBuilder buffer)
+        {
+            string s = buffer.ToString();
+            int best = -1;
+
+            foreach (string marker in ToolCallMarkers)
+            {
+                int i = s.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+                if (i >= 0 && (best < 0 || i < best)) best = i;
+            }
+
+            // Bare JSON with no marker at all — `{"name": ..., "arguments": {...}}`.
+            // Anchoring on "arguments" rather than "name" avoids cutting an
+            // ordinary sentence that happens to quote a name.
+            int args = s.IndexOf("\"arguments\"", StringComparison.OrdinalIgnoreCase);
+            if (args >= 0)
+            {
+                int brace = s.LastIndexOf('{', args);
+                int cut = brace >= 0 ? brace : args;
+                if (best < 0 || cut < best) best = cut;
+            }
+
+            return best;
         }
 
         // Pulls choices[0].delta.content out of one SSE payload. Chunks without a
