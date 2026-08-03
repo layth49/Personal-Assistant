@@ -368,9 +368,28 @@ namespace Personal_Assistant
 
             registry.Add(new VoiceCommand(
                 ToolDefinition.Create("open_youtube",
-                    "Open YouTube, optionally searching for a specific video."),
+                    "Open YouTube, either searching for a specific video or just opening the " +
+                    "site. If the user did not make clear which one they want, ask them first " +
+                    "and then call this — the tool cannot ask on its own.",
+                    new ToolParameter("mode", "string",
+                        "\"search\" to search for a specific video, \"open\" to just open YouTube.",
+                        AllowedValues: new[] { "search", "open" }),
+                    new ToolParameter("query", "string",
+                        "What to search for. Required when mode is \"search\".",
+                        Required: false)),
                 lower => lower.Contains("youtube"),
-                (ctx, args) => HandleYouTubeAsync(ctx.Speech)));
+                (ctx, args) =>
+                {
+                    args.TryGetValue("query", out string query);
+                    return HandleYouTubeAsync(args["mode"], query);
+                },
+                text =>
+                {
+                    string query = ExtractYouTubeQuery(text.ToLower());
+                    return string.IsNullOrWhiteSpace(query)
+                        ? new Dictionary<string, string> { ["mode"] = "open" }
+                        : new Dictionary<string, string> { ["mode"] = "search", ["query"] = query };
+                }));
 
             registry.Add(new VoiceCommand(
                 ToolDefinition.Create("open_visual_studio",
@@ -384,9 +403,27 @@ namespace Personal_Assistant
 
             registry.Add(new VoiceCommand(
                 ToolDefinition.Create("turn_on_playstation",
-                    "Turn on the PlayStation 5 via Remote Play and launch a game."),
+                    "Turn on the PlayStation 5 via Remote Play and launch a game. Ask the user " +
+                    "which game they want before calling this — the tool cannot ask on its own.",
+                    new ToolParameter("game", "string",
+                        "The title of the game to load, as the user said it.")),
                 lower => lower.Contains("turn on") && (lower.Contains("playstation") || lower.Contains("ps-5")),
-                (ctx, args) => ctx.Playstation.TurnOnPlaystation()));
+                async (ctx, args) =>
+                {
+                    string game = args["game"];
+                    bool launched = await ctx.Playstation.TurnOnPlaystation(game);
+                    return launched
+                        ? ToolResult.Speak($"{game} is ready! Have fun!").With("game", game)
+                        : ToolResult.Failed(
+                            "Sorry, I couldn't get Remote Play started.", "remote_play_unavailable");
+                },
+                text =>
+                {
+                    string game = ExtractGameTitle(text.ToLower());
+                    return string.IsNullOrWhiteSpace(game)
+                        ? VoiceCommand.EmptyArgs
+                        : new Dictionary<string, string> { ["game"] = game };
+                }));
 
             registry.Add(new VoiceCommand(
                 ToolDefinition.Create("control_lights",
@@ -496,22 +533,46 @@ namespace Personal_Assistant
                 var contacts = context.Contacts;
                 registry.Add(new VoiceCommand(
                     ToolDefinition.Create("send_sms",
-                        "Send a text message to one of the user's known contacts.",
+                        "Send a text message to one of the user's known contacts. This really " +
+                        "sends to a real phone and cannot be undone. Read the message back to " +
+                        "the user and ask whether to send it; only then call again with " +
+                        "`confirmed` set from what they actually said. Never decide `confirmed` " +
+                        "yourself — pass \"unknown\" until the user has answered out loud. The " +
+                        "first call never sends; it returns the question for you to ask.",
                         new ToolParameter("contact", "string",
                             "Which contact to message.",
-                            AllowedValues: new List<string>(contacts.Keys))),
+                            AllowedValues: new List<string>(contacts.Keys)),
+                        new ToolParameter("message", "string",
+                            "The exact words to send. Never empty, and never invented — this is " +
+                            "what the contact will read."),
+                        new ToolParameter("confirmed", "string",
+                            "The user's own answer to the read-back question. \"unknown\" means " +
+                            "you have not asked yet; only ever \"yes\" if they said so out loud.",
+                            AllowedValues: Confirmation.AllowedValues)),
                     lower => TryMatchContact(contacts, lower, out _, out _),
                     (ctx, args) =>
                     {
-                        string name = args["contact"];
-                        string number = ctx.Contacts[name];
-                        return ctx.Sms.SendSMS(name, number);
+                        args.TryGetValue("message", out string message);
+                        return HandleSendSmsAsync(ctx, args["contact"], message, args["confirmed"]);
                     },
                     text =>
                     {
-                        if (TryMatchContact(contacts, text.ToLower(), out string name, out _))
-                            return new Dictionary<string, string> { ["contact"] = name };
-                        return VoiceCommand.EmptyArgs;
+                        if (!TryMatchContact(contacts, text.ToLower(), out string name, out _))
+                            return VoiceCommand.EmptyArgs;
+
+                        // The keyword path has no model to compose a body, so the
+                        // best it can do is carry across whatever the user already
+                        // said ("text mom I'll be late"). With nothing to send this
+                        // fails validation and falls through to conversation, which
+                        // is the right direction to fail in.
+                        var args = new Dictionary<string, string>
+                        {
+                            ["contact"] = name,
+                            ["confirmed"] = Confirmation.Unknown
+                        };
+                        string body = ExtractSmsBody(text, name);
+                        if (!string.IsNullOrWhiteSpace(body)) args["message"] = body;
+                        return args;
                     }));
             }
 
@@ -541,18 +602,27 @@ namespace Personal_Assistant
 
             registry.Add(new VoiceCommand(
                 ToolDefinition.Create("power_control",
-                    "Shut down or restart the computer (asks for confirmation first).",
+                    "Shut down or restart the computer. This ends everything the user is doing " +
+                    "and cannot be undone. Ask them out loud whether they are sure, and only " +
+                    "then call again with `confirmed` set from what they actually said. Never " +
+                    "decide `confirmed` yourself — pass \"unknown\" until the user has answered " +
+                    "out loud. The first call never acts; it returns the question for you to ask.",
                     new ToolParameter("action", "string",
                         "Whether to shut down or restart the machine.",
-                        AllowedValues: new[] { "shutdown", "restart" })),
+                        AllowedValues: new[] { "shutdown", "restart" }),
+                    new ToolParameter("confirmed", "string",
+                        "The user's own answer to the confirmation question. \"unknown\" means " +
+                        "you have not asked yet; only ever \"yes\" if they said so out loud.",
+                        AllowedValues: Confirmation.AllowedValues)),
                 lower => lower == "shut down." || lower == "restart.",
-                (ctx, args) => HandleShutdownAsync(ctx.Speech, args["action"]),
+                (ctx, args) => HandlePowerControlAsync(args["action"], args["confirmed"]),
                 text =>
                 {
                     string lower = text.ToLower();
                     return new Dictionary<string, string>
                     {
-                        ["action"] = lower.Contains("shut down") ? "shutdown" : "restart"
+                        ["action"] = lower.Contains("shut down") ? "shutdown" : "restart",
+                        ["confirmed"] = Confirmation.Unknown
                     };
                 }));
 
@@ -1160,77 +1230,326 @@ namespace Personal_Assistant
             return false;
         }
 
-        // ── Blocking sub-dialogs — deliberately NOT converted here ──────────────
+        // ── Sub-dialogs, reshaped into tool round trips ─────────────────────────
         //
-        // These still speak for themselves and open their own SpeechRecognizer,
-        // which is why they are the only handlers left holding a microphone. That
-        // is Phase 4a's scope, not this one: converting them means changing the
-        // SHAPE of the interaction (a confirmation becomes a tool round trip the
-        // model drives), and it carries a safety requirement — `confirmed` has to
-        // become a declared, validated parameter so a model cannot hallucinate its
-        // way to `shutdown /s /t 0`. Returning a ToolResult would not fix them; it
-        // would only hide that they still steal the mic.
+        // These four used to speak a question and then open their OWN
+        // SpeechRecognizer to hear the answer: shutdown, YouTube, SMS, and
+        // PlayStation. A Gemini Live session owns the microphone for the length of
+        // a conversation, so a handler that grabs it mid-command deadlocks the
+        // session. Now the handler returns the question and the model asks it
+        // in-session; the user's answer arrives as a follow-up tool call.
         //
-        // Note for Phase 4a: its brief lists three of these — shutdown, YouTube,
-        // and SMS. There is a FOURTH, PlaystationController.TurnOnPlaystation
-        // (PlaystationController.cs:56), which opens its own SpeechRecognizer to
-        // ask which game to load. It will deadlock a Live session exactly like the
-        // other three.
-        private static async Task HandleYouTubeAsync(SpeechService speechManager)
+        // What that trades away is that the MODEL now decides when a confirmation
+        // is satisfied, and two of these actions are destructive. See Confirmation
+        // for what stands in for the recognizer that used to be the gate.
+
+        // The confirmation vocabulary, shared by every destructive tool.
+        //
+        // It is an enum rather than a boolean on purpose: TryValidate already
+        // canonicalises AllowedValues case-insensitively and rejects anything else
+        // before a handler runs, so this reuses machinery that works instead of
+        // adding a boolean parse. "unknown" exists so `confirmed` can be REQUIRED —
+        // a call that omits it is rejected outright, and there is still an honest
+        // value for "I have not asked yet".
+        public static class Confirmation
         {
-            await speechManager.Say(recognizedText, "Okay! Would you like a specific video or to just open it?");
+            public const string Yes = "yes";
+            public const string No = "no";
+            public const string Unknown = "unknown";
 
-            string confirmation;
-            using (var recognizer = new SpeechRecognizer(speechManager.speechConfig))
+            public static readonly IReadOnlyList<string> AllowedValues =
+                new[] { Yes, No, Unknown };
+
+            public static bool IsYes(string value) =>
+                string.Equals(value, Yes, StringComparison.OrdinalIgnoreCase);
+
+            public static bool IsNo(string value) =>
+                string.Equals(value, No, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Two-phase gate for the destructive tools.
+        //
+        // Declaring `confirmed` stops a MALFORMED call, but no schema stops a model
+        // from simply writing confirmed:"yes" on the first call it makes — and this
+        // project has already sent one real empty text to a real number by trusting
+        // a step that looked like it had happened. So the gate lives here, in code
+        // the model cannot reach:
+        //
+        //   1. A destructive tool ARMS the gate and returns its question. That call
+        //      performs no action, whatever `confirmed` claims.
+        //   2. Only a LATER call, for the same subject, is allowed through.
+        //
+        // "Later" is wall-clock, not turn bookkeeping. A genuine confirmation costs
+        // a spoken question plus a spoken answer and cannot arrive inside MinDelay;
+        // a model issuing both calls in one batch arrives in milliseconds and is
+        // refused. (Turn identity would be the tighter test, but ctx.RecognizedText
+        // is set by the Azure turn loop and the Live session has no equivalent, so
+        // it would deadlock the very path this exists for.) MaxAge stops a "yes"
+        // left over from an abandoned request authorising anything later.
+        //
+        // Subject includes the arguments, so approving one message does not approve
+        // a different one sent under the same "yes".
+        //
+        // Public for the same reason BuildRegistry is: the only two handlers that
+        // pass this gate shut the machine down and text a real phone, so a harness
+        // cannot verify the positive path by running them. It drives the gate
+        // itself instead. A test that reimplemented this logic would prove nothing.
+        public static class ConfirmationGate
+        {
+            private static readonly TimeSpan MinDelay = TimeSpan.FromSeconds(1.5);
+            private static readonly TimeSpan MaxAge = TimeSpan.FromMinutes(2);
+
+            private static readonly object sync = new object();
+            private static string pendingSubject;
+            private static DateTime pendingAtUtc;
+
+            // Records that this exact request has been put to the user, and returns
+            // the question to ask. Re-arming an already-pending subject restarts the
+            // clock, so repeated asking never shortens the wait.
+            public static void Arm(string subject)
             {
-                var result = await recognizer.RecognizeOnceAsync();
-                speechManager.ConvertSpeechToText(result);
-                confirmation = (result.Text ?? string.Empty).ToLower();
+                lock (sync)
+                {
+                    pendingSubject = subject;
+                    pendingAtUtc = DateTime.UtcNow;
+                }
             }
 
-            if (confirmation.StartsWith("search for") || confirmation.StartsWith("search up"))
+            public static void Clear()
             {
-                string prefix = confirmation.StartsWith("search up") ? "search up " : "search for ";
-                string query = confirmation.Substring(prefix.Length).TrimEnd('.');
-                await speechManager.Say(recognizedText, $"Ok! Searching for {query} now");
-                Process.Start($"https://www.youtube.com/results?search_query={Uri.EscapeDataString(query)}");
+                lock (sync) { pendingSubject = null; }
             }
-            else if (confirmation.Contains("open"))
+
+            // True only if this subject was armed, long enough ago to have been
+            // answered by a person, and recently enough to still mean anything.
+            // Consumes the pending state either way it succeeds.
+            public static bool TryConsume(string subject)
             {
-                await speechManager.Say(recognizedText, "Okay! Opening Youtube now.");
-                Process.Start("https://www.youtube.com");
-            }
-            else if (confirmation.Contains("nevermind") || confirmation.Contains("never mind"))
-            {
-                await speechManager.Say(recognizedText, "Okay! Let me know if you need anything else.");
+                lock (sync)
+                {
+                    if (pendingSubject == null ||
+                        !string.Equals(pendingSubject, subject, StringComparison.Ordinal))
+                    {
+                        return false;
+                    }
+
+                    TimeSpan age = DateTime.UtcNow - pendingAtUtc;
+                    if (age < MinDelay)
+                    {
+                        Console.WriteLine($"[confirm] '{subject}' confirmed after only {age.TotalMilliseconds:F0} ms -> refused");
+                        return false;
+                    }
+                    if (age > MaxAge)
+                    {
+                        Console.WriteLine($"[confirm] '{subject}' confirmation is {age.TotalSeconds:F0}s stale -> refused");
+                        pendingSubject = null;
+                        return false;
+                    }
+
+                    pendingSubject = null;
+                    return true;
+                }
             }
         }
 
-        // action is "shutdown" or "restart" (validated by the dispatcher).
-        private static async Task HandleShutdownAsync(SpeechService speechManager, string action)
+        // mode is "search" or "open" (validated by the dispatcher); query is
+        // optional and only meaningful for "search".
+        private static Task<ToolResult> HandleYouTubeAsync(string mode, string query)
         {
-            await speechManager.Say(recognizedText, "Are you sure?");
-
-            SpeechRecognitionResult confirmationResult;
-            using (var confirmRecognizer = new SpeechRecognizer(speechManager.speechConfig))
+            if (!string.Equals(mode, "search", StringComparison.OrdinalIgnoreCase))
             {
-                confirmationResult = await confirmRecognizer.RecognizeOnceAsync();
-                speechManager.ConvertSpeechToText(confirmationResult);
+                Process.Start("https://www.youtube.com");
+                return Task.FromResult(ToolResult
+                    .Speak("Okay! Opening Youtube now.")
+                    .With("mode", "open"));
             }
 
-            bool isShutdown = action == "shutdown";
-            string actionText = isShutdown ? "Shutting down" : "Restarting now";
+            query = (query ?? string.Empty).Trim();
+            if (query.Length == 0)
+            {
+                // A search with nothing to search for: ask rather than opening a
+                // blank results page. Not destructive, so no gate — just a question.
+                const string question = "What would you like me to search for on YouTube?";
+                return Task.FromResult(ToolResult
+                    .Speak(question)
+                    .With("status", "needs_query")
+                    .With("question", question));
+            }
 
-            if (string.Equals(confirmationResult.Text?.TrimEnd('.'), "yes", StringComparison.OrdinalIgnoreCase))
+            Process.Start($"https://www.youtube.com/results?search_query={Uri.EscapeDataString(query)}");
+            return Task.FromResult(ToolResult
+                .Speak($"Ok! Searching for {query} now")
+                .With("mode", "search")
+                .With("query", query));
+        }
+
+        // Pulls a search subject out of "search up X on youtube" and friends, for
+        // the keyword fallback path (where there is no model to fill `mode`).
+        // Returns null when the user just asked for YouTube itself.
+        private static string ExtractYouTubeQuery(string lower)
+        {
+            string[] cues = { "search for ", "search up ", "look up ", "play " };
+            foreach (string cue in cues)
             {
-                await speechManager.Say(confirmationResult.Text, $"Ok. {actionText}");
-                Process.Start("shutdown", isShutdown ? "/s /t 0" : "/r /t 0");
+                int at = lower.IndexOf(cue, StringComparison.Ordinal);
+                if (at < 0) continue;
+
+                string rest = lower.Substring(at + cue.Length);
+                int tail = rest.IndexOf("on youtube", StringComparison.Ordinal);
+                if (tail < 0) tail = rest.IndexOf("youtube", StringComparison.Ordinal);
+                if (tail >= 0) rest = rest.Substring(0, tail);
+
+                rest = rest.Trim().TrimEnd('.', '?', '!');
+                if (rest.Length > 0) return rest;
             }
-            else
+            return null;
+        }
+
+        // Pulls a game title out of "turn on the playstation and play X", for the
+        // keyword fallback path. Returns null when the user named no game, which
+        // fails validation — better than launching Remote Play and guessing.
+        private static string ExtractGameTitle(string lower)
+        {
+            string[] cues = { "and play ", "then play ", "to play ", "play " };
+            foreach (string cue in cues)
             {
-                await speechManager.Say(recognizedText, $"Ok. NOT {actionText}");
-                await Task.Delay(500);
+                int at = lower.IndexOf(cue, StringComparison.Ordinal);
+                if (at < 0) continue;
+
+                string rest = lower.Substring(at + cue.Length).Trim().TrimEnd('.', '?', '!');
+                if (rest.Length > 0) return rest;
             }
+            return null;
+        }
+
+        // action is "shutdown" or "restart", confirmed is one of Confirmation's
+        // values — both validated by the dispatcher before this runs.
+        private static Task<ToolResult> HandlePowerControlAsync(string action, string confirmed)
+        {
+            bool isShutdown = string.Equals(action, "shutdown", StringComparison.OrdinalIgnoreCase);
+            string verb = isShutdown ? "shut down" : "restart";
+            string gerund = isShutdown ? "Shutting down" : "Restarting now";
+            string subject = "power_control:" + (isShutdown ? "shutdown" : "restart");
+
+            if (Confirmation.IsNo(confirmed))
+            {
+                ConfirmationGate.Clear();
+                return Task.FromResult(ToolResult
+                    .Speak($"Ok. NOT {gerund.ToLower()}")
+                    .With("status", "cancelled")
+                    .With("action", action));
+            }
+
+            // Everything that is not an armed, aged "yes" only ever asks. Note this
+            // deliberately covers confirmed == "yes" on a first call: asserting the
+            // answer is not a way to skip the question.
+            if (!Confirmation.IsYes(confirmed) || !ConfirmationGate.TryConsume(subject))
+            {
+                ConfirmationGate.Arm(subject);
+                string question = $"Are you sure you want to {verb}?";
+                return Task.FromResult(ToolResult
+                    .Speak(question)
+                    .With("status", "needs_confirmation")
+                    .With("question", question)
+                    .With("action", action));
+            }
+
+            Process.Start("shutdown", isShutdown ? "/s /t 0" : "/r /t 0");
+            return Task.FromResult(ToolResult
+                .Speak($"Ok. {gerund}")
+                .With("status", "confirmed")
+                .With("action", action));
+        }
+
+        // contact and confirmed are validated by the dispatcher; message is
+        // re-checked here regardless, because the empty-SMS incident happened on
+        // exactly this path and a schema is not a guarantee about what arrives.
+        private static async Task<ToolResult> HandleSendSmsAsync(
+            CommandContext ctx,
+            string contact,
+            string message,
+            string confirmed)
+        {
+            message = (message ?? string.Empty).Trim();
+            if (message.Length == 0)
+            {
+                return ToolResult.Failed(
+                    $"I don't have anything to send yet — what should I say to {contact}?",
+                    "empty_message");
+            }
+
+            if (ctx.Contacts == null ||
+                !ctx.Contacts.TryGetValue(contact, out string number) ||
+                string.IsNullOrWhiteSpace(number))
+            {
+                return ToolResult.Failed($"I don't have a number for {contact}.", "unknown_contact");
+            }
+
+            // The subject binds the approval to this contact AND this exact body, so
+            // a "yes" cannot be spent on a message the user never heard read back.
+            string subject = "send_sms:" + contact + ":" + message;
+
+            if (Confirmation.IsNo(confirmed))
+            {
+                ConfirmationGate.Clear();
+                return ToolResult
+                    .Speak("Okay, message cancelled.")
+                    .With("status", "cancelled")
+                    .With("contact", contact);
+            }
+
+            if (!Confirmation.IsYes(confirmed) || !ConfirmationGate.TryConsume(subject))
+            {
+                ConfirmationGate.Arm(subject);
+                string question = $"You'd like to send \"{message}\" to {contact}. Should I send it?";
+                return ToolResult
+                    .Speak(question)
+                    .With("status", "needs_confirmation")
+                    .With("question", question)
+                    .With("contact", contact)
+                    .With("message", message);
+            }
+
+            bool sent = await ctx.Sms.SendSMS(contact, number, message);
+            if (!sent)
+            {
+                return ToolResult.Failed(
+                    $"Sorry, I couldn't send that to {contact}.", "send_failed");
+            }
+
+            return ToolResult
+                .Speak($"Sending \"{message}\" to {contact}.")
+                .With("status", "sent")
+                .With("contact", contact)
+                .With("message", message);
+        }
+
+        // Pulls the message body out of "text mom I'll be late", for the keyword
+        // fallback path. Everything after the contact's name is the body; if that
+        // leaves nothing, the caller omits `message` and validation refuses the
+        // call rather than sending a blank text.
+        private static string ExtractSmsBody(string text, string contactName)
+        {
+            int at = text.IndexOf(contactName, StringComparison.OrdinalIgnoreCase);
+            if (at < 0) return null;
+
+            string rest = text.Substring(at + contactName.Length)
+                              .TrimStart(' ', ',', ':', '-')
+                              .Trim();
+
+            // Strip a lead-in the user may have said before the body itself
+            // ("text mom saying I'll be late" / "... that I'll be late").
+            string[] leadIns = { "saying ", "that ", "and say ", "say " };
+            foreach (string leadIn in leadIns)
+            {
+                if (rest.StartsWith(leadIn, StringComparison.OrdinalIgnoreCase))
+                {
+                    rest = rest.Substring(leadIn.Length).Trim();
+                    break;
+                }
+            }
+
+            return rest.Length == 0 ? null : rest;
         }
     }
 }

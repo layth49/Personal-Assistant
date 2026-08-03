@@ -1,10 +1,7 @@
 ﻿using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.CognitiveServices.Speech;
-using Personal_Assistant.SpeechManager;
 using Python.Runtime;
 using WindowsInput;
 using WindowsInput.Native;
@@ -20,20 +17,32 @@ namespace Personal_Assistant.PlaystationController
         static extern bool IsWindowVisible(IntPtr hWnd);
 
         private readonly InputSimulator simulator = new InputSimulator();
-        private readonly SpeechService speechManager = new SpeechService();
 
-        public async Task TurnOnPlaystation()
+        // Launches Remote Play and navigates to `game`. Returns whether Remote Play
+        // came up far enough to drive.
+        //
+        // This used to ask "what game would you like to play?" and open its own
+        // SpeechRecognizer to hear the answer — the fourth blocking sub-dialog, and
+        // the one Phase 4a's brief did not list. A Gemini Live session owns the
+        // microphone, so that recognizer would deadlock it exactly like the other
+        // three. The title now arrives as a tool argument: the model asks the
+        // question in-session, which it is already good at, and calls once it knows.
+        public async Task<bool> TurnOnPlaystation(string game)
         {
+            game = (game ?? string.Empty).Trim().TrimEnd('.');
+            if (game.Length == 0)
+            {
+                Console.WriteLine("No game title given; not launching Remote Play.");
+                return false;
+            }
+
             Process remoteplay = Process.Start(@"C:\Program Files (x86)\Sony\PS Remote Play\RemotePlay.exe");
             if (remoteplay == null)
             {
                 Console.WriteLine("Failed to launch Remote Play.");
-                return;
+                return false;
             }
             remoteplay.PriorityClass = ProcessPriorityClass.High;
-
-            await speechManager.Say(Program.recognizedText,
-                "Okay! Turning on your PlayStation 5 now. What game would you like to play?");
 
             // Wait for the Remote Play window to actually appear and become
             // visible before sending input — the process starts but the window
@@ -42,7 +51,7 @@ namespace Personal_Assistant.PlaystationController
             if (handle == IntPtr.Zero)
             {
                 Console.WriteLine("Remote Play window did not appear within 30s.");
-                return;
+                return false;
             }
 
             SetForegroundWindow(handle);
@@ -52,22 +61,16 @@ namespace Personal_Assistant.PlaystationController
             simulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
             SetForegroundWindow(handle);
 
-            string userResponse;
-            using (var recognizer = new SpeechRecognizer(speechManager.speechConfig))
-            {
-                SpeechRecognitionResult parsedResponse = await recognizer.RecognizeOnceAsync();
-                speechManager.ConvertSpeechToText(parsedResponse);
-                userResponse = (parsedResponse.Text ?? string.Empty).TrimEnd('.');
-            }
-
-            SetForegroundWindow(handle);
-
-            await speechManager.Say(userResponse, $"Okay! Loading up {userResponse} now");
+            // The console's stream has to be up before the navigator can steer it.
+            // The old dictation dialog paid for this wait by accident — a recognizer
+            // plus a spoken read-back is several seconds — so removing the dialog
+            // means buying the settle time back explicitly.
+            await Task.Delay(6000);
 
             try
             {
                 SetForegroundWindow(handle);
-                NavigateToGame(userResponse);
+                NavigateToGame(game);
             }
             catch (Exception ex)
             {
@@ -76,8 +79,7 @@ namespace Personal_Assistant.PlaystationController
 
             remoteplay.CloseMainWindow();
             simulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
-
-            await speechManager.Say(userResponse, $"{userResponse} is ready! Have fun!");
+            return true;
         }
 
         // Polls until the process has a valid, visible main window handle,
