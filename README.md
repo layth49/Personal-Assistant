@@ -27,7 +27,8 @@ My Personal Voice Assistant!
 - Tell me the current day's Prayer Times
 - Open my IDE
 - Turn off/Restart my computer
-
+- Hold a conversation: it keeps listening after a reply, so follow-ups don't need the wake word
+- Interrupt it mid-sentence — say `49` and it stops talking immediately
 
 ## Local stack (this branch)
 
@@ -35,24 +36,39 @@ This branch runs entirely on-device — no Azure / Gemini keys required:
 
 | Service | Replaces | Default port |
 |---|---|---|
-| LM Studio | Gemini 2.5 Flash | 1234 |
+| LM Studio — `qwen/qwen3-4b-2507` | Gemini 2.5 Flash | 1234 |
 | SearxNG (Docker) | Gemini search grounding | 8080 |
-| faster-whisper-server (Docker) | Azure Speech-to-Text | 8000 |
+| Parakeet STT — [`stt-server/`](stt-server/) (Docker, CPU) | Azure Speech-to-Text | 8001 |
 | Kokoro-FastAPI (Docker) | Azure Neural TTS | 8880 |
+
+Both model choices were settled by bake-off rather than by reputation — see
+[`bakeoff/stt/README.md`](bakeoff/stt/README.md) and
+[`bakeoff/llm/README.md`](bakeoff/llm/README.md) for the tables.
+faster-whisper-server is still in `docker-compose.yml` but behind a `whisper`
+profile: it lost the bake-off, and its ~2.2 GB of VRAM is better spent on the LLM.
 
 Wake-word detection (`Hey 49`) still uses the on-device Azure `KeywordRecognizer` — no cloud calls.
 
 ### Prerequisites
 
 - Docker Desktop (WSL 2 backend) + NVIDIA Container Toolkit for GPU passthrough
-- LM Studio with `Llama-3.1-8B-Instruct-GGUF` (Q4_K_M) downloaded
+- LM Studio with `qwen/qwen3-4b-2507` downloaded (avoid `-thinking` / `-reasoning`
+  variants — reasoning tokens wreck voice latency for no gain at this size)
 - Python 3.12 + the packages in [requirements.txt](requirements.txt)
+- A `.env` with `CONTACTS_FILE` set — see [.env.example](.env.example)
 
 ### Start
 
 ```powershell
-docker compose up -d   # faster-whisper, Kokoro, SearxNG
+docker compose up -d   # SearxNG, Kokoro, Parakeet STT
 # Then launch LM Studio and start its local server (port 1234)
+```
+
+Check the STT service came up with contact boosting enabled — `boost_phrases: 0`
+means `CONTACTS_FILE` didn't resolve, which costs ~33 points of contact-name recall:
+
+```powershell
+curl http://127.0.0.1:8001/health
 ```
 
 Full setup notes, verification curls, and GPU memory budget: [local-stack.md](local-stack.md).
@@ -62,22 +78,34 @@ Full setup notes, verification curls, and GPU memory budget: [local-stack.md](lo
 Required: `WEATHERAPI_KEY` (OpenWeatherMap).
 
 Optional (defaults shown):
-- `LMSTUDIO_URL` — `http://localhost:1234/v1`
+- `LMSTUDIO_URL` — `http://127.0.0.1:1234/v1`
 - `SEARXNG_URL` — `http://localhost:8080`
-- `WHISPER_URL` — `http://localhost:8000`
-- `WHISPER_MODEL` — `Systran/faster-whisper-large-v3`
+- `STT_URL` — `http://127.0.0.1:8001` (the Parakeet service; `WHISPER_URL` is still
+  read as a fallback for machines configured before the engine swap)
 - `KOKORO_URL` — `http://localhost:8880`
 - `KOKORO_VOICE` — `am_onyx`
 - `IP_ADDRESS:PLUG`, `IP_ADDRESS:SWITCH` — TP-Link Kasa endpoints
 - `CONTACTS_PATH` — JSON file mapping contact names → phone numbers
+- `LAITH_ECHO_GATE` — `auto` (engage the barge-in energy gate only once speaker
+  bleed is observed) / `on` / `off`
+- `LAITH_ECHO_MARGIN` — how far above the measured bleed a frame must sit to count
+  as you talking, default `1.5`. Lower if barge-in needs shouting, raise if the
+  assistant cuts itself off
+
+**Address services running directly on the host as `127.0.0.1`, never `localhost`.**
+On Windows that name resolves to `::1` first, and both LM Studio and the STT
+service bind IPv4 only, so the connect waits for the IPv6 refusal — measured at
+~2s. The Docker-published services publish dual-stack and are unaffected.
 
 `SPEECH_KEY`, `SPEECH_REGION`, `GEMINIAPI_KEY` are **not used** on this branch.
 
 ## Roadmap
 
 - [x] Ability to interrupt L.A.I.T.H
-- [ ] Multi-turn context/memory
+- [x] Multi-turn context/memory
 - [ ] Give L.A.I.T.H. computer control
+- [ ] True end-to-end speech-to-speech — blocked until an open STS model does tool
+      calling in 6 GB; the cascade simulates it for now (low latency, barge-in)
   
 ## Acknowledgements
 
