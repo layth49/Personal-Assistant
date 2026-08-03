@@ -89,7 +89,12 @@ namespace Personal_Assistant.SpeechManager
             // keyword cycle so we don't re-pay WASAPI setup each time.
             try
             {
-                keywordModel = KeywordRecognitionModel.FromFile(@"..\keyword.table");
+                // Resolve next to the exe, not against the working directory. The app
+                // runs from a deploy folder (C:\Users\layth\LAITH\main) as often as from
+                // bin\Debug, and those sit at different depths, so no relative path is
+                // correct for both. The csproj copies keyword.table to the output dir.
+                keywordModel = KeywordRecognitionModel.FromFile(
+                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "keyword.table"));
                 keywordRecognizer = new KeywordRecognizer(audioConfig);
                 // Dedicated recognizer + mic config for barge-in (see field docs).
                 interruptAudioConfig = AudioConfig.FromDefaultMicrophoneInput();
