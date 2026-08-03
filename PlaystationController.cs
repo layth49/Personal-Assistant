@@ -20,7 +20,11 @@ namespace Personal_Assistant.PlaystationController
         static extern bool IsWindowVisible(IntPtr hWnd);
 
         private readonly InputSimulator simulator = new InputSimulator();
-        private readonly SpeechService speechManager = new SpeechService();
+        // The one running instance — never `new SpeechService()`. A second one
+        // owns none of the audio state the rest of the app reads, so everything
+        // it says escapes the echo gate and everything it hears times out.
+        // A property, not a field, so there is no construction-order trap.
+        private static SpeechService speechManager => SpeechService.Current;
 
         public async Task TurnOnPlaystation()
         {

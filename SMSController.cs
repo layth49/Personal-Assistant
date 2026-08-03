@@ -21,7 +21,14 @@ namespace Personal_Assistant.SMSController
         static extern bool SetForegroundWindow(IntPtr hWnd);
 
         private readonly InputSimulator simulator = new InputSimulator();
-        private readonly SpeechService speechManager = new SpeechService();
+
+        // The one running instance — never `new SpeechService()`. This handler is
+        // where that bug did its worst damage: its own instance waited on a
+        // microphone it didn't own, so RecognizeOnceAsync below returned "" and
+        // an empty message was handed to Phone Link and actually sent, while the
+        // prompts it spoke escaped the echo gate and queued up as fresh turns.
+        // A property, not a field, so there is no construction-order trap.
+        private static SpeechService speechManager => SpeechService.Current;
 
         public async Task SendSMS(string contactName, string contactNumber)
         {

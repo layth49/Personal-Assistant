@@ -7,7 +7,11 @@ namespace Personal_Assistant.PrayerTimesCalculator
 {
     public class GetPrayerTimes
     {
-        private readonly SpeechService speechManager = new SpeechService();
+        // The one running instance — never `new SpeechService()`. A second one
+        // owns none of the audio state the rest of the app reads, so everything
+        // it says escapes the echo gate and everything it hears times out.
+        // A property, not a field, so there is no construction-order trap.
+        private static SpeechService speechManager => SpeechService.Current;
 
         private readonly double latitude;
         private readonly double longitude;
@@ -76,9 +80,13 @@ namespace Personal_Assistant.PrayerTimesCalculator
                     $"{spokenName} is at {time12h}" +
                     "</voice></speak>";
 
-                var synthTask = speechManager.SynthesizeSsmlAsync(ssml);
-                speechManager.SpeechBubble(string.Empty, $"{name} is at: {time12h}");
-                await synthTask;
+                // SaySsml posts the bubble before starting the synth. Doing it the
+                // other way round (as this did) was safe only while the bubble
+                // blocked: now that it returns immediately, a synth that finished
+                // first would flip `running` on the PREVIOUS prayer's state dict
+                // and this bubble would hang on screen with nothing left to
+                // retract it.
+                await speechManager.SaySsml(string.Empty, $"{name} is at: {time12h}", ssml);
             }
         }
 

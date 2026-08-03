@@ -17,6 +17,12 @@ namespace Personal_Assistant.WeatherService
 
         private readonly string apiKey;
 
+        // The one running instance — never `new SpeechService()`. A second one
+        // owns none of the audio state the rest of the app reads, so everything
+        // it says escapes the echo gate and everything it hears times out.
+        // A property, not a field, so there is no construction-order trap.
+        private static SpeechService speechManager => SpeechService.Current;
+
         public GetWeather(string apiKey)
         {
             this.apiKey = apiKey;
@@ -25,7 +31,6 @@ namespace Personal_Assistant.WeatherService
         public async Task GetWeatherData()
         {
             var location = new GetLocation();
-            var speechManager = new SpeechService();
 
             try
             {
@@ -75,7 +80,6 @@ namespace Personal_Assistant.WeatherService
         public async Task GetForecastData(int days = 3)
         {
             var location = new GetLocation();
-            var speechManager = new SpeechService();
 
             try
             {

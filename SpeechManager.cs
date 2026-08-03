@@ -45,19 +45,53 @@ namespace Personal_Assistant.SpeechManager
         private readonly dynamic textDisplay;
         private PyDict state;
 
+        // Cached once instead of re-evaluated on every retract. PythonEngine.Eval
+        // parses and compiles a fresh expression each call, and the retract path
+        // runs at the end of every single utterance.
+        private PyObject pyTrue;
+        private PyObject pyFalse;
+
         // Serialises Say so overlapping callers never garble each other's audio
         // or clobber the single shared bubble `state`. The main loop is already
         // sequential; this matters when a background reminder/timer fires while
         // the assistant happens to be speaking.
+        //
+        // Because BeginSpeaking/EndSpeaking are both inside the gate on every
+        // path, `speaking` and the echo reference can't be clobbered by an
+        // overlapping speaker either.
         private readonly System.Threading.SemaphoreSlim sayGate =
             new System.Threading.SemaphoreSlim(1, 1);
+
+        // True for exactly as long as assistant audio is playing. Written only
+        // between BeginSpeaking and EndSpeaking, which are always inside sayGate.
+        private volatile bool speaking;
+        private volatile string speakingText;
 
         // Optional per-turn latency breakdown (null-safe — a caller that doesn't
         // care about timing can just not pass one).
         private readonly LatencyTracker latency;
 
+        // The one instance the app is actually running — the one holding the
+        // synthesizer whose audio the barge-in path stops, and the one whose
+        // bubble `state` the Python daemon is watching.
+        //
+        // Command handlers MUST use this rather than newing their own. Five of
+        // them did, and a second instance is silently useless in both
+        // directions: its BeginSpeaking updates state nothing else reads, so the
+        // real echo gate never learns the assistant is talking and every prompt
+        // that handler speaks escapes it wholesale; and its RecognizeOnceAsync
+        // competes for the same microphone. In the SMS flow that meant an empty
+        // message body was handed to Phone Link and actually sent, while the
+        // escaped prompts queued up as turns and the assistant talked to itself
+        // for a minute.
+        public static SpeechService Current { get; private set; }
+
         public SpeechService(LatencyTracker latency = null)
         {
+            // First one wins: Program.Main builds the real one before any handler
+            // exists, so a stray `new` elsewhere can't steal the slot.
+            if (Current == null) Current = this;
+
             this.latency = latency;
             // Recognition config — EndpointId here targets a CUSTOM RECOGNITION model.
             // It must NOT be applied to the synthesizer, or TTS calls hit the wrong
@@ -102,9 +136,57 @@ namespace Personal_Assistant.SpeechManager
 
             using (Py.GIL())
             {
+                // Importing the module starts its bubble daemon thread, which
+                // needs the GIL to run — Program.Main's PythonEngine.BeginAllowThreads()
+                // is what lets it get it once we drop out of this block.
                 textDisplay = Py.Import("SpeechBubble");
+                pyTrue = PythonEngine.Eval("True");
+                pyFalse = PythonEngine.Eval("False");
             }
         }
+
+        // Brackets every source of assistant audio — streamed replies, canned
+        // Say() lines, and reminders firing in the background alike. Anything
+        // that needs to know whether the assistant is currently talking (the
+        // barge-in check, and any echo gate on the microphone) keys off this, so
+        // a path that skips it is a path where the assistant can hear itself.
+        //
+        // Public, unlike local-laith's private pair: on this branch the Live
+        // session plays its own audio through LiveAudioPlayback rather than
+        // through this class, so it has to bracket that audio itself.
+        public void BeginSpeaking(string text)
+        {
+            speakingText = text;
+            speaking = true;
+            AssistantSpeechStarted?.Invoke(text);
+        }
+
+        public void EndSpeaking()
+        {
+            speaking = false;
+            speakingText = null;
+            AssistantSpeechEnded?.Invoke();
+        }
+
+        // Grows the echo reference mid-utterance. A streamed reply doesn't exist
+        // as one string when BeginSpeaking(null) is called — it arrives sentence
+        // by sentence — so callers append each piece as they voice it.
+        public void AppendSpeakingText(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+            speakingText = string.IsNullOrEmpty(speakingText) ? text : speakingText + " " + text;
+        }
+
+        public bool IsSpeaking => speaking;
+
+        // What the assistant is saying right now, for comparing against anything
+        // the microphone picks up. Null when it isn't speaking.
+        public string SpeakingText => speakingText;
+
+        // Raised inside sayGate, so handlers see a consistent view of `speaking`.
+        // A handler that blocks here delays the reply, so keep them cheap.
+        public event Action<string> AssistantSpeechStarted;
+        public event Action AssistantSpeechEnded;
 
         // Waits for the wakeword. Returns true only if the keyword actually fired,
         // so the caller can distinguish a real wake from an early/errored return.
@@ -146,10 +228,13 @@ namespace Personal_Assistant.SpeechManager
                     Console.WriteLine($"RECOGNIZED: {speechRecognitionResult.Text}");
                     break;
                 case ResultReason.NoMatch:
-                    // Fire-and-forget the synth so the bubble can show in parallel
-                    // and be retracted when audio finishes.
-                    _ = SynthesizeTextToSpeech("Sorry I didn't get that. Can you say it again?");
-                    SpeechBubble("", "Sorry I didn't get that. Can you say it again?");
+                    // Fire-and-forget: this method is synchronous and is called
+                    // from inside `using (var recognizer = ...)` blocks, so it
+                    // can't await. Routing through Say rather than raw synthesis
+                    // is what keeps the re-prompt inside sayGate and inside the
+                    // BeginSpeaking/EndSpeaking brackets. Callers that speak next
+                    // queue behind it on that gate rather than talking over it.
+                    _ = Say(string.Empty, "Sorry I didn't get that. Can you say it again?");
                     break;
                 case ResultReason.Canceled:
                     var cancellation = CancellationDetails.FromResult(speechRecognitionResult);
@@ -198,13 +283,7 @@ namespace Personal_Assistant.SpeechManager
                     }
                 }
 
-                if (state != null)
-                {
-                    using (Py.GIL())
-                    {
-                        state.SetItem("running", PythonEngine.Eval("False"));
-                    }
-                }
+                RetractBubble();
             }
         }
 
@@ -239,27 +318,34 @@ namespace Personal_Assistant.SpeechManager
                 }
 
                 // Signal the speech bubble to retract once audio finishes.
-                // (state may be null if no bubble was set up — that's fine.)
-                if (state != null)
-                {
-                    using (Py.GIL())
-                    {
-                        state.SetItem("running", PythonEngine.Eval("False"));
-                    }
-                }
+                RetractBubble();
             }
         }
 
-        public void SpeechBubble(string userInput, string response)
+        // Flips the current bubble's shared state so the Python daemon animates
+        // it out. Safe to call more than once, and a no-op if no bubble was set
+        // up for this utterance.
+        private void RetractBubble()
         {
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            Console.WriteLine($"[bubble t+{sw.ElapsedMilliseconds}ms] SpeechBubble: entered");
+            if (state == null) return;
             using (Py.GIL())
             {
-                Console.WriteLine($"[bubble t+{sw.ElapsedMilliseconds}ms] SpeechBubble: GIL acquired");
+                state.SetItem("running", pyFalse);
+            }
+        }
+
+        // Posts the bubble to the persistent Python daemon and returns immediately.
+        // The pygame window lives on its own long-lived Python thread, so this no
+        // longer parks the calling thread for the length of the utterance. The
+        // daemon holds the bubble while state["running"] is true and animates it
+        // out when the synth flips it to false.
+        public void SpeechBubble(string userInput, string response)
+        {
+            var sw = Stopwatch.StartNew();
+            using (Py.GIL())
+            {
                 state = new PyDict();
-                state.SetItem("running", PythonEngine.Eval("True"));
-                Console.WriteLine($"[bubble t+{sw.ElapsedMilliseconds}ms] SpeechBubble: state set, calling show_bubble");
+                state.SetItem("running", pyTrue);
                 try
                 {
                     textDisplay.show_bubble(userInput, response, state);
@@ -271,7 +357,42 @@ namespace Personal_Assistant.SpeechManager
                     Console.WriteLine("Message: " + ex.Message);
                     Console.WriteLine("StackTrace: " + ex.StackTrace);
                 }
-                Console.WriteLine($"[bubble t+{sw.ElapsedMilliseconds}ms] SpeechBubble: show_bubble returned");
+            }
+            Console.WriteLine($"[bubble] posted in {sw.ElapsedMilliseconds}ms");
+        }
+
+        // Swaps the text of the bubble already on screen, with no exit/enter
+        // animation — how a streamed reply grows as sentences arrive. A no-op if
+        // nothing is currently being held.
+        public void UpdateBubble(string userInput, string response)
+        {
+            using (Py.GIL())
+            {
+                try
+                {
+                    textDisplay.update_bubble(userInput, response);
+                }
+                catch (PythonException ex)
+                {
+                    Console.WriteLine("Bubble update failed: " + ex.Message);
+                }
+            }
+        }
+
+        // Retracts the current bubble without waiting on its state dict — for
+        // callers that show a bubble without an accompanying synth to flip it.
+        public void HideBubble()
+        {
+            using (Py.GIL())
+            {
+                try
+                {
+                    textDisplay.hide_bubble();
+                }
+                catch (PythonException ex)
+                {
+                    Console.WriteLine("Bubble hide failed: " + ex.Message);
+                }
             }
         }
 
@@ -281,8 +402,13 @@ namespace Personal_Assistant.SpeechManager
         // Call this once at startup so the first real synth plays in full.
         public async Task WarmUpAudioAsync()
         {
+            await sayGate.WaitAsync();
             try
             {
+                // Goes through the same brackets as every other speech path even
+                // though it is silent and runs before anything is listening: the
+                // invariant is worth more than the one line it costs here.
+                BeginSpeaking(null);
                 const string ssml =
                     "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>" +
                     "<voice name='en-US-AndrewMultilingualNeural'> " +
@@ -294,32 +420,55 @@ namespace Personal_Assistant.SpeechManager
             {
                 Console.WriteLine($"Audio warm-up failed (non-fatal): {ex.Message}");
             }
+            finally
+            {
+                EndSpeaking();
+                sayGate.Release();
+            }
         }
 
-        // Convenience wrapper: starts TTS, shows the bubble in parallel, and the
-        // bubble retracts automatically when the audio finishes. Always prefer this
-        // over calling Synthesize+SpeechBubble separately — the synth must run
-        // concurrently with the bubble so it can signal completion.
-        //
-        // SpeakTextAsync has a synchronous prelude (audio device + format setup)
-        // that runs on the calling thread before it yields. Hand it to the
-        // threadpool so the main thread can immediately show the bubble.
+        // Convenience wrapper: shows the bubble, speaks, and the bubble retracts
+        // automatically when the audio finishes. Always prefer this over calling
+        // Synthesize+SpeechBubble separately — it is the path that brackets the
+        // audio and serialises against other speakers.
         public async Task Say(string userInput, string response)
         {
             await sayGate.WaitAsync();
             try
             {
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                Console.WriteLine($"[t+{sw.ElapsedMilliseconds}ms] Say: entered");
-                var synthTask = Task.Run(() => SynthesizeTextToSpeech(response));
-                Console.WriteLine($"[t+{sw.ElapsedMilliseconds}ms] Say: synth task scheduled, calling SpeechBubble");
+                // Bubble first. Posting it is non-blocking now, and doing it
+                // before the synth starts means the synth's retract signal can
+                // never land on a stale state dict — previously the synth was
+                // scheduled first only because showing the bubble parked the
+                // calling thread for the whole utterance.
                 SpeechBubble(userInput, response);
-                Console.WriteLine($"[t+{sw.ElapsedMilliseconds}ms] Say: SpeechBubble returned");
-                try { await synthTask; }
+                BeginSpeaking(response);
+                try { await SynthesizeTextToSpeech(response); }
                 catch (Exception ex) { Console.WriteLine($"TTS error: {ex.Message}"); }
             }
             finally
             {
+                EndSpeaking();
+                sayGate.Release();
+            }
+        }
+
+        // Say, but for SSML — for callers that need <phoneme>, <lang>, <break> or
+        // other pronunciation control. `displayText` is what the bubble shows,
+        // since the markup itself must never be rendered.
+        public async Task SaySsml(string userInput, string displayText, string ssml)
+        {
+            await sayGate.WaitAsync();
+            try
+            {
+                SpeechBubble(userInput, displayText);
+                BeginSpeaking(displayText);
+                try { await SynthesizeSsmlAsync(ssml); }
+                catch (Exception ex) { Console.WriteLine($"TTS error: {ex.Message}"); }
+            }
+            finally
+            {
+                EndSpeaking();
                 sayGate.Release();
             }
         }
@@ -344,78 +493,70 @@ namespace Personal_Assistant.SpeechManager
             await sayGate.WaitAsync();
             try
             {
+                // Bubble first (non-blocking), then the synth — same ordering as
+                // Say, so the retract signal always targets this turn's state dict.
+                SpeechBubble(userInput, response);
+                BeginSpeaking(response);
+
+                // The synth still goes to the threadpool, but for a different
+                // reason than it used to: the race below needs a Task handle to
+                // put up against the keyword recogniser. It is no longer working
+                // around a bubble that parked the calling thread, which is why
+                // the race itself is now awaited right here rather than pushed
+                // onto its own thread and collected through a
+                // TaskCompletionSource with a timeout.
                 var synthTask = Task.Run(() => SynthesizeTextToSpeech(response));
 
-                // Start listening for the wakeword NOW, before the bubble. The
-                // bubble call below blocks the calling thread for the whole speech
-                // (it runs pygame until the synth signals done), so the barge-in
-                // race has to run on its own thread or it would only begin after
-                // the speech already finished.
                 Console.WriteLine("[interrupt] listening for wakeword during speech");
-                var interruptTcs = new TaskCompletionSource<bool>();
-                _ = Task.Run(async () =>
+                bool wasInterrupted = false;
+                try
                 {
-                    bool interrupted = false;
-                    try
+                    var keywordTask = interruptKeywordRecognizer.RecognizeOnceAsync(keywordModel);
+                    var finished = await Task.WhenAny(synthTask, keywordTask);
+
+                    if (finished == keywordTask)
                     {
-                        var keywordTask = interruptKeywordRecognizer.RecognizeOnceAsync(keywordModel);
-                        var finished = await Task.WhenAny(synthTask, keywordTask);
+                        KeywordRecognitionResult kw = null;
+                        try { kw = await keywordTask; }
+                        catch (Exception ex) { Console.WriteLine($"[interrupt] keyword await error: {ex.Message}"); }
 
-                        if (finished == keywordTask)
+                        wasInterrupted = kw != null && kw.Reason == ResultReason.RecognizedKeyword;
+                        if (wasInterrupted)
                         {
-                            KeywordRecognitionResult kw = null;
-                            try { kw = await keywordTask; }
-                            catch (Exception ex) { Console.WriteLine($"[interrupt] keyword await error: {ex.Message}"); }
-
-                            interrupted = kw != null && kw.Reason == ResultReason.RecognizedKeyword;
-                            if (interrupted)
-                            {
-                                Console.WriteLine("[interrupt] wakeword during speech -> cutting off");
-                                // Stopping the synth makes SpeakTextAsync return,
-                                // which flips state.running false and closes the
-                                // bubble on the main thread — same path as a
-                                // natural finish.
-                                try { await WithTimeout(synthesizer.StopSpeakingAsync(), 3000, "StopSpeaking"); } catch { }
-                            }
-                        }
-                        else
-                        {
-                            // Speech finished first -> stop listening. Bounded so a
-                            // stuck recognizer can't hang anything; and it's the
-                            // DEDICATED recognizer, so even if it's left in a bad
-                            // state only future barge-ins suffer, never the main loop.
-                            try { await WithTimeout(interruptKeywordRecognizer.StopRecognitionAsync(), 3000, "StopRecognition"); } catch { }
-                            try { await WithTimeout(keywordTask, 3000, "keywordTask drain"); } catch { }
+                            Console.WriteLine("[interrupt] wakeword during speech -> cutting off");
+                            // Stopping the synth makes SpeakTextAsync return,
+                            // which flips state.running false and retracts the
+                            // bubble — the same path as a natural finish.
+                            try { await WithTimeout(synthesizer.StopSpeakingAsync(), 3000, "StopSpeaking"); } catch { }
                         }
                     }
-                    catch (Exception ex)
+                    else
                     {
-                        Console.WriteLine($"[interrupt] race error: {ex.Message}");
+                        // Speech finished first -> stop listening. Bounded so a
+                        // stuck recognizer can't hang anything; and it's the
+                        // DEDICATED recognizer, so even if it's left in a bad
+                        // state only future barge-ins suffer, never the main loop.
+                        try { await WithTimeout(interruptKeywordRecognizer.StopRecognitionAsync(), 3000, "StopRecognition"); } catch { }
+                        try { await WithTimeout(keywordTask, 3000, "keywordTask drain"); } catch { }
                     }
-                    interruptTcs.TrySetResult(interrupted);
-                });
-
-                // Bubble on the calling thread; returns when the synth completes
-                // (naturally or because it was stopped by a barge-in).
-                SpeechBubble(userInput, response);
-                try { await synthTask; } catch (Exception ex) { Console.WriteLine($"TTS error: {ex.Message}"); }
-
-                // Retract the bubble defensively (normally already closed).
-                if (state != null)
+                }
+                catch (Exception ex)
                 {
-                    using (Py.GIL()) { state.SetItem("running", PythonEngine.Eval("False")); }
+                    Console.WriteLine($"[interrupt] race error: {ex.Message}");
                 }
 
-                bool wasInterrupted = false;
-                var settled = await Task.WhenAny(interruptTcs.Task, Task.Delay(4000));
-                if (settled == interruptTcs.Task) wasInterrupted = interruptTcs.Task.Result;
-                else Console.WriteLine("[interrupt] race did not settle in time");
+                try { await synthTask; }
+                catch (Exception ex) { Console.WriteLine($"TTS error: {ex.Message}"); }
+
+                // Retract the bubble defensively (normally already closed).
+                RetractBubble();
 
                 Console.WriteLine($"[interrupt] returning interrupted = {wasInterrupted}");
                 return wasInterrupted;
             }
             finally
             {
+                EndSpeaking();
                 sayGate.Release();
             }
         }
