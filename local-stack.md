@@ -9,8 +9,9 @@ Four services replace the cloud APIs used by the `main` branch:
 | Parakeet STT (`stt-server/`) | Azure Speech-to-Text | 8001 | `http://127.0.0.1:8001/v1/audio/transcriptions` |
 | Kokoro-FastAPI | Azure Neural TTS | 8880 | `http://localhost:8880/v1/audio/speech` |
 
-Both model choices were settled by bake-off rather than by reputation —
-`bakeoff/llm/README.md` and `bakeoff/stt/README.md` have the tables.
+Both model choices were settled by bake-off rather than by reputation. The
+harnesses run against personal voice recordings and contact names, so they are
+kept locally and not published.
 
 SearxNG, Kokoro and Parakeet run in Docker; LM Studio is a GUI process. The STT
 image is built from `stt-server/` rather than pulled, and is CPU-only on purpose

@@ -1,7 +1,6 @@
 using Personal_Assistant.AppLaunching;
 using Personal_Assistant.Arduino;
 using Personal_Assistant.AudioControl;
-using Personal_Assistant.Bakeoff;
 using Personal_Assistant.Diagnostics;
 using Personal_Assistant.Dispatch;
 using Personal_Assistant.Geolocator;
@@ -107,18 +106,6 @@ namespace Personal_Assistant
 
         public static async Task Main(string[] args)
         {
-            // Model bake-off mode (`--bakeoff` / LAITH_BAKEOFF=1): score whichever
-            // model LM Studio has loaded against bakeoff/llm/cases.json using the
-            // real tool registry and the real DetectToolAsync, then exit. Built
-            // before anything else so it needs no mic, speakers, Python, or API
-            // keys — only the LLM endpoint. See bakeoff/llm/README.md.
-            if (BakeoffHarness.IsRequested(args))
-            {
-                await BakeoffHarness.RunAsync(
-                    BuildRegistry(new CommandContext { Contacts = LoadContacts() }), args);
-                return;
-            }
-
             CheckEnvironmentVariables();
 
             // 49 (ASCII art)

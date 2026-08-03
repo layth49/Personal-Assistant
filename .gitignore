@@ -363,3 +363,6 @@ MigrationBackup/
 FodyWeavers.xsd
 # Local machine paths for docker compose (personal file locations)
 .env
+# Model bake-off harnesses, recordings and results. Kept local: they run against
+# personal voice recordings and real contact names.
+bakeoff/

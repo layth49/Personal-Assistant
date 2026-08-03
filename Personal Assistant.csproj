@@ -442,7 +442,6 @@
     <Compile Include="AppLauncher.cs" />
     <Compile Include="Arduino.cs" />
     <Compile Include="AudioController.cs" />
-    <Compile Include="bakeoff\llm\BakeoffHarness.cs" />
     <Compile Include="ContinuousListener.cs" />
     <Compile Include="ConversationMemory.cs" />
     <Compile Include="EchoGuard.cs" />
@@ -489,9 +488,6 @@
   </ItemGroup>
   <ItemGroup>
     <Content Include="AutoRemotePlay.py">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
-    <Content Include="bakeoff\llm\cases.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="logo.ico" />

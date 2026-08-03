@@ -41,9 +41,11 @@ This branch runs entirely on-device — no Azure / Gemini keys required:
 | Parakeet STT — [`stt-server/`](stt-server/) (Docker, CPU) | Azure Speech-to-Text | 8001 |
 | Kokoro-FastAPI (Docker) | Azure Neural TTS | 8880 |
 
-Both model choices were settled by bake-off rather than by reputation — see
-[`bakeoff/stt/README.md`](bakeoff/stt/README.md) and
-[`bakeoff/llm/README.md`](bakeoff/llm/README.md) for the tables.
+Both model choices were settled by bake-off rather than by reputation: Parakeet
+won on word error rate over contact names and command arguments, and
+`qwen3-4b-2507` on tool-call accuracy against the real registry. The harnesses
+score candidates on personal voice recordings and contact names, so they are
+kept locally and not published.
 faster-whisper-server is still in `docker-compose.yml` but behind a `whisper`
 profile: it lost the bake-off, and its ~2.2 GB of VRAM is better spent on the LLM.
 
