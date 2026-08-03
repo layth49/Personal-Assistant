@@ -20,14 +20,6 @@ namespace Personal_Assistant.SMSController
 
         private readonly InputSimulator simulator = new InputSimulator();
 
-        // The one running instance — never `new SpeechService()`. This handler is
-        // where that bug did its worst damage: its own instance waited on a
-        // microphone it didn't own, so RecognizeOnceAsync below returned "" and
-        // an empty message was handed to Phone Link and actually sent, while the
-        // prompts it spoke escaped the echo gate and queued up as fresh turns.
-        // A property, not a field, so there is no construction-order trap.
-        private static SpeechService speechManager => SpeechService.Current;
-
         // The canned message behind "text her to introduce yourself".
         private const string IntroductionText =
             "Hello! This was sent by L.A.I.T.H.49, AKA Layth's Logical Assistant for Intelligent Task Handling 49!";

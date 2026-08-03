@@ -7,11 +7,6 @@ namespace Personal_Assistant.LightAutomator
     public class LightControl
     {
         public ToolResult TurnOnLights(string lightName, string ipAddress) => Toggle(lightName, ipAddress, on: true);
-        // The one running instance — never `new SpeechService()`. A second one
-        // owns none of the audio state the rest of the app reads, so everything
-        // it says escapes the echo gate and everything it hears times out.
-        // A property, not a field, so there is no construction-order trap.
-        private static SpeechService speechManager => SpeechService.Current;
 
         public ToolResult TurnOffLights(string lightName, string ipAddress) => Toggle(lightName, ipAddress, on: false);
 
