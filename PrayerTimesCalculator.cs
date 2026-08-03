@@ -6,6 +6,12 @@ namespace Personal_Assistant.PrayerTimesCalculator
 {
     public class GetPrayerTimes
     {
+        // The one running instance — never `new SpeechService()`. A second one
+        // owns none of the audio state the rest of the app reads, so everything
+        // it says escapes the echo gate and everything it hears times out.
+        // A property, not a field, so there is no construction-order trap.
+        private static SpeechService speechManager => SpeechService.Current;
+
         private readonly double latitude;
         private readonly double longitude;
         private readonly CalculationMethods calculationMethod;

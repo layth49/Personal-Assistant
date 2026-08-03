@@ -52,16 +52,20 @@ def _r(n):
     """Scale a logical pixel value to supersampled render-space pixels."""
     return int(round(n * _DPI_SCALE * _SS))
 
+import atexit
+import threading
 import time
 import pygame
 import win32con
 import win32gui
 from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageFilter
 
-# Initialise pygame's display subsystem once. We only use it to host a native
-# window (for its HWND + event pump); all pixels are drawn with PIL and pushed
-# to the window via UpdateLayeredWindow, so no SDL rendering happens.
-pygame.display.init()
+# pygame's display subsystem is initialised by the bubble daemon thread at the
+# bottom of this module, NOT here. SDL requires that whichever thread creates a
+# window is also the one that pumps its messages, and the daemon owns the window
+# for the life of the process. We only use pygame to host a native window (for
+# its HWND + event pump); all pixels are drawn with PIL and pushed to the window
+# via UpdateLayeredWindow, so no SDL rendering happens.
 
 # ── Appearance ──────────────────────────────────────────────────────────────
 BG_COLOR = (30, 31, 34, 214)          # translucent "glass" panel
@@ -454,79 +458,271 @@ def _ease_in(t):
     return t * t * t
 
 
-def show_bubble(user_input, ai_response, state):
-    t0 = time.perf_counter()
-    def log(msg):
-        print(f"[py t+{int((time.perf_counter()-t0)*1000)}ms] {msg}", flush=True)
+# ── Persistent bubble daemon ────────────────────────────────────────────────
+# One long-lived thread owns the SDL window and every Win32 call for the life of
+# the process. This replaces the old model where show_bubble ran the whole
+# enter/hold/exit cycle inline on the caller's thread and created + destroyed the
+# window each call — which parked the C# turn loop for the length of every
+# utterance, and could hang set_mode for ~20s when the window was reused.
+#
+# Callers now just post a job and return immediately. The daemon watches the
+# `state` dict that C# owns: it holds the bubble while state["running"] is truthy
+# and animates out once C# flips it to False (which SynthesizeTextToSpeech does
+# when Kokoro playback finishes or is cut short).
 
-    log("show_bubble: entered")
+HOLD_TIMEOUT = 120.0        # retract anyway if C# never clears "running"
+IDLE_POLL = 0.02            # event-pump cadence while idle / holding
+FRAME_SLEEP = 0.006         # ~166fps during the enter/exit animations
 
-    if not pygame.display.get_init():
+_lock = threading.Lock()
+_pending = None             # (user_input, ai_response, state) awaiting the daemon
+_pending_update = None      # (user_input, ai_response) to re-render without animating
+_hide_requested = False
+_stopping = False
+_thread = None
+
+
+def _log(msg):
+    print(f"[bubble] {msg}", flush=True)
+
+
+def _take_pending():
+    global _pending, _pending_update
+    with _lock:
+        job, _pending = _pending, None
+        if job is not None:
+            _pending_update = None   # an update aimed at the outgoing bubble
+        return job
+
+
+def _take_update():
+    global _pending_update
+    with _lock:
+        upd, _pending_update = _pending_update, None
+        return upd
+
+
+def _hold_interrupted():
+    """True when a newer bubble has been posted or a hide was requested — either
+    way the current one should start animating out."""
+    with _lock:
+        return _pending is not None or _hide_requested or _stopping
+
+
+def _still_running(state):
+    """Read the shared dict C# posted with the job. A missing/unreadable key means
+    'stop holding' rather than an exception on the daemon thread."""
+    if state is None:
+        return False
+    try:
+        return bool(state["running"])
+    except Exception:
+        return False
+
+
+PARKED_POS = -10000         # where the window waits between bubbles
+
+
+class _BubbleWindow:
+    """Owns the layered window. Every method here runs on the daemon thread."""
+
+    def __init__(self):
+        # Create the native window off-screen so SDL's initial frame is never
+        # seen; the layered content we push is what actually becomes visible.
+        os.environ["SDL_VIDEO_WINDOW_POS"] = f"{PARKED_POS},{PARKED_POS}"
         pygame.display.init()
+        pygame.display.set_mode((16, 16), pygame.NOFRAME)
+        pygame.display.set_caption("")
+        self.hwnd = pygame.display.get_wm_info()["window"]
 
-    img, box_left, box_top, box_w, box_h = _build_image(user_input, ai_response)
-    img_w, img_h = img.size
-    log("image composed")
+        # Per-pixel-alpha layered window, hidden from taskbar/alt-tab.
+        # WS_EX_NOACTIVATE matters now that the window outlives a single bubble:
+        # a persistent top-most window must never take focus from the user.
+        ex = win32gui.GetWindowLong(self.hwnd, win32con.GWL_EXSTYLE)
+        ex = (ex | win32con.WS_EX_LAYERED | win32con.WS_EX_TOOLWINDOW
+                 | win32con.WS_EX_NOACTIVATE) & ~win32con.WS_EX_APPWINDOW
+        win32gui.SetWindowLong(self.hwnd, win32con.GWL_EXSTYLE, ex)
 
-    # Create the native window off-screen so SDL's initial frame is never seen;
-    # the layered content we push is what actually becomes visible.
-    os.environ["SDL_VIDEO_WINDOW_POS"] = "-10000,-10000"
-    pygame.display.set_mode((img_w, img_h), pygame.NOFRAME)
-    hwnd = pygame.display.get_wm_info()["window"]
-    pygame.display.set_caption("")
-    log("window created")
+        self.dib = None
+        self.x = 0
+        self.target_y = 0
+        self.start_y = 0
 
-    # Per-pixel-alpha layered window, hidden from taskbar/alt-tab.
-    ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-    ex = (ex | win32con.WS_EX_LAYERED | win32con.WS_EX_TOOLWINDOW) & ~win32con.WS_EX_APPWINDOW
-    win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex)
+        # A 1x1 fully transparent layer, reused every time the bubble retracts.
+        # The window is NEVER hidden with SW_HIDE: UpdateLayeredWindow refuses to
+        # draw to a hidden window (fails with ERROR_INVALID_PARAMETER), which
+        # would leave every bubble invisible. "Hidden" is therefore expressed as
+        # zero-alpha content parked off-screen — which also keeps the window
+        # click-through, since per-pixel-alpha windows pass hit-testing through
+        # transparent pixels.
+        self.blank = _image_to_dib(Image.new("RGBA", (1, 1), (0, 0, 0, 0)))
+        self.park()
 
-    work = _active_work_area()
-    window_x = work.left + ((work.right - work.left) - img_w) // 2
-    # Align the *visible panel* (not the padded image) a fixed margin above the taskbar.
-    target_y = work.bottom - MARGIN_BOTTOM - (box_top + box_h)
-    start_y = target_y + SLIDE_DISTANCE
+    def pump(self):
+        pygame.event.pump()
 
-    dib = _image_to_dib(img)
-    _push(hwnd, dib, window_x, start_y, 0)
-    win32gui.SetWindowPos(
-        hwnd, win32con.HWND_TOPMOST, window_x, start_y, img_w, img_h,
-        win32con.SWP_NOACTIVATE,
-    )
-    log("entering main loop")
+    def show(self, user_input, ai_response, at_rest=False):
+        """Compose the bubble and present it.
+
+        Default (at_rest=False) leaves it fully transparent at the pre-slide
+        position, ready to animate in. at_rest=True presents it opaque at its
+        resting position instead — that's an in-place text swap for a bubble
+        already on screen, with no re-animation.
+        """
+        img, _box_left, box_top, _box_w, box_h = _build_image(user_input, ai_response)
+        img_w, img_h = img.size
+
+        work = _active_work_area()
+        self.x = work.left + ((work.right - work.left) - img_w) // 2
+        # Align the *visible panel* (not the padded image) a fixed margin above
+        # the taskbar.
+        self.target_y = work.bottom - MARGIN_BOTTOM - (box_top + box_h)
+        self.start_y = self.target_y + SLIDE_DISTANCE
+
+        self._release_dib()
+        self.dib = _image_to_dib(img)
+
+        y = self.target_y if at_rest else self.start_y
+        alpha = 255 if at_rest else 0
+
+        # Move/resize the window into place while it still carries the previous
+        # layer, then push this bubble's pixels. SetWindowPos also re-asserts
+        # top-most, which a long-lived window can otherwise lose to whatever the
+        # user brought forward since the last bubble.
+        win32gui.SetWindowPos(
+            self.hwnd, win32con.HWND_TOPMOST, self.x, y, img_w, img_h,
+            win32con.SWP_NOACTIVATE,
+        )
+        _push(self.hwnd, self.dib, self.x, y, alpha)
+
+    def animate(self, from_y, to_y, from_alpha, to_alpha, duration, ease):
+        t0 = time.perf_counter()
+        while True:
+            t = min(1.0, (time.perf_counter() - t0) / duration)
+            p = ease(t)
+            _push(self.hwnd, self.dib,
+                  self.x, from_y + (to_y - from_y) * p,
+                  int(from_alpha + (to_alpha - from_alpha) * p))
+            self.pump()
+            if t >= 1.0:
+                return
+            time.sleep(FRAME_SLEEP)
+
+    def park(self):
+        """Blank the window and move it off-screen — this is what 'hidden' means
+        here (see the note on self.blank)."""
+        _push(self.hwnd, self.blank, PARKED_POS, PARKED_POS, 0)
+        self._release_dib()
+
+    def close(self):
+        self.park()
+        _free_dib(self.blank)
+
+    def _release_dib(self):
+        if self.dib is not None:
+            _free_dib(self.dib)
+            self.dib = None
+
+
+def _run_job(win, job):
+    user_input, ai_response, state = job
+    win.show(user_input, ai_response)
+
+    # Enter: slide up + fade in (ease-out).
+    win.animate(win.start_y, win.target_y, 0, 255, ENTER_DURATION, _ease_out)
+
+    # Hold until C# flips state["running"] to False (or a newer bubble arrives).
+    # While holding, a posted update swaps the text in place — that's how a
+    # streamed reply grows sentence by sentence alongside the audio.
+    deadline = time.perf_counter() + HOLD_TIMEOUT
+    while _still_running(state) and not _hold_interrupted():
+        if time.perf_counter() > deadline:
+            _log("hold timed out — retracting")
+            break
+        update = _take_update()
+        if update is not None:
+            win.show(update[0], update[1], at_rest=True)
+        win.pump()
+        time.sleep(IDLE_POLL)
+
+    # Exit: slide down + fade out (ease-in).
+    win.animate(win.target_y, win.target_y + SLIDE_DISTANCE, 255, 0, EXIT_DURATION, _ease_in)
+    win.park()
+
+
+def _daemon():
+    global _hide_requested
+    try:
+        win = _BubbleWindow()
+    except Exception as ex:
+        _log(f"window init failed, bubbles disabled: {ex}")
+        return
+
+    while not _stopping:
+        job = _take_pending()
+        if job is None:
+            win.pump()
+            time.sleep(IDLE_POLL)
+            continue
+        with _lock:
+            _hide_requested = False
+        try:
+            _run_job(win, job)
+        except Exception as ex:
+            # A failed bubble must never kill the daemon — the next Say should
+            # still get one.
+            _log(f"bubble failed: {ex}")
+            try:
+                win.park()
+            except Exception:
+                pass
 
     try:
-        # Enter: slide up + fade in (ease-out).
-        anim_t0 = time.perf_counter()
-        while True:
-            t = min(1.0, (time.perf_counter() - anim_t0) / ENTER_DURATION)
-            p = _ease_out(t)
-            y = start_y + (target_y - start_y) * p
-            _push(hwnd, dib, window_x, y, int(255 * p))
-            pygame.event.pump()
-            if t >= 1.0:
-                break
-            time.sleep(0.006)
+        win.close()
+    except Exception:
+        pass
 
-        # Idle: hold in place until C# flips state["running"] to False.
-        while bool(state["running"]):
-            pygame.event.pump()
-            time.sleep(0.02)
 
-        # Exit: slide down + fade out (ease-in).
-        anim_t0 = time.perf_counter()
-        while True:
-            t = min(1.0, (time.perf_counter() - anim_t0) / EXIT_DURATION)
-            p = _ease_in(t)
-            y = target_y + SLIDE_DISTANCE * p
-            _push(hwnd, dib, window_x, y, int(255 * (1 - p)))
-            pygame.event.pump()
-            if t >= 1.0:
-                break
-            time.sleep(0.006)
-    finally:
-        _free_dib(dib)
-        # Tear the window down so the next call gets a fresh one. Reusing a
-        # hidden SDL window between calls caused set_mode to hang for ~20s and
-        # return a stale hwnd.
-        pygame.display.quit()
+def show_bubble(user_input, ai_response, state=None):
+    """Post a bubble to the daemon and return immediately (non-blocking).
+
+    `state` is the dict the caller owns; setting state["running"] = False is what
+    retracts the bubble. Posting a new bubble supersedes whatever is on screen.
+    """
+    global _pending, _pending_update, _hide_requested
+    with _lock:
+        _pending = (user_input, ai_response, state)
+        _pending_update = None
+        _hide_requested = False
+
+
+def update_bubble(user_input, ai_response):
+    """Replace the text of the bubble currently on screen, in place — no exit/enter
+    animation. Used by the streaming reply path to grow the bubble sentence by
+    sentence. A no-op if nothing is being held."""
+    global _pending_update
+    with _lock:
+        _pending_update = (user_input, ai_response)
+
+
+def hide_bubble():
+    """Retract the current bubble without waiting for its state dict to flip."""
+    global _hide_requested
+    with _lock:
+        _hide_requested = True
+
+
+def _shutdown():
+    """Stop the daemon before Py_Finalize tears the interpreter down, so the
+    thread isn't executing Python when C# calls PythonEngine.Shutdown()."""
+    global _stopping
+    _stopping = True
+    t = _thread
+    if t is not None:
+        t.join(timeout=1.5)
+
+
+atexit.register(_shutdown)
+
+_thread = threading.Thread(target=_daemon, name="SpeechBubble", daemon=True)
+_thread.start()
