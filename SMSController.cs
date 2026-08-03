@@ -4,8 +4,6 @@ using FlaUI.Core.Conditions;
 using FlaUI.Core.Input;
 using FlaUI.Core.WindowsAPI;
 using FlaUI.UIA3;
-using Personal_Assistant.SpeechManager;
-using Python.Runtime;
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -21,10 +19,45 @@ namespace Personal_Assistant.SMSController
         static extern bool SetForegroundWindow(IntPtr hWnd);
 
         private readonly InputSimulator simulator = new InputSimulator();
-        private readonly SpeechService speechManager = new SpeechService();
 
-        public async Task SendSMS(string contactName, string contactNumber)
+        // The canned message behind "text her to introduce yourself".
+        private const string IntroductionText =
+            "Hello! This was sent by L.A.I.T.H.49, AKA Layth's Logical Assistant for Intelligent Task Handling 49!";
+
+        // Sends `message` to `contactNumber` through Phone Link. Returns whether it
+        // was actually handed off.
+        //
+        // This used to dictate the body itself: it spoke "what would you like to
+        // send?", opened its own recognizer, read back, and opened another. All of
+        // that is gone — the body and the user's approval now arrive as tool
+        // arguments (Program.HandleSendSmsAsync), because a handler holding the
+        // microphone deadlocks a Gemini Live session, and because the recognizer it
+        // was trusting is what returned "" and sent a real empty text to a real
+        // number.
+        //
+        // The empty-body check below is deliberately redundant with the caller's.
+        // It is the last thing standing between a bad string and a real phone, and
+        // it costs nothing.
+        public async Task<bool> SendSMS(string contactName, string contactNumber, string message)
         {
+            message = (message ?? string.Empty).Trim();
+            if (message.Length == 0)
+            {
+                Console.WriteLine($"[sms] refusing to send an empty message to {contactName}.");
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(contactNumber))
+            {
+                Console.WriteLine($"[sms] no number for {contactName}.");
+                return false;
+            }
+
+            if (message.IndexOf("introduce yourself", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                message = IntroductionText;
+            }
+
             try
             {
                 Process.Start(new ProcessStartInfo("powershell",
@@ -33,45 +66,18 @@ namespace Personal_Assistant.SMSController
                     UseShellExecute = true
                 });
 
+                // Phone Link needs a moment to come up before it can be focused;
+                // the dictation prompt used to provide that delay for free.
+                await Task.Delay(1500);
                 FocusPhoneLink();
 
-                const int maxAttempts = 3;
-                for (int attempt = 0; attempt < maxAttempts; attempt++)
-                {
-                    await speechManager.Say(Program.recognizedText, $"Okay! What would you like to send {contactName}?");
-
-                    string userText = await speechManager.RecognizeOnceAsync();
-
-                    if (userText.IndexOf("Introduce yourself", StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        FocusPhoneLink();
-                        SendMessageToContact(contactNumber,
-                            "Hello! This was sent by L.A.I.T.H.49, AKA Layth's Logical Assistant for Intelligent Task Handling 49!");
-
-                        await speechManager.Say(userText, $"Okay! Introducing myself to {contactName}.");
-                        return;
-                    }
-
-                    await speechManager.Say(userText, $"You'd like to send \"{userText}\" to {contactName}. Is that correct?");
-
-                    string confirmation = await speechManager.RecognizeOnceAsync();
-
-                    if (confirmation.IndexOf("no", StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        await speechManager.Say(confirmation, "Okay, message cancelled.");
-                        continue;
-                    }
-
-                    FocusPhoneLink();
-                    SendMessageToContact(contactNumber, userText);
-
-                    await speechManager.Say(userText, $"Sending \"{userText}\" to {contactName}.");
-                    return;
-                }
+                SendMessageToContact(contactNumber, message);
+                return true;
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error: {ex.Message}");
+                return false;
             }
         }
 
@@ -85,6 +91,13 @@ namespace Personal_Assistant.SMSController
 
         public void SendMessageToContact(string contactNumber, string message)
         {
+            // Public, so it gets its own check rather than inheriting the caller's.
+            if (string.IsNullOrWhiteSpace(message))
+            {
+                Console.WriteLine("[sms] refusing to send an empty message.");
+                return;
+            }
+
             Console.WriteLine($"Sending message to {contactNumber}: {message}");
 
             // Phone Link usually runs under this process name
