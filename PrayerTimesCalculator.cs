@@ -1,14 +1,11 @@
 ﻿using System;
-using System.Threading.Tasks;
 using PrayTimes;
-using Personal_Assistant.SpeechManager;
+using Personal_Assistant.Dispatch;
 
 namespace Personal_Assistant.PrayerTimesCalculator
 {
     public class GetPrayerTimes
     {
-        private readonly SpeechService speechManager = new SpeechService();
-
         private readonly double latitude;
         private readonly double longitude;
         private readonly CalculationMethods calculationMethod;
@@ -52,7 +49,16 @@ namespace Personal_Assistant.PrayerTimesCalculator
                 { "Isha",    "ʕiʃaːʔ" },     // EE-shah
             };
 
-        public async Task AnnouncePrayerTimes(DateTime date)
+        // Today's prayer times as a result: one SSML block carrying the phonemes,
+        // the plain-text equivalent for the bubble, and every prayer as its own
+        // data key so the Live model can answer "when is Maghrib?" from the times
+        // rather than from memory.
+        //
+        // This used to speak the five prayers as five separate utterances, each
+        // with its own bubble. They are one utterance and one bubble now, because
+        // a result is voiced once by whoever is doing the voicing — the sequence
+        // was only possible while the handler owned the speaker.
+        public ToolResult DescribePrayerTimes(DateTime date)
         {
             Times prayerTimes = CalculatePrayerTimes(date);
             bool isFriday = date.DayOfWeek == DayOfWeek.Friday;
@@ -60,6 +66,13 @@ namespace Personal_Assistant.PrayerTimesCalculator
             string[] prayers = isFriday
                 ? new[] { "Fajr", "Jumuah", "Asr", "Maghrib", "Isha" }
                 : new[] { "Fajr", "Dhuhr", "Asr", "Maghrib", "Isha" };
+
+            var spoken = new System.Text.StringBuilder();
+            var plain = new System.Text.StringBuilder();
+            var result = ToolResult.None;
+
+            spoken.Append("<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>");
+            spoken.Append("<voice name='en-US-AndrewMultilingualNeural'>");
 
             for (int i = 0; i < prayers.Length; i++)
             {
@@ -70,16 +83,21 @@ namespace Personal_Assistant.PrayerTimesCalculator
                     ? $"<phoneme alphabet='ipa' ph='{ipa}'>{name}</phoneme>"
                     : name;
 
-                string ssml =
-                    "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>" +
-                    "<voice name='en-US-AndrewMultilingualNeural'>" +
-                    $"{spokenName} is at {time12h}" +
-                    "</voice></speak>";
+                spoken.Append($"{spokenName} is at {time12h}. ");
+                if (plain.Length > 0) plain.Append(' ');
+                plain.Append($"{name} is at {time12h}.");
 
-                var synthTask = speechManager.SynthesizeSsmlAsync(ssml);
-                speechManager.SpeechBubble(string.Empty, $"{name} is at: {time12h}");
-                await synthTask;
+                result = result.With(name.ToLowerInvariant(), time12h);
             }
+
+            spoken.Append("</voice></speak>");
+
+            ToolResult withSsml = ToolResult.SpeakSsml(plain.ToString(), spoken.ToString());
+            foreach (System.Collections.Generic.KeyValuePair<string, string> kv in result.Data)
+            {
+                withSsml = withSsml.With(kv.Key, kv.Value);
+            }
+            return withSsml.With("date_local", date.ToString("yyyy-MM-dd"));
         }
 
         private static TimeSpan GetPrayerTime(Times times, string prayerName)

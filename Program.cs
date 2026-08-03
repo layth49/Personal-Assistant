@@ -26,7 +26,7 @@ using System.Threading.Tasks;
 
 namespace Personal_Assistant
 {
-    class Program
+    public class Program
     {
         public static readonly string weatherAPIKey = Environment.GetEnvironmentVariable("WEATHERAPI_KEY");
 
@@ -214,8 +214,11 @@ namespace Personal_Assistant
                 conversationMemory,
                 latency);
 
-            // Let the `repeat` tool run other tools by name (validated).
-            context.RunTool = dispatcher.RunToolByNameAsync;
+            // Let the `repeat` tool run other tools by name (validated). Speaking
+            // is explicit rather than defaulted: the repeated actions are the only
+            // thing the user hears on this path, and a method group would silently
+            // bind whatever the default happened to be.
+            context.RunTool = (name, args) => dispatcher.RunToolByNameAsync(name, args, speak: true);
 
             // When the user barges in over a spoken reply with the wakeword, we
             // skip the wakeword wait + greeting on the next turn and listen for
@@ -276,7 +279,12 @@ namespace Personal_Assistant
         // schema (for Gemini dispatch) plus a keyword predicate + arg extractor
         // (for the fallback path). Registration order == the original if/else
         // order, so "first keyword match wins" is preserved on fallback.
-        private static ToolRegistry BuildRegistry(CommandContext context)
+        // Public so the Live smoke harness can drive the REAL tool catalogue.
+        // It built its own stub registry once, which meant a test that "passed"
+        // was only ever exercising its own fake handlers — it reported a working
+        // tool round trip while the actual one was still handing the model
+        // {"result":"done"} and letting it invent the answer.
+        public static ToolRegistry BuildRegistry(CommandContext context)
         {
             var registry = new ToolRegistry();
 
@@ -284,8 +292,8 @@ namespace Personal_Assistant
                 ToolDefinition.Create("who_are_you",
                     "Introduce the assistant when the user asks who or what it is."),
                 lower => lower == "who are you?",
-                (ctx, args) => ctx.Speech.Say(ctx.RecognizedText,
-                    "Hi! I'm L.A.I.T.H.49, your own personal assistant!")));
+                (ctx, args) => Task.FromResult(ToolResult.Speak(
+                    "Hi! I'm L.A.I.T.H.49, your own personal assistant!"))));
 
             registry.Add(new VoiceCommand(
                 ToolDefinition.Create("exit_assistant",
@@ -293,6 +301,10 @@ namespace Personal_Assistant
                 lower => lower.Contains("exit"),
                 async (ctx, args) =>
                 {
+                    // The one handler that still speaks for itself, because it
+                    // never returns: Environment.Exit runs before any caller could
+                    // voice a result. Awaiting the goodbye is what keeps it from
+                    // being cut off mid-word by the process ending.
                     await ctx.Speech.Say(ctx.RecognizedText, "Alright goodbye!");
                     PythonEngine.Shutdown();
                     Environment.Exit(0);
@@ -302,22 +314,36 @@ namespace Personal_Assistant
                 ToolDefinition.Create("never_mind",
                     "Cancel or dismiss the current request without doing anything."),
                 lower => lower.Contains("never mind") || lower.Contains("nevermind"),
-                (ctx, args) => ctx.Speech.Say(ctx.RecognizedText,
-                    "Okay! Let me know if you need anything else.")));
+                (ctx, args) => Task.FromResult(ToolResult.Speak(
+                    "Okay! Let me know if you need anything else."))));
 
             registry.Add(new VoiceCommand(
                 ToolDefinition.Create("get_time",
                     "Tell the user the current time of day."),
                 lower => lower == "what time is it?" || lower == "what's the time?",
-                (ctx, args) => ctx.Speech.Say(ctx.RecognizedText,
-                    $"It's {DateTime.Now.ToLocalTime():t}")));
+                (ctx, args) =>
+                {
+                    DateTime now = DateTime.Now;
+                    // The 24-hour value and the zone go along for the ride so the
+                    // model states the user's ACTUAL local time. Given only a
+                    // sentence it will happily re-derive one and get it wrong —
+                    // this tool is why: it announced "7:20 AM UTC" for 2:20 AM.
+                    return Task.FromResult(ToolResult.Speak($"It's {now:t}")
+                        .With("time_local", now.ToString("HH:mm"))
+                        .With("time_zone", TimeZoneInfo.Local.StandardName));
+                }));
 
             registry.Add(new VoiceCommand(
                 ToolDefinition.Create("get_date",
                     "Tell the user today's date / what day it is."),
                 lower => lower == "what day is it?",
-                (ctx, args) => ctx.Speech.Say(ctx.RecognizedText,
-                    $"It's {DateTime.Now.Date:D}")));
+                (ctx, args) =>
+                {
+                    DateTime today = DateTime.Now.Date;
+                    return Task.FromResult(ToolResult.Speak($"It's {today:D}")
+                        .With("date_local", today.ToString("yyyy-MM-dd"))
+                        .With("weekday", today.DayOfWeek.ToString()));
+                }));
 
             registry.Add(new VoiceCommand(
                 ToolDefinition.Create("google_search",
@@ -325,11 +351,12 @@ namespace Personal_Assistant
                     new ToolParameter("query", "string",
                         "The search terms to look up on Google.")),
                 lower => lower.StartsWith("search up") || lower.StartsWith("google"),
-                async (ctx, args) =>
+                (ctx, args) =>
                 {
                     string query = args["query"];
-                    await ctx.Speech.Say(ctx.RecognizedText, $"Okay! Searching up {query} now");
                     Process.Start("https://www.google.com/search?q=" + Uri.EscapeDataString(query));
+                    return Task.FromResult(ToolResult.Speak($"Okay! Searching up {query} now")
+                        .With("query", query));
                 },
                 text =>
                 {
@@ -349,10 +376,10 @@ namespace Personal_Assistant
                 ToolDefinition.Create("open_visual_studio",
                     "Open Visual Studio for coding."),
                 lower => lower.Contains("visual studio") || lower.Contains("code") || lower.Contains("coding"),
-                async (ctx, args) =>
+                (ctx, args) =>
                 {
-                    await ctx.Speech.Say(ctx.RecognizedText, "Okay! Opening Visual Studio now.");
                     Process.Start("devenv");
+                    return Task.FromResult(ToolResult.Speak("Okay! Opening Visual Studio now."));
                 }));
 
             registry.Add(new VoiceCommand(
@@ -371,13 +398,14 @@ namespace Personal_Assistant
                         "Which light to control.",
                         AllowedValues: new[] { "LED", "bedroom" })),
                 lower => (lower.Contains("turn on") || lower.Contains("turn off")) && lower.Contains("light"),
-                async (ctx, args) =>
+                (ctx, args) =>
                 {
                     string state = args["state"];
                     string room = args["room"];
                     string ip = room == "LED" ? ctx.IpAddressPlug : ctx.IpAddressSwitch;
-                    if (state == "on") await ctx.Lights.TurnOnLights(room, ip);
-                    else await ctx.Lights.TurnOffLights(room, ip);
+                    return Task.FromResult(state == "on"
+                        ? ctx.Lights.TurnOnLights(room, ip)
+                        : ctx.Lights.TurnOffLights(room, ip));
                 },
                 text =>
                 {
@@ -398,8 +426,13 @@ namespace Personal_Assistant
                          !lower.Contains("tomorrow") && !lower.Contains("this week") && !lower.Contains("next few days"),
                 async (ctx, args) =>
                 {
-                    try { await ctx.Weather.GetWeatherData(); }
-                    catch (Exception ex) { Console.WriteLine("An error occurred: " + ex.Message); }
+                    try { return await ctx.Weather.GetWeatherData(); }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("An error occurred: " + ex.Message);
+                        return ToolResult.Failed(
+                            "Sorry, I couldn't get the weather right now.", ex.Message);
+                    }
                 }));
 
             registry.Add(new VoiceCommand(
@@ -418,8 +451,13 @@ namespace Personal_Assistant
                     int days = 3;
                     if (args.TryGetValue("days", out string d) && int.TryParse(d, out int parsed))
                         days = Math.Max(1, Math.Min(5, parsed));
-                    try { await ctx.Weather.GetForecastData(days); }
-                    catch (Exception ex) { Console.WriteLine("An error occurred: " + ex.Message); }
+                    try { return await ctx.Weather.GetForecastData(days); }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("An error occurred: " + ex.Message);
+                        return ToolResult.Failed(
+                            "Sorry, I ran into a problem getting the forecast.", ex.Message);
+                    }
                 },
                 text =>
                 {
@@ -440,13 +478,14 @@ namespace Personal_Assistant
                         double latitude = await ctx.Location.GetLatitude();
                         double longitude = await ctx.Location.GetLongitude();
                         var prayerTimesLogic = new GetPrayerTimes(latitude, longitude);
-                        await prayerTimesLogic.AnnouncePrayerTimes(DateTime.Now);
+                        return prayerTimesLogic.DescribePrayerTimes(DateTime.Now);
                     }
                     catch (InvalidOperationException ex)
                     {
                         Console.WriteLine($"Location lookup failed: {ex.Message}");
-                        await ctx.Speech.Say(ctx.RecognizedText,
-                            "Sorry, I couldn't get your location. Make sure Windows location services are enabled.");
+                        return ToolResult.Failed(
+                            "Sorry, I couldn't get your location. Make sure Windows location services are enabled.",
+                            ex.Message);
                     }
                 }));
 
@@ -485,16 +524,11 @@ namespace Personal_Assistant
                 lower => lower.Contains("door") && (lower.Contains("open") || lower.Contains("close")),
                 async (ctx, args) =>
                 {
-                    if (args["state"] == "open")
-                    {
-                        await ctx.Arduino.ArduinoCommunication("OPEN");
-                        await ctx.Speech.Say(ctx.RecognizedText, "Okay! Opening your door now.");
-                    }
-                    else
-                    {
-                        await ctx.Arduino.ArduinoCommunication("CLOSE");
-                        await ctx.Speech.Say(ctx.RecognizedText, "Okay! Closing your door now.");
-                    }
+                    bool opening = args["state"] == "open";
+                    await ctx.Arduino.ArduinoCommunication(opening ? "OPEN" : "CLOSE");
+                    return ToolResult
+                        .Speak(opening ? "Okay! Opening your door now." : "Okay! Closing your door now.")
+                        .With("door_state", opening ? "open" : "closed");
                 },
                 text =>
                 {
@@ -533,35 +567,47 @@ namespace Personal_Assistant
                         "Target volume as a percentage from 0 to 100. Only used when action is 'set'.",
                         Required: false)),
                 lower => lower.Contains("volume") || lower.Contains("mute"),
-                async (ctx, args) =>
+                (ctx, args) =>
                 {
+                    ToolResult result;
                     switch (args["action"])
                     {
                         case "up":
-                            await ctx.Speech.Say(ctx.RecognizedText,
-                                $"Volume's now at {ctx.Audio.VolumeUp()} percent.");
+                            int up = ctx.Audio.VolumeUp();
+                            result = ToolResult.Speak($"Volume's now at {up} percent.")
+                                .With("volume_percent", up.ToString());
                             break;
                         case "down":
-                            await ctx.Speech.Say(ctx.RecognizedText,
-                                $"Volume's now at {ctx.Audio.VolumeDown()} percent.");
+                            int down = ctx.Audio.VolumeDown();
+                            result = ToolResult.Speak($"Volume's now at {down} percent.")
+                                .With("volume_percent", down.ToString());
                             break;
                         case "mute":
                             ctx.Audio.Mute();
-                            await ctx.Speech.Say(ctx.RecognizedText, "Muted.");
+                            result = ToolResult.Speak("Muted.").With("muted", "true");
                             break;
                         case "unmute":
                             ctx.Audio.Unmute();
-                            await ctx.Speech.Say(ctx.RecognizedText, "Unmuted.");
+                            result = ToolResult.Speak("Unmuted.").With("muted", "false");
                             break;
                         case "set":
                             if (args.TryGetValue("level", out string lvl) && int.TryParse(lvl, out int target))
-                                await ctx.Speech.Say(ctx.RecognizedText,
-                                    $"Volume set to {ctx.Audio.SetVolume(target)} percent.");
+                            {
+                                int actual = ctx.Audio.SetVolume(target);
+                                result = ToolResult.Speak($"Volume set to {actual} percent.")
+                                    .With("volume_percent", actual.ToString());
+                            }
                             else
-                                await ctx.Speech.Say(ctx.RecognizedText,
-                                    "What level would you like the volume set to?");
+                            {
+                                result = ToolResult.Speak("What level would you like the volume set to?")
+                                    .With("needs", "level");
+                            }
+                            break;
+                        default:
+                            result = ToolResult.None;
                             break;
                     }
+                    return Task.FromResult(result);
                 },
                 text =>
                 {
@@ -586,18 +632,21 @@ namespace Personal_Assistant
                     "Capture a screenshot of the whole screen, save it, and open it."),
                 lower => lower.Contains("screenshot") || lower.Contains("screen shot") ||
                          (lower.Contains("capture") && lower.Contains("screen")),
-                async (ctx, args) =>
+                (ctx, args) =>
                 {
                     try
                     {
                         string path = ctx.Screenshot.Capture();
                         ctx.Screenshot.Open(path);
-                        await ctx.Speech.Say(ctx.RecognizedText, "Done! I took a screenshot and opened it for you.");
+                        return Task.FromResult(
+                            ToolResult.Speak("Done! I took a screenshot and opened it for you.")
+                                .With("path", path));
                     }
                     catch (Exception ex)
                     {
                         Console.WriteLine("Screenshot failed: " + ex.Message);
-                        await ctx.Speech.Say(ctx.RecognizedText, "Sorry, I couldn't take the screenshot.");
+                        return Task.FromResult(ToolResult.Failed(
+                            "Sorry, I couldn't take the screenshot.", ex.Message));
                     }
                 }));
 
@@ -610,16 +659,18 @@ namespace Personal_Assistant
                           lower.Contains("force quit")) &&
                          (lower.Contains("process") || lower.Contains("task") || lower.Contains("program") ||
                           lower.Contains("app")),
-                async (ctx, args) =>
+                (ctx, args) =>
                 {
-                    var result = ctx.Processes.KillByName(args["name"]);
-                    if (result.Killed > 0)
-                        await ctx.Speech.Say(ctx.RecognizedText,
-                            $"Closed {result.Killed} {result.MatchedName} " +
-                            $"{(result.Killed == 1 ? "process" : "processes")}.");
-                    else
-                        await ctx.Speech.Say(ctx.RecognizedText,
-                            $"I couldn't find a running process called {result.MatchedName}.");
+                    var killed = ctx.Processes.KillByName(args["name"]);
+                    ToolResult result = killed.Killed > 0
+                        ? ToolResult.Speak(
+                            $"Closed {killed.Killed} {killed.MatchedName} " +
+                            $"{(killed.Killed == 1 ? "process" : "processes")}.")
+                        : ToolResult.Speak(
+                            $"I couldn't find a running process called {killed.MatchedName}.");
+                    return Task.FromResult(result
+                        .With("matched_name", killed.MatchedName)
+                        .With("killed_count", killed.Killed.ToString()));
                 },
                 text =>
                 {
@@ -642,13 +693,14 @@ namespace Personal_Assistant
                     "Chrome, Spotify, OBS, Blender, Photoshop, Steam, Discord).",
                     new ToolParameter("name", "string", "The application name the user said.")),
                 lower => lower.StartsWith("open ") || lower.StartsWith("launch ") || lower.StartsWith("start "),
-                async (ctx, args) =>
+                (ctx, args) =>
                 {
-                    if (ctx.Apps.TryLaunch(args["name"], out string launched))
-                        await ctx.Speech.Say(ctx.RecognizedText, $"Opening {launched}.");
-                    else
-                        await ctx.Speech.Say(ctx.RecognizedText,
-                            $"Sorry, I couldn't find an app called {args["name"]}.");
+                    ToolResult result = ctx.Apps.TryLaunch(args["name"], out string launched)
+                        ? ToolResult.Speak($"Opening {launched}.").With("launched", launched)
+                        : ToolResult.Failed(
+                            $"Sorry, I couldn't find an app called {args["name"]}.",
+                            $"no Start-menu match for '{args["name"]}'");
+                    return Task.FromResult(result);
                 },
                 text =>
                 {
@@ -669,12 +721,14 @@ namespace Personal_Assistant
                 lower => (lower.Contains("switch") || lower.Contains("change") || lower.Contains("set")) &&
                          (lower.Contains("headphone") || lower.Contains("speaker") ||
                           lower.Contains("output") || lower.Contains("audio device") || lower.Contains("sound device")),
-                async (ctx, args) =>
+                (ctx, args) =>
                 {
                     string matched = ctx.Audio.SwitchOutputDevice(args["device"]);
                     if (matched != null)
                     {
-                        await ctx.Speech.Say(ctx.RecognizedText, $"Switched audio output to {matched}.");
+                        return Task.FromResult(
+                            ToolResult.Speak($"Switched audio output to {matched}.")
+                                .With("device", matched));
                     }
                     else
                     {
@@ -682,8 +736,13 @@ namespace Personal_Assistant
                         string list = available.Count > 0
                             ? string.Join(", ", available)
                             : "no active output devices";
-                        await ctx.Speech.Say(ctx.RecognizedText,
-                            $"I couldn't find an output device matching {args["device"]}. Available devices are: {list}.");
+                        // The device list goes back as data too: asked to switch to
+                        // something that isn't there, the model can offer what is.
+                        return Task.FromResult(ToolResult
+                            .Speak($"I couldn't find an output device matching {args["device"]}. " +
+                                   $"Available devices are: {list}.")
+                            .With("error", $"no output device matching '{args["device"]}'")
+                            .With("available_devices", list));
                     }
                 },
                 text =>
@@ -706,29 +765,31 @@ namespace Personal_Assistant
                          lower.Contains("play ") || lower == "play" || lower == "play." ||
                          lower.Contains("pause") || lower.Contains("resume") ||
                          lower.Contains("skip") || lower.Contains("next") || lower.Contains("previous"),
-                async (ctx, args) =>
+                (ctx, args) =>
                 {
+                    ToolResult result;
                     switch (args["action"])
                     {
                         case "next":
                             ctx.Media.Next();
-                            await ctx.Speech.Say(ctx.RecognizedText, "Skipping ahead.");
+                            result = ToolResult.Speak("Skipping ahead.").With("action", "next");
                             break;
                         case "previous":
                             ctx.Media.Previous();
-                            await ctx.Speech.Say(ctx.RecognizedText, "Going back.");
+                            result = ToolResult.Speak("Going back.").With("action", "previous");
                             break;
                         case "stop":
                             ctx.Media.Stop();
-                            await ctx.Speech.Say(ctx.RecognizedText, "Stopped.");
+                            result = ToolResult.Speak("Stopped.").With("action", "stop");
                             break;
                         // play, pause, and playpause all map to the play/pause
                         // toggle — the media key is a single toggle regardless.
                         default:
                             ctx.Media.PlayPause();
-                            await ctx.Speech.Say(ctx.RecognizedText, "Done.");
+                            result = ToolResult.Speak("Done.").With("action", "playpause");
                             break;
                     }
+                    return Task.FromResult(result);
                 },
                 text =>
                 {
@@ -751,10 +812,18 @@ namespace Personal_Assistant
                 {
                     var np = await ctx.NowPlaying.GetCurrentAsync();
                     string spoken = np?.Spoken();
-                    if (spoken != null)
-                        await ctx.Speech.Say(ctx.RecognizedText, $"This is {spoken}.");
-                    else
-                        await ctx.Speech.Say(ctx.RecognizedText, "Nothing seems to be playing right now.");
+                    if (spoken == null)
+                    {
+                        return ToolResult.Speak("Nothing seems to be playing right now.")
+                            .With("playing", "false");
+                    }
+                    // Title and artist separately as well as the spoken form, so a
+                    // follow-up ("who's the artist?") doesn't need the model to
+                    // re-parse the sentence it just said.
+                    return ToolResult.Speak($"This is {spoken}.")
+                        .With("playing", "true")
+                        .With("title", np.Title)
+                        .With("artist", np.Artist);
                 }));
 
             registry.Add(new VoiceCommand(
@@ -770,19 +839,23 @@ namespace Personal_Assistant
                 lower => lower.Contains("timer") ||
                          (lower.Contains("remind") && (lower.Contains(" in ") || lower.Contains("minute") ||
                                                        lower.Contains("hour") || lower.Contains("second"))),
-                async (ctx, args) =>
+                (ctx, args) =>
                 {
                     if (!args.TryGetValue("duration_seconds", out string ds) ||
                         !int.TryParse(ds, out int secs) || secs < 1)
                     {
-                        await ctx.Speech.Say(ctx.RecognizedText, "How long would you like the timer for?");
-                        return;
+                        return Task.FromResult(
+                            ToolResult.Speak("How long would you like the timer for?")
+                                .With("needs", "duration_seconds"));
                     }
                     string label = args.TryGetValue("label", out string l) ? l : null;
                     ctx.Reminders.AddTimer(secs, label);
                     string what = string.IsNullOrWhiteSpace(label) ? "" : $" to {label}";
-                    await ctx.Speech.Say(ctx.RecognizedText,
-                        $"Okay, I'll remind you{what} in {DescribeDuration(secs)}.");
+                    return Task.FromResult(ToolResult
+                        .Speak($"Okay, I'll remind you{what} in {DescribeDuration(secs)}.")
+                        .With("duration_seconds", secs.ToString())
+                        .With("label", label ?? string.Empty)
+                        .With("fires_at_local", DateTime.Now.AddSeconds(secs).ToString("HH:mm")));
                 },
                 text =>
                 {
@@ -817,25 +890,29 @@ namespace Personal_Assistant
                         Required: false)),
                 lower => lower.Contains("alarm") || lower.Contains("wake me") ||
                          (lower.Contains("remind") && lower.Contains(" at ")),
-                async (ctx, args) =>
+                (ctx, args) =>
                 {
                     if (!args.TryGetValue("time", out string timeText) || string.IsNullOrWhiteSpace(timeText))
                     {
-                        await ctx.Speech.Say(ctx.RecognizedText, "What time should I set it for?");
-                        return;
+                        return Task.FromResult(
+                            ToolResult.Speak("What time should I set it for?").With("needs", "time"));
                     }
                     string label = args.TryGetValue("label", out string l) ? l : null;
                     DateTime? fireAt = ctx.Reminders.AddAlarm(timeText, label);
                     if (fireAt == null)
                     {
-                        await ctx.Speech.Say(ctx.RecognizedText, $"Sorry, I didn't catch what time you meant.");
-                        return;
+                        return Task.FromResult(ToolResult.Failed(
+                            "Sorry, I didn't catch what time you meant.",
+                            $"could not parse '{timeText}' as a time"));
                     }
                     string what = string.IsNullOrWhiteSpace(label) ? "" : $" to {label}";
                     string when = fireAt.Value.Date == DateTime.Today
                         ? $"at {fireAt.Value:t}"
                         : $"tomorrow at {fireAt.Value:t}";
-                    await ctx.Speech.Say(ctx.RecognizedText, $"Okay, I'll remind you{what} {when}.");
+                    return Task.FromResult(ToolResult
+                        .Speak($"Okay, I'll remind you{what} {when}.")
+                        .With("fires_at_local", fireAt.Value.ToString("yyyy-MM-dd HH:mm"))
+                        .With("label", label ?? string.Empty));
                 },
                 text =>
                 {
@@ -853,16 +930,17 @@ namespace Personal_Assistant
                     "List the user's pending timers, alarms, and reminders."),
                 lower => (lower.Contains("list") || lower.Contains("what") || lower.Contains("any")) &&
                          (lower.Contains("timer") || lower.Contains("alarm") || lower.Contains("reminder")),
-                async (ctx, args) =>
+                (ctx, args) =>
                 {
                     var pending = ctx.Reminders.Pending();
                     if (pending.Count == 0)
                     {
-                        await ctx.Speech.Say(ctx.RecognizedText, "You have no timers or alarms set.");
-                        return;
+                        return Task.FromResult(
+                            ToolResult.Speak("You have no timers or alarms set.").With("count", "0"));
                     }
                     var sb = new System.Text.StringBuilder();
                     sb.Append($"You have {pending.Count} {(pending.Count == 1 ? "reminder" : "reminders")}: ");
+                    ToolResult result = ToolResult.None.With("count", pending.Count.ToString());
                     for (int i = 0; i < pending.Count; i++)
                     {
                         var p = pending[i];
@@ -871,8 +949,17 @@ namespace Personal_Assistant
                             : $"tomorrow at {p.FireAt:t}";
                         sb.Append(string.IsNullOrWhiteSpace(p.Label) ? when : $"{p.Label} at {when}");
                         sb.Append(i < pending.Count - 1 ? "; " : ".");
+
+                        // Each reminder numbered, so "cancel the second one" has
+                        // something to refer to.
+                        result = result
+                            .With($"reminder_{i + 1}_at", p.FireAt.ToString("yyyy-MM-dd HH:mm"))
+                            .With($"reminder_{i + 1}_label", p.Label ?? string.Empty);
                     }
-                    await ctx.Speech.Say(ctx.RecognizedText, sb.ToString());
+
+                    ToolResult spoken = ToolResult.Speak(sb.ToString());
+                    foreach (KeyValuePair<string, string> kv in result.Data) spoken = spoken.With(kv.Key, kv.Value);
+                    return Task.FromResult(spoken);
                 }));
 
             registry.Add(new VoiceCommand(
@@ -880,13 +967,14 @@ namespace Personal_Assistant
                     "Cancel all pending timers, alarms, and reminders."),
                 lower => lower.Contains("cancel") &&
                          (lower.Contains("timer") || lower.Contains("alarm") || lower.Contains("reminder")),
-                async (ctx, args) =>
+                (ctx, args) =>
                 {
                     int n = ctx.Reminders.CancelAll();
-                    await ctx.Speech.Say(ctx.RecognizedText,
-                        n == 0
+                    return Task.FromResult(ToolResult
+                        .Speak(n == 0
                             ? "There was nothing to cancel."
-                            : $"Cancelled {n} {(n == 1 ? "reminder" : "reminders")}.");
+                            : $"Cancelled {n} {(n == 1 ? "reminder" : "reminders")}.")
+                        .With("cancelled_count", n.ToString()));
                 }));
 
             // --- Composition primitives (LLM-only; no keyword path) ------------------
@@ -1072,6 +1160,22 @@ namespace Personal_Assistant
             return false;
         }
 
+        // ── Blocking sub-dialogs — deliberately NOT converted here ──────────────
+        //
+        // These still speak for themselves and open their own SpeechRecognizer,
+        // which is why they are the only handlers left holding a microphone. That
+        // is Phase 4a's scope, not this one: converting them means changing the
+        // SHAPE of the interaction (a confirmation becomes a tool round trip the
+        // model drives), and it carries a safety requirement — `confirmed` has to
+        // become a declared, validated parameter so a model cannot hallucinate its
+        // way to `shutdown /s /t 0`. Returning a ToolResult would not fix them; it
+        // would only hide that they still steal the mic.
+        //
+        // Note for Phase 4a: its brief lists three of these — shutdown, YouTube,
+        // and SMS. There is a FOURTH, PlaystationController.TurnOnPlaystation
+        // (PlaystationController.cs:56), which opens its own SpeechRecognizer to
+        // ask which game to load. It will deadlock a Live session exactly like the
+        // other three.
         private static async Task HandleYouTubeAsync(SpeechService speechManager)
         {
             await speechManager.Say(recognizedText, "Okay! Would you like a specific video or to just open it?");

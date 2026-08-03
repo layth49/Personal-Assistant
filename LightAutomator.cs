@@ -1,19 +1,19 @@
 ﻿using System;
 using System.Diagnostics;
-using System.Threading.Tasks;
-using Personal_Assistant.SpeechManager;
+using Personal_Assistant.Dispatch;
 
 namespace Personal_Assistant.LightAutomator
 {
     public class LightControl
     {
-        private readonly SpeechService speechManager = new SpeechService();
+        public ToolResult TurnOnLights(string lightName, string ipAddress) => Toggle(lightName, ipAddress, on: true);
 
-        public Task TurnOnLights(string lightName, string ipAddress) => Toggle(lightName, ipAddress, on: true);
+        public ToolResult TurnOffLights(string lightName, string ipAddress) => Toggle(lightName, ipAddress, on: false);
 
-        public Task TurnOffLights(string lightName, string ipAddress) => Toggle(lightName, ipAddress, on: false);
-
-        private async Task Toggle(string lightName, string ipAddress, bool on)
+        // Reports what it did instead of announcing it. The SpeechService this
+        // used to own was a second instance — silently useless in both directions
+        // and the class of bug that once sent a real empty SMS.
+        private ToolResult Toggle(string lightName, string ipAddress, bool on)
         {
             string verb = on ? "on" : "off";
 
@@ -31,10 +31,14 @@ namespace Personal_Assistant.LightAutomator
             catch (Exception ex)
             {
                 Console.WriteLine($"Error toggling {lightName} lights: {ex.Message}");
-                return;
+                return ToolResult.Failed(
+                    $"Sorry, I couldn't reach your {lightName} lights.", ex.Message);
             }
 
-            await speechManager.Say(Program.recognizedText, $"Okay! Turning your {lightName} lights {verb} now.");
+            return ToolResult
+                .Speak($"Okay! Turning your {lightName} lights {verb} now.")
+                .With("light", lightName)
+                .With("state", verb);
         }
     }
 }
