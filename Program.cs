@@ -116,6 +116,11 @@ namespace Personal_Assistant
             lines.AddRange(eveningGreetings);
             lines.AddRange(nightGreetings);
             lines.Add(Goodbye);
+
+            // Fired timers and alarms speak outside any Live session too. Must
+            // match ReminderService.Fire's wording exactly or the cache misses.
+            lines.Add("Your timer is done.");
+            lines.Add("Your alarm is going off.");
             return lines;
         }
 
@@ -220,8 +225,13 @@ namespace Personal_Assistant
             // A fired reminder has no user utterance, so use a clock as the
             // bubble's "you said" label — a nice reminder indicator now that the
             // bubble renders emoji. It's only shown, never spoken.
+            // SayClip, not Say: a fired timer speaks outside any Live session, so
+            // it was the last thing still answering in the Azure voice. The two
+            // unlabelled announcements are pre-rendered by --render-clips; a
+            // labelled reminder ("Reminder: take the bins out.") is user-supplied
+            // text that cannot be pre-rendered, and falls back to Azure.
             var reminders = new ReminderService(
-                message => speechManager.Say("⏰", message),
+                message => speechManager.SayClip("⏰", message),
                 timerWidgets);
 
             // Shared dependencies handed to every command handler.

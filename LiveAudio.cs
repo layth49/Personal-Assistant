@@ -65,12 +65,36 @@ namespace Personal_Assistant.LiveAudio
         // — enough to reject a click, fast enough that the pre-roll covers it.
         private const int OnsetFrames = 2;
 
-        // How long the gate stays open after the level drops. This doubles as
-        // the endpoint Phase 3 hangs activityEnd on, so it has to survive an
-        // ordinary pause mid-sentence. 800 ms is local-laith's measured value
-        // (bakeoff/stt/tail_sweep.py) rather than a guess.
-        private const int HangoverMs = 800;
-        private const int HangoverFrames = HangoverMs / BufferMs;
+        // How long the gate stays open after the level drops. This doubles as the
+        // endpoint activityEnd hangs on, so it has to survive an ordinary pause
+        // mid-sentence — when it doesn't, the model is handed half a sentence as
+        // a COMPLETE turn and answers the fragment.
+        //
+        // 800 ms was local-laith's measured value (bakeoff/stt/tail_sweep.py), but
+        // it was measured for a local STT endpointer, not as a conversational turn
+        // boundary. Observed failing here: "tell me how jet engines work" split
+        // into "some/how" + "works." across two turns, and a hesitant "I'm... set
+        // our... message saying hello to" split three ways. Fluent speech survived
+        // 800 ms fine; hesitation did not.
+        //
+        // Raised to 1200 ms, and tunable — this is a real trade, not a free win:
+        // every extra millisecond here is added latency before EVERY reply, since
+        // the model cannot start until activityEnd. Lower it if replies feel
+        // sluggish, raise it if sentences keep getting cut in half.
+        private static readonly int HangoverMs =
+            ReadInt("LAITH_LIVE_HANGOVER_MS", 1200, min: 300, max: 5000);
+        private static readonly int HangoverFrames = Math.Max(1, HangoverMs / BufferMs);
+
+        private static int ReadInt(string name, int fallback, int min, int max)
+        {
+            string raw = Environment.GetEnvironmentVariable(name);
+            if (!string.IsNullOrWhiteSpace(raw) &&
+                int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed))
+            {
+                return Math.Min(Math.Max(parsed, min), max);
+            }
+            return fallback;
+        }
 
         // Speakers are still sounding after the code thinks playback stopped.
         // Counted in FRAMES, not wall-clock: a frame count cannot drift from the
@@ -348,7 +372,7 @@ namespace Personal_Assistant.LiveAudio
                     $"[live-audio] utterance {utteranceFrames * BufferMs}ms  " +
                     $"peak={utterancePeak:F4} mean={mean:F4} " +
                     $"ambient={ambientFloor:F4} floor={UploadFloor:F4} " +
-                    $"headroom={headroom:F0}x");
+                    $"headroom={headroom:F0}x hangover={HangoverMs}ms");
             }
 
             gateOpen = false;
