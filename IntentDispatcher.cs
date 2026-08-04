@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Threading.Tasks;
 using Personal_Assistant.Diagnostics;
 
@@ -212,7 +213,23 @@ namespace Personal_Assistant.Dispatch
             if (!TryValidate(command.Tool, args, out var cleanArgs, out string error))
             {
                 Console.WriteLine($"[dispatch] RunTool: invalid args for '{name}': {error}");
-                return ToolResult.Failed(null, error);
+
+                // Tell the model what the parameters actually are, so a misnamed
+                // argument is a retry rather than a dead end. Observed:
+                // google_search called with `queries` instead of `query`, and the
+                // bare error left the model with no way to tell a rejected call
+                // from an empty result.
+                string expected = command.Tool?.Parameters == null || command.Tool.Parameters.Count == 0
+                    ? "(none)"
+                    : string.Join(", ", command.Tool.Parameters.Select(
+                        p => p.Required ? p.Name + " (required)" : p.Name));
+
+                return ToolResult
+                    .Failed(null, error)
+                    .With("instruction",
+                        $"The call was REJECTED and '{name}' did not run — do not describe its " +
+                        $"result. Retry with the correct parameters: {expected}")
+                    .With("expected_parameters", expected);
             }
             Console.WriteLine($"[dispatch] RunTool '{name}' args=[{Describe(cleanArgs)}]");
             return await RunAsync(command, cleanArgs, speak);

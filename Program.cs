@@ -536,9 +536,14 @@ namespace Personal_Assistant
 
             registry.Add(new VoiceCommand(
                 ToolDefinition.Create("google_search",
-                    "Open a Google web search for what the user wants to look up.",
+                    "Opens a Google results page in the user's browser. This is a BROWSER " +
+                    "ACTION, not a way to find things out: it returns no results to you and " +
+                    "shows the user a web page. Use it ONLY when the user asks to open, pull " +
+                    "up, or show a search — \"google X\", \"search up X\", \"show me results for " +
+                    "X\". To ANSWER a question about the world, use your own built-in Google " +
+                    "Search grounding and reply directly; never call this tool for that.",
                     new ToolParameter("query", "string",
-                        "The search terms to look up on Google.")),
+                        "The search terms to put in the browser's search box.")),
                 lower => lower.StartsWith("search up") || lower.StartsWith("google"),
                 (ctx, args) =>
                 {
@@ -1018,37 +1023,46 @@ namespace Personal_Assistant
                     "Control the currently playing music or video: play/pause, skip to the " +
                     "next track, go back to the previous track, or stop.",
                     new ToolParameter("action", "string",
-                        "The media action to perform.",
+                        "The media action to perform. Use 'play' to resume (including for " +
+                        "\"unpause\") and 'pause' to pause — both are explicit and safe to repeat. " +
+                        "Only use 'playpause' when the user genuinely means \"toggle\".",
                         AllowedValues: new[] { "playpause", "play", "pause", "next", "previous", "stop" })),
                 lower => lower.Contains("music") || lower.Contains("song") || lower.Contains("track") ||
                          lower.Contains("play ") || lower == "play" || lower == "play." ||
                          lower.Contains("pause") || lower.Contains("resume") ||
                          lower.Contains("skip") || lower.Contains("next") || lower.Contains("previous"),
-                (ctx, args) =>
+                async (ctx, args) =>
                 {
-                    ToolResult result;
                     switch (args["action"])
                     {
                         case "next":
                             ctx.Media.Next();
-                            result = ToolResult.Speak("Skipping ahead.").With("action", "next");
-                            break;
+                            return ToolResult.Speak("Skipping ahead.").With("action", "next");
                         case "previous":
                             ctx.Media.Previous();
-                            result = ToolResult.Speak("Going back.").With("action", "previous");
-                            break;
+                            return ToolResult.Speak("Going back.").With("action", "previous");
                         case "stop":
                             ctx.Media.Stop();
-                            result = ToolResult.Speak("Stopped.").With("action", "stop");
-                            break;
-                        // play, pause, and playpause all map to the play/pause
-                        // toggle — the media key is a single toggle regardless.
+                            return ToolResult.Speak("Stopped.").With("action", "stop");
+
+                        // play and pause are explicit and idempotent, NOT the
+                        // toggle they used to share. Asking to play something
+                        // already playing used to pause it, so repeated requests
+                        // fought each other and the video never resumed.
+                        case "play":
+                            return (await ctx.Media.PlayAsync())
+                                ? ToolResult.Speak("Playing.").With("action", "play")
+                                : ToolResult.Failed("Nothing is playing right now.", "no_media_session");
+                        case "pause":
+                            return (await ctx.Media.PauseAsync())
+                                ? ToolResult.Speak("Paused.").With("action", "pause")
+                                : ToolResult.Failed("Nothing is playing right now.", "no_media_session");
+
+                        // Only an explicit "playpause" still toggles.
                         default:
                             ctx.Media.PlayPause();
-                            result = ToolResult.Speak("Done.").With("action", "playpause");
-                            break;
+                            return ToolResult.Speak("Done.").With("action", "playpause");
                     }
-                    return Task.FromResult(result);
                 },
                 text =>
                 {
