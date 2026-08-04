@@ -535,7 +535,13 @@ namespace Personal_Assistant
                 }));
 
             registry.Add(new VoiceCommand(
-                ToolDefinition.Create("google_search",
+                // NOT named `google_search`. That is the name of Gemini's OWN
+                // built-in search tool, and declaring a function with the same
+                // name shadows it: the model's grounding calls (which carry a
+                // `queries` array, not our `query` string) were being routed here
+                // and rejected, so grounding never ran and the model answered
+                // from memory instead. Renaming frees the built-in name.
+                ToolDefinition.Create("open_web_search",
                     "Opens a Google results page in the user's browser. This is a BROWSER " +
                     "ACTION, not a way to find things out: it returns no results to you and " +
                     "shows the user a web page. Use it ONLY when the user asks to open, pull " +

@@ -215,10 +215,13 @@ namespace Personal_Assistant.Dispatch
                 Console.WriteLine($"[dispatch] RunTool: invalid args for '{name}': {error}");
 
                 // Tell the model what the parameters actually are, so a misnamed
-                // argument is a retry rather than a dead end. Observed:
-                // google_search called with `queries` instead of `query`, and the
-                // bare error left the model with no way to tell a rejected call
-                // from an empty result.
+                // argument is a retry rather than a dead end — the bare error
+                // left it unable to tell a rejected call from an empty result.
+                //
+                // The case that surfaced this was not really a misnaming: a
+                // custom tool named `google_search` was shadowing Gemini's
+                // built-in one, so grounding calls carrying a `queries` array
+                // landed here. That tool is now `open_web_search`.
                 string expected = command.Tool?.Parameters == null || command.Tool.Parameters.Count == 0
                     ? "(none)"
                     : string.Join(", ", command.Tool.Parameters.Select(
