@@ -204,6 +204,11 @@ namespace Personal_Assistant.Live
         // retracts it, which is exactly what HideBubble exists for.
         private readonly object bubbleSync = new object();
         private readonly StringBuilder replyText = new StringBuilder();
+
+        // The user's current utterance, accumulated across streamed fragments.
+        private readonly StringBuilder inputText = new StringBuilder();
+        private bool inputTurnClosed = true;
+
         private bool bubbleShown;
         private DateTime lastBubbleUpdateUtc;
 
@@ -229,6 +234,31 @@ namespace Personal_Assistant.Live
             this.limits = limits ?? new LiveSessionLimits();
             this.options = options ?? new LiveSessionOptions();
             if (this.options.Tools == null) this.options.Tools = tools;
+            this.options.SystemInstruction += BuildNameHints(this.context);
+        }
+
+        // The same model does transcription and reasoning, so the proper nouns it
+        // is likely to mishear are worth naming up front. Observed failures:
+        // "Layth" -> "to life", "L.A.I.T.H. 49" -> "Vade forty-nine",
+        // "Layth" -> "Leith"/"Lathe". There is no phrase-list/speech-context
+        // parameter on the Live API the way Azure has boost_phrases, so the
+        // system instruction is the only place to bias this.
+        private static string BuildNameHints(CommandContext context)
+        {
+            var sb = new StringBuilder();
+            sb.Append(" Speech recognition note: the user is Layth (rhymes with \"faith\"), and you are ");
+            sb.Append("L.A.I.T.H.49, spoken \"Laith forty-nine\". Audio that sounds like \"Leith\", \"Lathe\", ");
+            sb.Append("\"to life\", \"Vade\" or \"Faith\" is almost certainly one of those two names — resolve it ");
+            sb.Append("that way rather than transcribing the homophone literally.");
+
+            if (context?.Contacts != null && context.Contacts.Count > 0)
+            {
+                sb.Append(" Known contact names, which are the only valid values for a contact argument: ");
+                sb.Append(string.Join(", ", context.Contacts.Keys));
+                sb.Append(". Map a name you hear to the closest one of these.");
+            }
+
+            return sb.ToString();
         }
 
         /// <summary>Why the last conversation ended. Meaningful once RunConversationAsync returns.</summary>
@@ -390,7 +420,7 @@ namespace Personal_Assistant.Live
             client.OutputTranscript += OnOutputTranscript;
             client.InputTranscript += text =>
             {
-                if (!string.IsNullOrWhiteSpace(text)) lastInputTranscript = text;
+                if (!string.IsNullOrWhiteSpace(text)) AppendInputTranscript(text);
                 Console.WriteLine($"[live-session] heard: {text}");
             };
 
@@ -499,6 +529,23 @@ namespace Personal_Assistant.Live
             ShowOrGrowBubble(text);
         }
 
+        // Input transcripts stream in per-syllable — "in" / "tro" / "duce yourself
+        // to Layth" is one utterance, not four. This used to overwrite, so the
+        // bubble's "you said" label showed only the final fragment.
+        private void AppendInputTranscript(string fragment)
+        {
+            lock (bubbleSync)
+            {
+                if (inputTurnClosed)
+                {
+                    inputText.Clear();
+                    inputTurnClosed = false;
+                }
+                inputText.Append(fragment);
+                lastInputTranscript = inputText.ToString().Trim();
+            }
+        }
+
         private void ShowOrGrowBubble(string fragment)
         {
             if (speech == null) return;
@@ -520,6 +567,11 @@ namespace Personal_Assistant.Live
                 {
                     bubbleShown = true;
                     post = true;
+
+                    // The assistant is replying, so the user's turn is over: the
+                    // next input fragment starts a fresh utterance rather than
+                    // extending the one now shown on the bubble.
+                    inputTurnClosed = true;
                 }
                 lastBubbleUpdateUtc = DateTime.UtcNow;
             }

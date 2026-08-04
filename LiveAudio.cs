@@ -111,6 +111,12 @@ namespace Personal_Assistant.LiveAudio
         private bool gateOpen;
         private int onsetFrames;
         private int silentFrames;
+        // Per-utterance signal stats, reported on gate close. Diagnostic only —
+        // nothing gates on these.
+        private double utterancePeak;
+        private double utteranceSum;
+        private int utteranceFrames;
+
         private readonly Queue<byte[]> preRoll = new Queue<byte[]>();
         private int preRollBytes;
         private double ambientFloor = 0.002;
@@ -275,6 +281,10 @@ namespace Personal_Assistant.LiveAudio
                 return;
             }
 
+            if (rms > utterancePeak) utterancePeak = rms;
+            utteranceSum += rms;
+            utteranceFrames++;
+
             if (loud)
             {
                 silentFrames = 0;
@@ -306,6 +316,9 @@ namespace Personal_Assistant.LiveAudio
             gateOpen = true;
             onsetFrames = 0;
             silentFrames = 0;
+            utterancePeak = 0;
+            utteranceSum = 0;
+            utteranceFrames = 0;
             Raise(UploadGateOpened, nameof(UploadGateOpened));
 
             // Flush after the event so the session has already opened its
@@ -319,6 +332,25 @@ namespace Personal_Assistant.LiveAudio
 
         private void CloseGate()
         {
+            // Signal level for the utterance just uploaded. Transcription quality
+            // is mostly a function of how loud the speech actually was relative to
+            // the room, and that is not something you can judge by ear from the
+            // other side of the mic — so measure it rather than guess.
+            //
+            // Rough reading: peak below ~0.05 is a quiet mic and will garble
+            // similar-sounding words; a peak-to-ambient ratio under ~10x means the
+            // room is competing with the speech.
+            if (utteranceFrames > 0)
+            {
+                double mean = utteranceSum / utteranceFrames;
+                double headroom = ambientFloor > 0 ? utterancePeak / ambientFloor : 0;
+                Console.WriteLine(
+                    $"[live-audio] utterance {utteranceFrames * BufferMs}ms  " +
+                    $"peak={utterancePeak:F4} mean={mean:F4} " +
+                    $"ambient={ambientFloor:F4} floor={UploadFloor:F4} " +
+                    $"headroom={headroom:F0}x");
+            }
+
             gateOpen = false;
             onsetFrames = 0;
             silentFrames = 0;

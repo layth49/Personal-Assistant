@@ -19,7 +19,10 @@ namespace Personal_Assistant.GeminiClient
         private static readonly HttpClient httpClient = CreateHttpClient();
 
         private const string Endpoint =
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent";
+            // gemini-2.5-flash-lite 404s here — "no longer available to new users"
+            // — which silently broke this path, and this path is the fallback that
+            // only runs when the Live socket is already failing.
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent";
 
         private const string SystemPrompt =
             "You are L.A.I.T.H., Layth's personal voice assistant running on his computer. " +
