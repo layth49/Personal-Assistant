@@ -412,6 +412,12 @@ namespace Personal_Assistant.Live
             // looks hung — the single most likely "it just sits there" bug.
             capture.UploadGateOpened += () =>
             {
+                // Under server VAD the gate opens on assistant-audio boundaries
+                // rather than on user speech, so counting turns or resetting the
+                // idle clock here would be counting the wrong thing entirely.
+                // AppendInputTranscript owns both in that mode.
+                if (!options.ManualActivityDetection) return;
+
                 // A real user turn, and the ONLY thing that resets the idle clock.
                 Interlocked.Exchange(ref idleMs, 0);
                 Interlocked.Increment(ref turns);
@@ -419,9 +425,13 @@ namespace Personal_Assistant.Live
                 // The user is talking again, so whatever the model was still
                 // streaming for the turn they cut is no longer wanted.
                 suppressAssistantAudio = false;
+
                 Enqueue(UplinkItem.Activity(ActivityMarker.Start));
             };
-            capture.UploadGateClosed += () => Enqueue(UplinkItem.Activity(ActivityMarker.End));
+            capture.UploadGateClosed += () =>
+            {
+                if (options.ManualActivityDetection) Enqueue(UplinkItem.Activity(ActivityMarker.End));
+            };
 
             client.AudioReceived += OnAudioReceived;
             client.OutputTranscript += OnOutputTranscript;
@@ -541,8 +551,10 @@ namespace Personal_Assistant.Live
         // bubble's "you said" label showed only the final fragment.
         private void AppendInputTranscript(string fragment)
         {
+            bool newTurn;
             lock (bubbleSync)
             {
+                newTurn = inputTurnClosed;
                 if (inputTurnClosed)
                 {
                     inputText.Clear();
@@ -550,6 +562,21 @@ namespace Personal_Assistant.Live
                 }
                 inputText.Append(fragment);
                 lastInputTranscript = inputText.ToString().Trim();
+            }
+
+            // The user speaking is what resets the idle clock — never assistant
+            // output, or a talkative reply keeps its own session alive forever.
+            // Under server VAD this is the ONLY user-activity signal, since the
+            // upload gate no longer tracks utterances.
+            Interlocked.Exchange(ref idleMs, 0);
+
+            if (newTurn && !options.ManualActivityDetection)
+            {
+                Interlocked.Increment(ref turns);
+
+                // Whatever the model was still streaming for a turn the user has
+                // spoken over is no longer wanted.
+                suppressAssistantAudio = false;
             }
         }
 
@@ -959,7 +986,14 @@ namespace Personal_Assistant.Live
                         !toolRunning &&
                         !audio.Capture.AssistantAudioPlaying &&
                         !audio.Playback.IsPlaying &&
-                        !audio.Capture.IsUploading;
+                        // Under client endpointing an open gate means the user is
+                        // mid-utterance. Under server VAD the gate is open for the
+                        // whole session by design, so this test would be
+                        // permanently false — the idle window would never fire and
+                        // every session would run to the hard cap. There, arriving
+                        // transcripts are the signal instead, and they reset the
+                        // clock directly in AppendInputTranscript.
+                        (!options.ManualActivityDetection || !audio.Capture.IsUploading);
 
                     long elapsed = userHasTheFloor
                         ? Interlocked.Add(ref idleMs, (long)delta.TotalMilliseconds)

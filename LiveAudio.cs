@@ -388,7 +388,15 @@ namespace Personal_Assistant.LiveAudio
             // Rough reading: peak below ~0.05 is a quiet mic and will garble
             // similar-sounding words; a peak-to-ambient ratio under ~10x means the
             // room is competing with the speech.
-            if (utteranceFrames > 0)
+            // Under continuous upload the gate tracks assistant-audio boundaries,
+            // not utterances, so most of these segments are the silence while the
+            // assistant talks — reporting them as "utterance peak=0.0000" is
+            // noise that says nothing about the microphone. Only report segments
+            // that actually contain sound.
+            bool worthReporting = utteranceFrames > 0 &&
+                (!UploadContinuously || utterancePeak >= UploadFloor);
+
+            if (worthReporting)
             {
                 double mean = utteranceSum / utteranceFrames;
                 double headroom = ambientFloor > 0 ? utterancePeak / ambientFloor : 0;

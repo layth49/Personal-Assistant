@@ -388,7 +388,16 @@ namespace Personal_Assistant.Live
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[live] close failed: {ex.Message}");
+                // Closing a socket that is already Aborted/Closed is not a
+                // failure — it means something else got there first. On exit that
+                // is routine: Dispose and the ProcessExit handler both close, and
+                // whichever loses the race used to report an error for doing
+                // exactly what it was supposed to do. Only a socket still claiming
+                // to be Open is genuinely unexpected.
+                if (socket.State == WebSocketState.Open)
+                {
+                    Console.WriteLine($"[live] close failed: {ex.Message}");
+                }
             }
             finally
             {
