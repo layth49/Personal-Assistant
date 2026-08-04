@@ -438,6 +438,7 @@
     <Compile Include="LiveAudio.cs" />
     <Compile Include="LiveClient.cs" />
     <Compile Include="LiveSession.cs" />
+    <Compile Include="VoiceClips.cs" />
     <Compile Include="MediaController.cs" />
     <Compile Include="NowPlayingReader.cs" />
     <Compile Include="PlaystationController.cs" />

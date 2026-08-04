@@ -1,6 +1,7 @@
 ﻿using Microsoft.CognitiveServices.Speech;
 using Microsoft.CognitiveServices.Speech.Audio;
 using Personal_Assistant.Diagnostics;
+using Personal_Assistant.VoiceClips;
 using Python.Runtime;
 using System;
 using System.Diagnostics;
@@ -453,6 +454,47 @@ namespace Personal_Assistant.SpeechManager
             }
             finally
             {
+                EndSpeaking();
+                sayGate.Release();
+            }
+        }
+
+        // Say, but plays a pre-rendered Live-voice clip when one exists, so the
+        // greeting and the goodbye are in the same voice as the conversation
+        // between them. Falls back to Azure TTS on a miss — an unrendered line
+        // must still be spoken, just in the old voice.
+        //
+        // Identical bracketing to Say: the bubble, BeginSpeaking/EndSpeaking and
+        // sayGate all apply, because a clip is assistant audio like any other and
+        // the echo gate has to know about it.
+        public async Task SayClip(string userInput, string response)
+        {
+            string voice = Environment.GetEnvironmentVariable("LAITH_LIVE_VOICE");
+            if (!VoiceClipCache.TryGet(voice, response, out string clip))
+            {
+                await Say(userInput, response);
+                return;
+            }
+
+            await sayGate.WaitAsync();
+            try
+            {
+                SpeechBubble(userInput, response);
+                BeginSpeaking(response);
+                try
+                {
+                    await VoiceClipCache.PlayAsync(clip);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[clips] playback failed, falling back to TTS: {ex.Message}");
+                    try { await SynthesizeTextToSpeech(response); }
+                    catch (Exception inner) { Console.WriteLine($"TTS error: {inner.Message}"); }
+                }
+            }
+            finally
+            {
+                RetractBubble();
                 EndSpeaking();
                 sayGate.Release();
             }

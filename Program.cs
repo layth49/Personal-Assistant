@@ -1,4 +1,4 @@
-using Microsoft.CognitiveServices.Speech;
+﻿using Microsoft.CognitiveServices.Speech;
 using Personal_Assistant.AppLaunching;
 using Personal_Assistant.Arduino;
 using Personal_Assistant.AudioControl;
@@ -16,6 +16,7 @@ using Personal_Assistant.Reminders;
 using Personal_Assistant.ScreenCapture;
 using Personal_Assistant.SMSController;
 using Personal_Assistant.SpeechManager;
+using Personal_Assistant.VoiceClips;
 using Personal_Assistant.WeatherService;
 using Python.Runtime;
 using System;
@@ -98,6 +99,25 @@ namespace Personal_Assistant
             }
         }
 
+        // The one line the exit tool speaks. A constant because the clip cache is
+        // keyed on the exact text — an inline literal here and a different one in
+        // the render list would miss every time and silently fall back to Azure.
+        public const string Goodbye = "Alright goodbye!";
+
+        // Every line spoken outside a Live conversation, i.e. everything that
+        // needs a pre-rendered clip to stay in voice. Keep in sync with the
+        // greeting pools; --render-clips reads exactly this.
+        public static IReadOnlyList<string> ClipLines()
+        {
+            var lines = new List<string>();
+            lines.AddRange(morningGreetings);
+            lines.AddRange(afternoonGreetings);
+            lines.AddRange(eveningGreetings);
+            lines.AddRange(nightGreetings);
+            lines.Add(Goodbye);
+            return lines;
+        }
+
         private static string PickGreeting(int hour)
         {
             string[] pool;
@@ -108,9 +128,20 @@ namespace Personal_Assistant
             return pool[random.Next(pool.Length)];
         }
 
-        public static async Task Main()
+        public static async Task Main(string[] args)
         {
             CheckEnvironmentVariables();
+
+            // Offline mode: render the greeting/goodbye clips in the configured
+            // Live voice and exit. Rendering goes through the Live API, which is
+            // unmetered on this project, rather than the TTS model, which is
+            // 3/min and 10/day. Re-run after changing LAITH_LIVE_VOICE.
+            if (args != null && Array.IndexOf(args, "--render-clips") >= 0)
+            {
+                string voice = Environment.GetEnvironmentVariable("LAITH_LIVE_VOICE");
+                int failed = await VoiceClipRenderer.RenderAsync(ClipLines(), voice);
+                Environment.Exit(failed == 0 ? 0 : 1);
+            }
 
             // 49 (ASCII art)
             Console.WriteLine("                                    \r\n     ,AM  .d*\"*bg.\r\n    AVMM 6MP    Mb\r\n  ,W' MM YMb    MM\r\n,W'   MM  `MbmmdM9\r\nAmmmmmMMmm     .M'\r\n      MM     .d9  \r\n      MM   m\"'    \n\n");
@@ -320,7 +351,12 @@ namespace Personal_Assistant
                 // conversational replies, not a two-second greeting. It also has to
                 // finish before the session opens its microphone, or the Live model
                 // hears the greeting as the user's first utterance.
-                await speechManager.Say("Hey 49", greeting);
+                //
+                // SayClip so the greeting is in the SAME voice as the conversation
+                // it introduces. It cannot be spoken by the Live model itself --
+                // this is what covers socket setup, so it has to be audible before
+                // the session exists. Falls back to Azure TTS if unrendered.
+                await speechManager.SayClip("Hey 49", greeting);
 
                 // One Gemini Live conversation, wake word to close. It owns STT,
                 // reasoning, tool calls and TTS over a single WebSocket, so there
@@ -432,7 +468,7 @@ namespace Personal_Assistant
                     // never returns: Environment.Exit runs before any caller could
                     // voice a result. Awaiting the goodbye is what keeps it from
                     // being cut off mid-word by the process ending.
-                    await ctx.Speech.Say(ctx.RecognizedText, "Alright goodbye!");
+                    await ctx.Speech.SayClip(ctx.RecognizedText, Goodbye);
                     PythonEngine.Shutdown();
                     Environment.Exit(0);
                 }));
