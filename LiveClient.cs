@@ -109,7 +109,16 @@ namespace Personal_Assistant.Live
         // speech. So the client owns turn boundaries via activityStart /
         // activityEnd, and mic frames stop uploading while the assistant talks.
         // Do not flip this on without real AEC.
-        public bool ManualActivityDetection { get; set; } = true;
+        //
+        // Switchable, because the settled conclusion above was reached on a
+        // pipeline WITHOUT the half-duplex gate. That gate drops every mic frame
+        // while assistant audio plays, so the model cannot hear itself and the
+        // server's VAD only ever sees Layth — which is what makes server-side
+        // endpointing safe to try at all. It is still UNPROVEN on speakers, where
+        // the echo tail is the only thing covering the gap between playback
+        // ending and sound stopping. Set LAITH_LIVE_SERVER_VAD=0 to revert.
+        public bool ManualActivityDetection { get; set; } =
+            Environment.GetEnvironmentVariable("LAITH_LIVE_SERVER_VAD") == "0";
 
         public bool InputAudioTranscription { get; set; } = true;
         public bool OutputAudioTranscription { get; set; } = true;

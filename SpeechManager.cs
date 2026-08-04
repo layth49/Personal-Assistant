@@ -470,7 +470,17 @@ namespace Personal_Assistant.SpeechManager
         public async Task SayClip(string userInput, string response)
         {
             string voice = Environment.GetEnvironmentVariable("LAITH_LIVE_VOICE");
+
+            // A miss is rendered now rather than dropping to the other voice.
+            // Layth's call: a labelled reminder arriving a beat late is better
+            // than a different voice appearing out of nowhere. Only the FIRST
+            // utterance of a given line pays this; it is cached afterwards.
             if (!VoiceClipCache.TryGet(voice, response, out string clip))
+            {
+                await VoiceClipRenderer.TryEnsureAsync(voice, response);
+            }
+
+            if (!VoiceClipCache.TryGet(voice, response, out clip))
             {
                 await Say(userInput, response);
                 return;

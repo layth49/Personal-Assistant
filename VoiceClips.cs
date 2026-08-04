@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
@@ -128,8 +129,9 @@ namespace Personal_Assistant.VoiceClips
 
                 try
                 {
+                    var sw = Stopwatch.StartNew();
                     await RenderOneAsync(line, voice).ConfigureAwait(false);
-                    Console.WriteLine($"[clips] ok   {Preview(line)}");
+                    Console.WriteLine($"[clips] ok {sw.ElapsedMilliseconds,5}ms  {Preview(line)}");
                     written++;
                 }
                 catch (Exception ex)
@@ -141,6 +143,31 @@ namespace Personal_Assistant.VoiceClips
 
             Console.WriteLine($"[clips] wrote {written}, skipped {skipped}, failed {failed}");
             return failed;
+        }
+
+        // Renders a line that was not pre-rendered, and caches it, so dynamic text
+        // (a labelled reminder, say) is still spoken in the Live voice. The first
+        // utterance of a given line pays the render; every later one is a cache hit.
+        //
+        // Returns false rather than throwing: the caller's fallback is Azure TTS,
+        // and a late announcement in the wrong voice beats no announcement at all.
+        public static async Task<bool> TryEnsureAsync(string voice, string line)
+        {
+            if (string.IsNullOrEmpty(voice) || string.IsNullOrWhiteSpace(line)) return false;
+            if (VoiceClipCache.TryGet(voice, line, out _)) return true;
+
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                await RenderOneAsync(line, voice).ConfigureAwait(false);
+                Console.WriteLine($"[clips] rendered on demand in {sw.ElapsedMilliseconds}ms: {Preview(line)}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[clips] on-demand render failed after {sw.ElapsedMilliseconds}ms: {ex.Message}");
+                return false;
+            }
         }
 
         private static async Task RenderOneAsync(string line, string voice)

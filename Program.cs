@@ -142,10 +142,19 @@ namespace Personal_Assistant
             // Live voice and exit. Rendering goes through the Live API, which is
             // unmetered on this project, rather than the TTS model, which is
             // 3/min and 10/day. Re-run after changing LAITH_LIVE_VOICE.
-            if (args != null && Array.IndexOf(args, "--render-clips") >= 0)
+            int renderAt = args == null ? -1 : Array.IndexOf(args, "--render-clips");
+            if (renderAt >= 0)
             {
                 string voice = Environment.GetEnvironmentVariable("LAITH_LIVE_VOICE");
-                int failed = await VoiceClipRenderer.RenderAsync(ClipLines(), voice);
+
+                // Any text after the switch is rendered instead of the standard
+                // set — for pre-rendering reminder labels you use often, so they
+                // never pay the on-demand render at the moment the timer fires.
+                var extra = new List<string>();
+                for (int i = renderAt + 1; i < args.Length; i++) extra.Add(args[i]);
+
+                int failed = await VoiceClipRenderer.RenderAsync(
+                    extra.Count > 0 ? extra : ClipLines(), voice);
                 Environment.Exit(failed == 0 ? 0 : 1);
             }
 
@@ -232,7 +241,13 @@ namespace Personal_Assistant
             // text that cannot be pre-rendered, and falls back to Azure.
             var reminders = new ReminderService(
                 message => speechManager.SayClip("⏰", message),
-                timerWidgets);
+                timerWidgets,
+                // Rendering a clip takes ~5-7s, so a labelled reminder gets its
+                // line rendered when the timer is SET rather than when it fires.
+                // By the time it goes off the clip is already cached, and the
+                // announcement is instant and in the right voice.
+                prepare: message => VoiceClipRenderer.TryEnsureAsync(
+                    Environment.GetEnvironmentVariable("LAITH_LIVE_VOICE"), message));
 
             // Shared dependencies handed to every command handler.
             var context = new CommandContext

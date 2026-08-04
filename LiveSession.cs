@@ -322,12 +322,19 @@ namespace Personal_Assistant.Live
             Console.WriteLine(
                 $"[live-session] opening — model '{options.Model}', " +
                 $"voice {(string.IsNullOrEmpty(options.Voice) ? "(server default — LAITH_LIVE_VOICE unset)" : options.Voice)}, " +
+                $"endpointing {(options.ManualActivityDetection ? "client (energy gate)" : "server VAD")}, " +
                 $"hard cap {limits.HardCap.TotalSeconds:0}s, idle window {limits.IdleWindow.TotalSeconds:0}s");
 
             try
             {
                 client = new LiveClient(options);
                 audio = new LiveAudioPipeline();
+
+                // The energy gate must not endpoint when the server is doing it —
+                // otherwise the server's VAD just sees the silence the gate made,
+                // and the truncation this was meant to fix survives the change.
+                audio.Capture.UploadContinuously = !options.ManualActivityDetection;
+
                 HookEvents();
 
                 await client.ConnectAsync(ct).ConfigureAwait(false);

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -44,14 +44,19 @@ namespace Personal_Assistant.Reminders
         private readonly List<ScheduledItem> items = new List<ScheduledItem>();
         private readonly object gate = new object();
         private readonly Func<string, Task> announce;
+        private readonly Func<string, Task> prepare;
         private readonly IReminderVisual visual;
         private readonly Timer ticker;
         private int nextId = 1;
 
-        public ReminderService(Func<string, Task> announce, IReminderVisual visual = null)
+        public ReminderService(
+            Func<string, Task> announce,
+            IReminderVisual visual = null,
+            Func<string, Task> prepare = null)
         {
             this.announce = announce ?? throw new ArgumentNullException(nameof(announce));
             this.visual = visual;
+            this.prepare = prepare;
             // Check every second; first check after one second.
             ticker = new Timer(_ => Tick(), null, 1000, 1000);
         }
@@ -72,6 +77,7 @@ namespace Personal_Assistant.Reminders
                 items.Add(item);
             }
             visual?.Show(item.Id, item.Label, item.FireAt, item.Kind);
+            Prepare(item);
             return item.FireAt;
         }
 
@@ -97,6 +103,7 @@ namespace Personal_Assistant.Reminders
                 items.Add(item);
             }
             visual?.Show(item.Id, item.Label, item.FireAt, item.Kind);
+            Prepare(item);
             return fireAt;
         }
 
@@ -145,22 +152,41 @@ namespace Personal_Assistant.Reminders
             }
         }
 
+        // The exact words Fire will speak. Shared with the scheduling path so the
+        // announcement can be prepared ahead of time — the two must not drift, or
+        // the preparation is done against a string that is never spoken.
+        internal static string AnnouncementFor(string label, ReminderKind kind)
+        {
+            if (!string.IsNullOrWhiteSpace(label)) return $"Reminder: {label}.";
+            return kind == ReminderKind.Alarm
+                ? "Your alarm is going off."
+                : "Your timer is done.";
+        }
+
+        // Called when an item is scheduled, with the line it will eventually say.
+        // Rendering that line takes ~5-7s, which is far too long to do when the
+        // timer actually fires — but a timer is set minutes before it goes off, so
+        // doing it here means the clip is ready and waiting.
+        private void Prepare(ScheduledItem item)
+        {
+            if (prepare == null) return;
+            string message = AnnouncementFor(item.Label, item.Kind);
+
+            // Deliberately not awaited: scheduling a timer must stay instant, and
+            // a failed preparation is not an error — Fire falls back on its own.
+            Task.Run(async () =>
+            {
+                try { await prepare(message).ConfigureAwait(false); }
+                catch (Exception ex) { Console.WriteLine($"[reminder] prepare failed: {ex.Message}"); }
+            });
+        }
+
         private async Task Fire(ScheduledItem item)
         {
             // Flash + dismiss the on-screen widget in step with the announcement.
             visual?.Fired(item.Id);
 
-            string message;
-            if (!string.IsNullOrWhiteSpace(item.Label))
-            {
-                message = $"Reminder: {item.Label}.";
-            }
-            else
-            {
-                message = item.Kind == ReminderKind.Alarm
-                    ? "Your alarm is going off."
-                    : "Your timer is done.";
-            }
+            string message = AnnouncementFor(item.Label, item.Kind);
 
             try
             {

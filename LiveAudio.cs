@@ -157,6 +157,16 @@ namespace Personal_Assistant.LiveAudio
         private long framesDroppedSilent;
         private long framesDroppedForPlayback;
 
+        // With server-side VAD the SERVER decides where turns end, so the energy
+        // gate must not also decide it. Leaving the gate in charge would hand the
+        // same truncated audio to a better endpointer and change nothing — the
+        // server would just see the silence the gate created.
+        //
+        // The half-duplex assistant-audio gate is NOT affected by this and still
+        // drops every frame while the speakers are live. That gate is the echo
+        // protection; this one is only bandwidth.
+        public bool UploadContinuously { get; set; }
+
         public LiveAudioCapture()
         {
             floorOverride = ReadDouble("LAITH_LIVE_UPLOAD_FLOOR", 0.0);
@@ -289,6 +299,20 @@ namespace Personal_Assistant.LiveAudio
             double rms = FrameRms(frame);
             TrackAmbientFloor(rms);
             bool loud = rms >= UploadFloor;
+
+            // Server VAD owns endpointing: upload everything the assistant isn't
+            // covering and let the server find the boundaries. The gate is still
+            // opened/closed so activity events and the utterance stats keep
+            // working, it just never withholds audio.
+            if (UploadContinuously)
+            {
+                if (!gateOpen) OpenGate();
+                if (rms > utterancePeak) utterancePeak = rms;
+                utteranceSum += rms;
+                utteranceFrames++;
+                Emit(frame);
+                return;
+            }
 
             if (!gateOpen)
             {
