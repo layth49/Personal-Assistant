@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Personal_Assistant.Diagnostics;
@@ -192,6 +193,26 @@ namespace Personal_Assistant.Live
         // chunks, short enough that the user isn't left staring at a dead mic.
         private static readonly TimeSpan AssistantAudioStallTimeout = TimeSpan.FromSeconds(5);
 
+        // ---- speech bubble --------------------------------------------------
+        //
+        // On the turn-based path the bubble is posted by SpeechService.Say, which
+        // this path never calls — the Live model does its own TTS. So the bubble
+        // is driven from output transcripts instead: post on the first fragment of
+        // a reply, grow it as more arrive, retract when the speakers go quiet.
+        //
+        // There is no Azure synth here to flip the state dict that normally
+        // retracts it, which is exactly what HideBubble exists for.
+        private readonly object bubbleSync = new object();
+        private readonly StringBuilder replyText = new StringBuilder();
+        private bool bubbleShown;
+        private DateTime lastBubbleUpdateUtc;
+
+        // Transcript fragments arrive per-word — the prayer-times reply produced
+        // roughly forty. Each update takes the Python GIL and re-renders the
+        // window, so they are coalesced; TurnComplete flushes the final text so
+        // throttling can never leave the last words off the bubble.
+        private static readonly TimeSpan BubbleUpdateInterval = TimeSpan.FromMilliseconds(120);
+
         public LiveSession(
             IntentDispatcher dispatcher,
             CommandContext context,
@@ -270,6 +291,7 @@ namespace Personal_Assistant.Live
             Console.WriteLine($"[session] opening at {openedLocal:HH:mm:ss}");
             Console.WriteLine(
                 $"[live-session] opening — model '{options.Model}', " +
+                $"voice {(string.IsNullOrEmpty(options.Voice) ? "(server default — LAITH_LIVE_VOICE unset)" : options.Voice)}, " +
                 $"hard cap {limits.HardCap.TotalSeconds:0}s, idle window {limits.IdleWindow.TotalSeconds:0}s");
 
             try
@@ -376,6 +398,11 @@ namespace Personal_Assistant.Live
             {
                 Console.WriteLine("[live-session] model turn interrupted — dropping buffered audio");
                 audio.Interrupt();
+
+                // The buffered audio is gone, so PlaybackFinished may never fire
+                // for this turn. Retract here or the cut-off reply stays on screen
+                // until something else supersedes it.
+                ClearBubble();
             };
 
             client.TurnComplete += () =>
@@ -389,6 +416,10 @@ namespace Personal_Assistant.Live
                 // Clearing it here would hand the floor back mid-sentence and end
                 // the barge-in watch while the reply is still audible.
                 audio.EndAssistantAudio();
+
+                // Model output is complete, so this is the full reply text even if
+                // the last fragments landed inside the coalescing window.
+                FlushBubble();
             };
 
             audio.Playback.PlaybackStarted += OnPlaybackStarted;
@@ -464,6 +495,81 @@ namespace Personal_Assistant.Live
             // Latches for the rest of the reply: once the assistant has said its
             // own name, anything the spotter hears afterwards could be that.
             if (NamesAssistant(text)) replyNamesAssistant = true;
+
+            ShowOrGrowBubble(text);
+        }
+
+        private void ShowOrGrowBubble(string fragment)
+        {
+            if (speech == null) return;
+
+            string userLabel, reply;
+            bool post;
+            lock (bubbleSync)
+            {
+                replyText.Append(fragment);
+                reply = replyText.ToString();
+                userLabel = lastInputTranscript;
+
+                if (bubbleShown)
+                {
+                    if (DateTime.UtcNow - lastBubbleUpdateUtc < BubbleUpdateInterval) return;
+                    post = false;
+                }
+                else
+                {
+                    bubbleShown = true;
+                    post = true;
+                }
+                lastBubbleUpdateUtc = DateTime.UtcNow;
+            }
+
+            // Outside the lock: these take the Python GIL, and holding a lock
+            // across the GIL is how you deadlock against the bubble daemon.
+            TryBubble(() =>
+            {
+                if (post) speech.SpeechBubble(userLabel, reply);
+                else speech.UpdateBubble(userLabel, reply);
+            });
+        }
+
+        // Flushes the complete reply text, so the coalescing above can't drop the
+        // tail of a turn. Called on turnComplete, while the audio is still playing.
+        private void FlushBubble()
+        {
+            if (speech == null) return;
+
+            string userLabel, reply;
+            lock (bubbleSync)
+            {
+                if (!bubbleShown || replyText.Length == 0) return;
+                reply = replyText.ToString();
+                userLabel = lastInputTranscript;
+                lastBubbleUpdateUtc = DateTime.UtcNow;
+            }
+            TryBubble(() => speech.UpdateBubble(userLabel, reply));
+        }
+
+        private void ClearBubble()
+        {
+            if (speech == null) return;
+
+            bool wasShown;
+            lock (bubbleSync)
+            {
+                wasShown = bubbleShown;
+                bubbleShown = false;
+                replyText.Clear();
+            }
+            if (wasShown) TryBubble(() => speech.HideBubble());
+        }
+
+        // The bubble is decoration. A Python-side failure must never take down a
+        // conversation that is otherwise working.
+        private static void TryBubble(Action action)
+        {
+            try { action(); }
+            catch (Exception ex) { Console.WriteLine($"[bubble] live-path update failed: {ex.Message}"); }
         }
 
         private void OnPlaybackStarted()
@@ -477,6 +583,11 @@ namespace Personal_Assistant.Live
             // which starts the speaker-tail countdown that reopens the mic.
             assistantTurnActive = false;
             StopWakewordWatch();
+
+            // Retract only once the speakers are actually quiet. Transcripts run
+            // ahead of audio, so hiding on turnComplete would pull the bubble off
+            // screen while the reply was still being spoken.
+            ClearBubble();
         }
 
         // ---- uplink --------------------------------------------------------
@@ -775,6 +886,12 @@ namespace Personal_Assistant.Live
                                 "turnComplete — releasing the turn and reopening the mic");
                             audio.EndAssistantAudio();
                             assistantTurnActive = false;
+
+                            // Draining normally retracts the bubble via
+                            // PlaybackFinished, but a stall with nothing buffered
+                            // means that already fired. Idempotent, so the ordinary
+                            // path is unaffected.
+                            ClearBubble();
                         }
                     }
 
@@ -831,6 +948,10 @@ namespace Personal_Assistant.Live
         {
             try { uplink.CompleteAdding(); } catch { }
             StopWakewordWatch();
+
+            // A bubble must never outlive the conversation that posted it — on a
+            // mid-reply close nothing else would ever retract it.
+            ClearBubble();
 
             // Read the totals while the devices are still alive — the close log
             // is written after they have been disposed.
