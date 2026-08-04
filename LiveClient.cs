@@ -124,6 +124,13 @@ namespace Personal_Assistant.Live
         public bool ManualActivityDetection { get; set; } =
             Environment.GetEnvironmentVariable("LAITH_LIVE_SERVER_VAD") == "0";
 
+        // BCP-47 code for the input ASR, e.g. "en-US". Unset by default: the
+        // native-audio models this normally runs on do not accept it. Set
+        // LAITH_LIVE_LANGUAGE only alongside a half-cascade model such as
+        // gemini-3.1-flash-live-preview, whose separate ASR can be pinned.
+        public string LanguageCode { get; set; } =
+            Environment.GetEnvironmentVariable("LAITH_LIVE_LANGUAGE");
+
         public bool InputAudioTranscription { get; set; } = true;
         public bool OutputAudioTranscription { get; set; } = true;
 
@@ -419,18 +426,32 @@ namespace Personal_Assistant.Live
                 ["responseModalities"] = new[] { "AUDIO" }
             };
 
-            if (!string.IsNullOrEmpty(options.Voice))
+            if (!string.IsNullOrEmpty(options.Voice) || !string.IsNullOrEmpty(options.LanguageCode))
             {
-                generationConfig["speechConfig"] = new Dictionary<string, object>
+                var speechConfig = new Dictionary<string, object>();
+
+                if (!string.IsNullOrEmpty(options.Voice))
                 {
-                    ["voiceConfig"] = new Dictionary<string, object>
+                    speechConfig["voiceConfig"] = new Dictionary<string, object>
                     {
                         ["prebuiltVoiceConfig"] = new Dictionary<string, object>
                         {
                             ["voiceName"] = options.Voice
                         }
-                    }
-                };
+                    };
+                }
+
+                // Opt-in only. Native-audio models choose the language themselves
+                // and reject an explicit code, so sending this unasked would break
+                // the default configuration. It exists for the half-cascade models
+                // (gemini-3.1-flash-live-preview), which run a separate ASR that
+                // DOES take a language and can therefore be pinned to English.
+                if (!string.IsNullOrEmpty(options.LanguageCode))
+                {
+                    speechConfig["languageCode"] = options.LanguageCode;
+                }
+
+                generationConfig["speechConfig"] = speechConfig;
             }
 
             var setup = new Dictionary<string, object>

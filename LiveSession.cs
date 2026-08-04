@@ -246,6 +246,18 @@ namespace Personal_Assistant.Live
         private static string BuildNameHints(CommandContext context)
         {
             var sb = new StringBuilder();
+
+            // Native-audio models pick the language themselves and, per Google's
+            // docs, "don't support explicitly setting the language code" — the
+            // system instruction is the only documented way to restrict it. Left
+            // free, this model has transcribed Layth's English as Italian
+            // ("un po'.", "l'ita.") and then answered the wrong question.
+            sb.Append(" Language: Layth speaks American English, only ever English. ");
+            sb.Append("Always interpret the audio as English and always reply in English, even when a ");
+            sb.Append("word is unclear or sounds foreign — an English word you are unsure of is far ");
+            sb.Append("more likely than a switch to another language. Never transcribe or answer in ");
+            sb.Append("any other language.");
+
             sb.Append(" Speech recognition note: the user is Layth (rhymes with \"faith\"), and you are ");
             sb.Append("L.A.I.T.H.49, spoken \"Laith forty-nine\". Audio that sounds like \"Leith\", \"Lathe\", ");
             sb.Append("\"to life\", \"Vade\" or \"Faith\" is almost certainly one of those two names — resolve it ");
