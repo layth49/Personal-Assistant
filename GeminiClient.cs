@@ -19,7 +19,7 @@ namespace Personal_Assistant.GeminiClient
         private static readonly HttpClient httpClient = CreateHttpClient();
 
         private const string Endpoint =
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent";
 
         private const string SystemPrompt =
             "You are L.A.I.T.H., Layth's personal voice assistant running on his computer. " +

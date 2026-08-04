@@ -71,8 +71,11 @@ namespace Personal_Assistant.SMSController
                 await Task.Delay(1500);
                 FocusPhoneLink();
 
-                SendMessageToContact(contactNumber, message);
-                return true;
+                // Propagated, not ignored. This used to be a void call followed by
+                // an unconditional `return true`, so a Phone Link window that never
+                // appeared still reported success and the assistant told Layth it
+                // had sent a text that does not exist.
+                return SendMessageToContact(contactNumber, message);
             }
             catch (Exception ex)
             {
@@ -89,13 +92,38 @@ namespace Personal_Assistant.SMSController
             }
         }
 
-        public void SendMessageToContact(string contactNumber, string message)
+        // How long to wait for each Phone Link control to appear. The window is
+        // launched ~1.5s earlier and populates progressively, so a single
+        // FindFirstDescendant right after launch legitimately misses — which is
+        // what produced the null message box.
+        private static readonly TimeSpan ElementTimeout = TimeSpan.FromSeconds(10);
+
+        // Polls for an element instead of taking one shot at it. Returns null on
+        // timeout; every call site treats that as a hard failure.
+        private static AutomationElement WaitForElement(
+            Window window, ConditionFactory cf, string automationId, TimeSpan timeout)
+        {
+            var deadline = DateTime.UtcNow + timeout;
+            do
+            {
+                var found = window.FindFirstDescendant(cf.ByAutomationId(automationId));
+                if (found != null) return found;
+                System.Threading.Thread.Sleep(200);
+            }
+            while (DateTime.UtcNow < deadline);
+            return null;
+        }
+
+        // Returns whether the message actually reached Phone Link's send box.
+        // Every step is verified: a missing control means the send did NOT happen,
+        // and saying so is the whole point — the caller reports this to the user.
+        public bool SendMessageToContact(string contactNumber, string message)
         {
             // Public, so it gets its own check rather than inheriting the caller's.
             if (string.IsNullOrWhiteSpace(message))
             {
                 Console.WriteLine("[sms] refusing to send an empty message.");
-                return;
+                return false;
             }
 
             Console.WriteLine($"Sending message to {contactNumber}: {message}");
@@ -104,8 +132,8 @@ namespace Personal_Assistant.SMSController
             var processes = Process.GetProcessesByName("PhoneExperienceHost");
             if (processes.Length == 0)
             {
-                Console.WriteLine("Phone Link is not running.");
-                return;
+                Console.WriteLine("[sms] Phone Link is not running — nothing was sent.");
+                return false;
             }
 
             using (var automation = new UIA3Automation())
@@ -116,29 +144,54 @@ namespace Personal_Assistant.SMSController
 
                 try
                 {
+                    // Each step is required. Previously the first two were `?.` and
+                    // the third was a bare dereference, so a compose click that
+                    // never landed walked silently into a NullReferenceException on
+                    // the message box — reporting the failure two steps after the
+                    // one that actually broke.
+
                     // 1. Find and click the Compose button
-                    var composeButton = window.FindFirstDescendant(conditionFactory.ByAutomationId("NewMessageButton"))?.AsButton();
-                    composeButton?.Invoke();
+                    var composeButton = WaitForElement(
+                        window, conditionFactory, "NewMessageButton", ElementTimeout)?.AsButton();
+                    if (composeButton == null)
+                    {
+                        Console.WriteLine("[sms] compose button never appeared — nothing was sent.");
+                        return false;
+                    }
+                    composeButton.Invoke();
                     Wait.UntilInputIsProcessed(); // Let the UI catch up
-                    Console.WriteLine("Shouldve pressed the new message by now");
 
                     // 2. Find the "To" field, type number, press Enter
-                    var toField = window.FindFirstDescendant(conditionFactory.ByAutomationId("TextBox"))?.AsTextBox();
-                    toField?.Enter(contactNumber);
+                    var toField = WaitForElement(
+                        window, conditionFactory, "TextBox", ElementTimeout)?.AsTextBox();
+                    if (toField == null)
+                    {
+                        Console.WriteLine("[sms] recipient box never appeared — nothing was sent.");
+                        return false;
+                    }
+                    toField.Enter(contactNumber);
                     Keyboard.Press(VirtualKeyShort.ENTER);
                     Wait.UntilInputIsProcessed();
-                    Console.WriteLine("Shouldve pressed on the 'To' box");
 
                     // 3. Find the message box, type message, press Enter
-                    var messageBox = window.FindFirstDescendant(conditionFactory.ByAutomationId("InputTextBox"))?.AsTextBox();
+                    var messageBox = WaitForElement(
+                        window, conditionFactory, "InputTextBox", ElementTimeout)?.AsTextBox();
+                    if (messageBox == null)
+                    {
+                        Console.WriteLine("[sms] message box never appeared — nothing was sent.");
+                        return false;
+                    }
                     messageBox.Text = message;
                     Keyboard.Press(VirtualKeyShort.ENTER);
 
-                    Console.WriteLine("Message sent successfully via FlaUI.");
+                    Console.WriteLine($"[sms] handed to Phone Link for {contactNumber}.");
+                    return true;
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"FlaUI Automation Error: {ex.Message}");
+                    // Caught rather than thrown, but no longer mistaken for success.
+                    Console.WriteLine($"[sms] Phone Link automation failed: {ex.Message}");
+                    return false;
                 }
             }
         }

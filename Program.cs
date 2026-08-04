@@ -23,6 +23,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 
@@ -1648,9 +1649,17 @@ namespace Personal_Assistant
                 return ToolResult.Failed($"I don't have a number for {contact}.", "unknown_contact");
             }
 
-            // The subject binds the approval to this contact AND this exact body, so
-            // a "yes" cannot be spent on a message the user never heard read back.
-            string subject = "send_sms:" + contact + ":" + message;
+            // The subject binds the approval to this contact AND this body, so a
+            // "yes" cannot be spent on a message the user never heard read back.
+            //
+            // Normalised, because the model re-types the body on the confirming
+            // call and does not reproduce it byte for byte — the first real run of
+            // this dropped a trailing full stop between the two calls, the subject
+            // missed, and the gate silently re-asked while the model announced it
+            // had sent the message. Case, whitespace and trailing punctuation are
+            // not meaningful differences; different WORDS still miss, which is the
+            // property actually worth protecting.
+            string subject = "send_sms:" + contact.Trim().ToLowerInvariant() + ":" + NormalizeForConsent(message);
 
             if (Confirmation.IsNo(confirmed))
             {
@@ -1663,11 +1672,26 @@ namespace Personal_Assistant
 
             if (!Confirmation.IsYes(confirmed) || !ConfirmationGate.TryConsume(subject))
             {
+                // A `yes` that lands here matched no armed request — the body
+                // changed, it expired, or the model issued it unprompted. Say so
+                // out loud: this case previously looked identical to a first ask,
+                // and the model responded by announcing it had sent the message.
+                if (Confirmation.IsYes(confirmed))
+                {
+                    Console.WriteLine(
+                        $"[confirm] send_sms 'yes' matched no armed request -> NOT sent. " +
+                        $"contact={contact} message=\"{message}\"");
+                }
+
                 ConfirmationGate.Arm(subject);
                 string question = $"You'd like to send \"{message}\" to {contact}. Should I send it?";
                 return ToolResult
                     .Speak(question)
                     .With("status", "needs_confirmation")
+                    .With("sent", "false")
+                    .With("instruction",
+                        "NOT sent. Ask the question verbatim and wait for the user's answer. " +
+                        "Do not tell the user the message has been sent.")
                     .With("question", question)
                     .With("contact", contact)
                     .With("message", message);
@@ -1685,6 +1709,33 @@ namespace Personal_Assistant
                 .With("status", "sent")
                 .With("contact", contact)
                 .With("message", message);
+        }
+
+        // Collapses the differences a model introduces when it repeats a body back
+        // — case, run-together whitespace, and trailing punctuation — while leaving
+        // the words themselves intact. Consent is bound to what the user HEARD,
+        // and they cannot hear a full stop.
+        private static string NormalizeForConsent(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return string.Empty;
+
+            var sb = new StringBuilder(text.Length);
+            bool lastWasSpace = false;
+            foreach (char c in text.Trim())
+            {
+                if (char.IsWhiteSpace(c))
+                {
+                    if (!lastWasSpace) sb.Append(' ');
+                    lastWasSpace = true;
+                }
+                else
+                {
+                    sb.Append(char.ToLowerInvariant(c));
+                    lastWasSpace = false;
+                }
+            }
+
+            return sb.ToString().TrimEnd('.', '!', '?', ',', ';', ':', ' ');
         }
 
         // Pulls the message body out of "text mom I'll be late", for the keyword
