@@ -172,6 +172,20 @@ namespace Personal_Assistant
             AppDomain.CurrentDomain.ProcessExit += (s, e) => CloseActiveSession("process exiting");
             Console.CancelKeyPress += (s, e) => CloseActiveSession("Ctrl+C");
 
+            // A crash on a background thread — an NAudio capture callback, the
+            // Live receive pump, the bubble pump — takes the process down with no
+            // console output at all, so it reads as "it just closed". Nothing here
+            // can prevent that; the point is purely that it leaves a stack trace
+            // in the log instead of requiring the debugger to have been watching.
+            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+            {
+                Console.WriteLine(new string('!', 72));
+                Console.WriteLine($"[crash] unhandled exception (terminating={e.IsTerminating})");
+                Console.WriteLine(e.ExceptionObject?.ToString() ?? "(no exception object)");
+                Console.WriteLine(new string('!', 72));
+                Console.Out.Flush();
+            };
+
             Runtime.PythonDLL = @"C:\Users\layth\AppData\Local\Programs\Python\Python312\python312.dll";
             PythonEngine.Initialize();
             PythonEngine.BeginAllowThreads();
