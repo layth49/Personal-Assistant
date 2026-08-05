@@ -129,6 +129,30 @@ namespace Personal_Assistant.Live
         private volatile bool assistantTurnActive;
         private volatile bool toolRunning;
 
+        // The user's turn — ONE signal, one meaning, whichever endpointer is in
+        // charge.
+        //
+        // The two modes used to be branched on at five call sites, each
+        // compensating for the other's compensation: the gate counted turns under
+        // client endpointing, transcripts counted them under server VAD, and the
+        // watchdog had to know which was which to decide whether the user held the
+        // floor. But the modes differ only in WHO NOTICES the user speaking — the
+        // energy gate, or the transcripts the server's own endpointer produces.
+        // What a turn MEANS is identical either way, so it lives in
+        // UserTurnStarted/UserTurnEnded and nothing downstream asks about the mode.
+        private volatile bool userTurnActive;
+
+        // "Is the user audibly speaking right now?" — the one question the two
+        // modes genuinely answer differently. Bound once in HookEvents and asked
+        // only by the watchdog, so this and the wiring beside it are the last two
+        // places the endpointing mode is consulted at all.
+        private Func<bool> userIsSpeaking = () => false;
+
+        // When the last input transcript arrived, for the server-VAD answer to
+        // that question. Ticks rather than DateTime because a struct can't be
+        // written atomically across threads.
+        private long lastUserSpeechTicks;
+
         // Latched when the model's own transcript says "49" / "Laith": from that
         // point in the reply, anything the keyword spotter hears could be the
         // assistant coming back through the speakers, so barge-in stands down.
@@ -404,10 +428,15 @@ namespace Personal_Assistant.Live
             if (client == null || !client.IsOpen || string.IsNullOrWhiteSpace(text))
                 return Task.CompletedTask;
 
-            Interlocked.Exchange(ref idleMs, 0);
-            Interlocked.Increment(ref turns);
-            suppressAssistantAudio = false;
             lastInputTranscript = text;
+
+            // A complete turn, start to finish, so it counts as one exactly as a
+            // spoken turn does. Safe in either mode precisely because the activity
+            // markers live in the wiring rather than in these two: a text turn
+            // carries its own turnComplete and must not be bracketed by them.
+            UserTurnStarted();
+            UserTurnEnded();
+
             return client.SendTextAsync(text, sessionCts.Token);
         }
 
@@ -419,32 +448,6 @@ namespace Personal_Assistant.Live
 
             capture.FrameReady += frame => Enqueue(UplinkItem.Audio(frame));
 
-            // Both halves are mandatory. With automaticActivityDetection disabled
-            // and no activity markers, the model waits forever and the session
-            // looks hung — the single most likely "it just sits there" bug.
-            capture.UploadGateOpened += () =>
-            {
-                // Under server VAD the gate opens on assistant-audio boundaries
-                // rather than on user speech, so counting turns or resetting the
-                // idle clock here would be counting the wrong thing entirely.
-                // AppendInputTranscript owns both in that mode.
-                if (!options.ManualActivityDetection) return;
-
-                // A real user turn, and the ONLY thing that resets the idle clock.
-                Interlocked.Exchange(ref idleMs, 0);
-                Interlocked.Increment(ref turns);
-
-                // The user is talking again, so whatever the model was still
-                // streaming for the turn they cut is no longer wanted.
-                suppressAssistantAudio = false;
-
-                Enqueue(UplinkItem.Activity(ActivityMarker.Start));
-            };
-            capture.UploadGateClosed += () =>
-            {
-                if (options.ManualActivityDetection) Enqueue(UplinkItem.Activity(ActivityMarker.End));
-            };
-
             client.AudioReceived += OnAudioReceived;
             client.OutputTranscript += OnOutputTranscript;
             client.InputTranscript += text =>
@@ -452,6 +455,67 @@ namespace Personal_Assistant.Live
                 if (!string.IsNullOrWhiteSpace(text)) AppendInputTranscript(text);
                 Console.WriteLine($"[live-session] heard: {text}");
             };
+
+            // ---- who observes the user's turn -------------------------------
+            //
+            // The ONE place the endpointing mode decides anything. Both branches
+            // bind the same two signals to different observers; everything
+            // downstream — the idle budget, the turn count, the floor test — reads
+            // those signals and never this flag.
+            if (options.ManualActivityDetection)
+            {
+                // Client endpointing: the energy gate decides where a turn ends,
+                // and the server has to be told, explicitly and in both
+                // directions. With automaticActivityDetection disabled and no
+                // markers arriving, the model waits forever and the session looks
+                // hung — the single most likely "it just sits there" bug.
+                //
+                // The markers are enqueued outside UserTurnStarted/Ended and
+                // unconditionally, not folded into them: those are idempotent, and
+                // a marker that got skipped because the turn had already been
+                // closed by something else is exactly the half-sent pair that
+                // wedges the model.
+                //
+                // Ordering is load-bearing. LiveAudioCapture raises Opened BEFORE
+                // flushing its pre-roll, and the marker goes through the same
+                // single uplink queue as the frames, so activityStart cannot be
+                // overtaken by the onset audio it is supposed to bound.
+                capture.UploadGateOpened += () =>
+                {
+                    UserTurnStarted();
+                    Enqueue(UplinkItem.Activity(ActivityMarker.Start));
+                };
+                capture.UploadGateClosed += () =>
+                {
+                    UserTurnEnded();
+                    Enqueue(UplinkItem.Activity(ActivityMarker.End));
+                };
+
+                // The gate is open for exactly as long as the user is audible.
+                userIsSpeaking = () => audio.Capture.IsUploading;
+            }
+            else
+            {
+                // Server VAD: the gate uploads continuously and so says nothing
+                // about turns — it opens and closes on assistant-audio boundaries.
+                // The server's endpointer decides instead, and the first thing we
+                // ever see of that decision is a transcript fragment. No activity
+                // markers here; sending them is a protocol error.
+                //
+                // Same emptiness test the "heard:" handler uses, so a stray blank
+                // transcript can't open a turn and inflate the turn count.
+                client.InputTranscript += text =>
+                {
+                    if (!string.IsNullOrWhiteSpace(text)) UserTurnStarted();
+                };
+
+                // Nothing announces that the server's endpointer closed a turn, so
+                // silence has to stand in for it — the same span the client gate
+                // uses for the same purpose, from the same setting.
+                userIsSpeaking = () =>
+                    DateTime.UtcNow - new DateTime(Volatile.Read(ref lastUserSpeechTicks), DateTimeKind.Utc)
+                        < TimeSpan.FromMilliseconds(LiveAudioCapture.HangoverMs);
+            }
 
             client.Interrupted += () =>
             {
@@ -521,6 +585,34 @@ namespace Personal_Assistant.Live
             };
         }
 
+        // ---- the user's turn -----------------------------------------------
+
+        // The user has started speaking. Idempotent, and deliberately free of any
+        // mode test: whichever observer calls it, a turn starting means the same
+        // four things.
+        private void UserTurnStarted()
+        {
+            Volatile.Write(ref lastUserSpeechTicks, DateTime.UtcNow.Ticks);
+            if (userTurnActive) return;
+            userTurnActive = true;
+
+            // A real user turn, and the ONLY thing that resets the idle budget.
+            // Assistant output must never reset it, or a talkative reply keeps its
+            // own session alive forever — see WatchdogAsync.
+            Interlocked.Exchange(ref idleMs, 0);
+            Interlocked.Increment(ref turns);
+
+            // The user is talking again, so whatever the model was still streaming
+            // for the turn they cut is no longer wanted.
+            suppressAssistantAudio = false;
+        }
+
+        // The user's turn is over. Idempotent for the same reason.
+        private void UserTurnEnded()
+        {
+            userTurnActive = false;
+        }
+
         private void OnAudioReceived(byte[] pcm)
         {
             if (pcm == null || pcm.Length == 0) return;
@@ -561,12 +653,14 @@ namespace Personal_Assistant.Live
         // Input transcripts stream in per-syllable — "in" / "tro" / "duce yourself
         // to Layth" is one utterance, not four. This used to overwrite, so the
         // bubble's "you said" label showed only the final fragment.
+        //
+        // Purely about the text now. Turn accounting used to be tangled in here
+        // for server VAD only, which is what made `inputTurnClosed` mean two
+        // unrelated things at once; UserTurnStarted owns that in both modes.
         private void AppendInputTranscript(string fragment)
         {
-            bool newTurn;
             lock (bubbleSync)
             {
-                newTurn = inputTurnClosed;
                 if (inputTurnClosed)
                 {
                     inputText.Clear();
@@ -574,21 +668,6 @@ namespace Personal_Assistant.Live
                 }
                 inputText.Append(fragment);
                 lastInputTranscript = inputText.ToString().Trim();
-            }
-
-            // The user speaking is what resets the idle clock — never assistant
-            // output, or a talkative reply keeps its own session alive forever.
-            // Under server VAD this is the ONLY user-activity signal, since the
-            // upload gate no longer tracks utterances.
-            Interlocked.Exchange(ref idleMs, 0);
-
-            if (newTurn && !options.ManualActivityDetection)
-            {
-                Interlocked.Increment(ref turns);
-
-                // Whatever the model was still streaming for a turn the user has
-                // spoken over is no longer wanted.
-                suppressAssistantAudio = false;
             }
         }
 
@@ -996,19 +1075,27 @@ namespace Personal_Assistant.Live
                         }
                     }
 
+                    // Nothing announces the end of a user turn under server VAD,
+                    // and under client endpointing a gate that failed to close
+                    // would hold the floor forever. Both are the same failure —
+                    // a turn nobody closed — so both get the same close, off the
+                    // one "is the user audibly speaking" observer.
+                    //
+                    // Without this the idle accumulator could never advance and
+                    // every session would run to the hard cap, which is exactly
+                    // the bug the mode-specific version of this test had.
+                    if (userTurnActive && !userIsSpeaking()) UserTurnEnded();
+
                     bool userHasTheFloor =
                         !assistantTurnActive &&
                         !toolRunning &&
                         !audio.Capture.AssistantAudioPlaying &&
                         !audio.Playback.IsPlaying &&
-                        // Under client endpointing an open gate means the user is
-                        // mid-utterance. Under server VAD the gate is open for the
-                        // whole session by design, so this test would be
-                        // permanently false — the idle window would never fire and
-                        // every session would run to the hard cap. There, arriving
-                        // transcripts are the signal instead, and they reset the
-                        // clock directly in AppendInputTranscript.
-                        (!options.ManualActivityDetection || !audio.Capture.IsUploading);
+                        // The floor is the user's when they are neither being
+                        // talked over nor mid-turn themselves. One test, both
+                        // endpointing modes — the observer above absorbed the
+                        // difference.
+                        !userTurnActive;
 
                     long elapsed = userHasTheFloor
                         ? Interlocked.Add(ref idleMs, (long)delta.TotalMilliseconds)

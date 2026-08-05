@@ -82,7 +82,13 @@ namespace Personal_Assistant.LiveAudio
         // every extra millisecond here is added latency before EVERY reply, since
         // the model cannot start until activityEnd. Lower it if replies feel
         // sluggish, raise it if sentences keep getting cut in half.
-        private static readonly int HangoverMs =
+        // Public because it is "how long a silence ends the user's turn", which is
+        // a question in BOTH endpointing modes. This gate answers it under client
+        // endpointing; under server VAD the gate is bypassed entirely and
+        // LiveSession applies the same span to the arriving transcripts instead.
+        // One setting, one meaning, so a session behaves the same way when the
+        // mode is flipped in App.config.
+        public static readonly int HangoverMs =
             LaithConfig.Int("LiveHangoverMs", 1200, min: 300, max: 5000);
         private static readonly int HangoverFrames = Math.Max(1, HangoverMs / BufferMs);
 
