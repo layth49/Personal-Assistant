@@ -82,6 +82,7 @@ namespace Personal_Assistant.LiveAudio
         // every extra millisecond here is added latency before EVERY reply, since
         // the model cannot start until activityEnd. Lower it if replies feel
         // sluggish, raise it if sentences keep getting cut in half.
+        //
         // Public because it is "how long a silence ends the user's turn", which is
         // a question in BOTH endpointing modes. This gate answers it under client
         // endpointing; under server VAD the gate is bypassed entirely and
@@ -115,6 +116,101 @@ namespace Personal_Assistant.LiveAudio
         private const double AbsoluteFloor = 0.006;
         private const double MaxDerivedFloor = 0.08;
 
+        // ---- input gain -----------------------------------------------------
+        //
+        // Native-audio Gemini does transcription and reasoning in ONE pass, so
+        // there is no recogniser to tune and no phrase list to bias — the only
+        // lever left on transcription quality is the signal we hand it.
+        //
+        // Measured on Layth's mic 2026-08-05: leaning back in the chair drops the
+        // mean frame level from ~0.055 to ~0.012, and the transcripts fall apart
+        // across that range in the same session ("unpause my video" at mean
+        // 0.0565, unintelligible garbage at 0.0133). `peak` barely moves between
+        // the two — it catches one plosive — which is why MEAN is the number to
+        // read on the utterance line.
+        //
+        // That 13 dB is unused range, not a signal-to-noise problem: ambient sits
+        // at ~0.0005 with headroom over 400x, so there is nothing down there to
+        // amplify along with the speech. So normalise toward a target instead of
+        // shipping whatever the room happened to deliver.
+        //
+        // Two rules keep this from becoming a distortion pedal:
+        //
+        //   1. It only ADAPTS on frames that are actually speech (at or above the
+        //      upload floor) and HOLDS its gain through silence. An AGC that
+        //      chased silence would wind up to maximum during a pause and then
+        //      hand the server's VAD a wall of amplified room tone — which under
+        //      server endpointing is a turn boundary, not just noise.
+        //   2. Gain falls fast and rises slowly. A syllable louder than the
+        //      estimate must not clip while that estimate catches up; but a slow
+        //      rise keeps a sentence at an even level rather than pumping between
+        //      words, and pumping is itself something ASR mishears.
+        //
+        // The peak cap is what makes the RMS target safe. Speech has a crest
+        // factor around 4x, so gain enough to put the MEAN at target would drive
+        // the loudest syllables past full scale; capping on the decaying peak
+        // envelope lands the level as high as it can go without the limiter
+        // having to do the work.
+        //
+        // It is also what frees the LEVEL estimate to be a plain symmetric
+        // average. The obvious AGC shape — fast attack, slow release — makes the
+        // estimate track the top of the frame-RMS spread rather than its middle,
+        // and the target here is a MEAN (0.05 is the measured mean of utterances
+        // that transcribed correctly). Pairing the two would silently under-gain
+        // by whatever the crest factor happens to be: ~1.7x instead of ~3.5x on
+        // the leaned-back case. Clip protection does not need the estimate to be
+        // fast, because peakEnvelope rises on the very first loud frame and the
+        // gain cap follows it within a few frames.
+
+        // 0 = adapt (the default). 1 = unity, i.e. off. Anything else is a fixed
+        // gain, for pinning the variable while testing something else.
+        private static readonly double GainSetting =
+            LaithConfig.Double("LiveInputGain", 0.0, 0.0, 16.0);
+
+        // Target mean level for adaptive mode — measured from the utterances that
+        // transcribed correctly, not picked.
+        private static readonly double GainTarget =
+            LaithConfig.Double("LiveInputTarget", 0.05, 0.005, 0.5);
+
+        private const double MaxAutoGain = 8.0;
+
+        // What counts as "speech" for the LEVEL ESTIMATE — deliberately far below
+        // the upload floor, and not the same test.
+        //
+        // Reusing the upload floor here was wrong and measurably so. At 0.006 it
+        // sits inside quiet speech rather than under it: on the leaned-back
+        // recording it excluded 43% of the frames, and precisely the quiet ones,
+        // so the estimate came out ~1.55x the true mean and the gain settled at
+        // 2.5x where 4x was needed. Meanwhile GainTarget was measured as a mean
+        // over ALL frames of an utterance — the two have to be the same statistic
+        // or the target is silently unreachable.
+        //
+        // Derived from ambient rather than fixed, so a genuinely noisy room
+        // raises the bar and this declines to amplify the noise along with the
+        // voice; the constant is only a floor under that for a very quiet room.
+        private const double GainAdaptRatio = 4.0;
+        private const double GainAdaptMinimum = 0.002;
+
+        // Speech frames to observe before the gain is allowed to move. Without it
+        // the very first syllable of a session sets the estimate on its own, and
+        // the gain lurches before settling.
+        private const int GainWarmupFrames = 25;   // 0.5 s of speech
+
+        // Leaves ~1 dB below full scale, so the per-sample clamp is a backstop
+        // rather than part of normal operation.
+        private const double PeakCeiling = 0.90;
+
+        // Per 20 ms frame, at 50 frames/s.
+        private const double SpeechRmsAlpha = 0.03;    // symmetric — ~0.7 s of speech
+        private const double GainFall = 0.25;          // ~80 ms, so a cap drop lands fast
+        private const double GainRise = 0.04;          // ~0.5 s, slow enough not to pump
+        private const double PeakDecay = 0.995;        // ~0.8x per second
+
+        private double speechRms;
+        private double peakEnvelope;
+        private double inputGain = 1.0;
+        private int gainWarmup;
+
         // One frame of 16 kHz mono PCM16, ready to go up as realtimeInput.audio.
         public event Action<byte[]> FrameReady;
 
@@ -133,10 +229,24 @@ namespace Personal_Assistant.LiveAudio
         private int onsetFrames;
         private int silentFrames;
         // Per-utterance signal stats, reported on gate close. Diagnostic only —
-        // nothing gates on these.
+        // nothing gates on these. Measured BEFORE gain, so they keep describing
+        // the room rather than what the gain stage made of it; the gain applied is
+        // reported alongside.
         private double utterancePeak;
         private double utteranceSum;
         private int utteranceFrames;
+
+        // The same, over SPEECH frames only.
+        //
+        // Under continuous upload a segment is mostly silence, so the plain mean
+        // above is diluted by whatever the speech-to-silence ratio happened to be
+        // — a 4460 ms segment and a 7480 ms one are not comparable measurements of
+        // how loud somebody was, and reading them as if they were is how the gain
+        // target came to be set from the wrong number. This one is comparable
+        // across utterances, and it is what the gain stage actually works on.
+        private double utteranceSpeechSum;
+        private double utteranceSpeechGainSum;
+        private int utteranceSpeechFrames;
 
         private readonly Queue<byte[]> preRoll = new Queue<byte[]>();
         private int preRollBytes;
@@ -170,7 +280,21 @@ namespace Personal_Assistant.LiveAudio
             if (floorOverride > 0)
             {
                 Console.WriteLine(
-                    $"[live-audio] upload floor pinned to {floorOverride:F4} by LAITH_LIVE_UPLOAD_FLOOR");
+                    $"[live-audio] upload floor pinned to {floorOverride:F4} by LiveUploadFloor");
+            }
+
+            if (GainSetting > 0)
+            {
+                inputGain = GainSetting;
+                Console.WriteLine(
+                    $"[live-audio] input gain fixed at {GainSetting:F2}x by LiveInputGain " +
+                    "(adaptive gain off)");
+            }
+            else
+            {
+                Console.WriteLine(
+                    $"[live-audio] input gain adaptive, target mean {GainTarget:F3} " +
+                    $"(max {MaxAutoGain:F0}x) — set LiveInputGain=1 to disable");
             }
         }
 
@@ -297,6 +421,11 @@ namespace Personal_Assistant.LiveAudio
             TrackAmbientFloor(rms);
             bool loud = rms >= UploadFloor;
 
+            // Before the gate decides anything, and on the raw level — the gate,
+            // the floor and the stats all keep measuring the room, and only the
+            // bytes that leave through Emit are amplified.
+            TrackInputGain(frame, rms);
+
             // Server VAD owns endpointing: upload everything the assistant isn't
             // covering and let the server find the boundaries. The gate is still
             // opened/closed so activity events and the utterance stats keep
@@ -304,9 +433,7 @@ namespace Personal_Assistant.LiveAudio
             if (UploadContinuously)
             {
                 if (!gateOpen) OpenGate();
-                if (rms > utterancePeak) utterancePeak = rms;
-                utteranceSum += rms;
-                utteranceFrames++;
+                TrackUtteranceStats(rms);
                 Emit(frame);
                 return;
             }
@@ -326,9 +453,7 @@ namespace Personal_Assistant.LiveAudio
                 return;
             }
 
-            if (rms > utterancePeak) utterancePeak = rms;
-            utteranceSum += rms;
-            utteranceFrames++;
+            TrackUtteranceStats(rms);
 
             if (loud)
             {
@@ -343,6 +468,28 @@ namespace Personal_Assistant.LiveAudio
 
             Emit(frame);
         }
+
+        // One place, called from both the gated and the continuous path. These
+        // used to be two identical copies at different indentation, which is
+        // exactly how a field got added to one of them and not the other.
+        private void TrackUtteranceStats(double rms)
+        {
+            if (rms > utterancePeak) utterancePeak = rms;
+            utteranceSum += rms;
+            utteranceFrames++;
+
+            if (rms < AdaptFloor) return;
+            utteranceSpeechSum += rms;
+            utteranceSpeechGainSum += inputGain;
+            utteranceSpeechFrames++;
+        }
+
+        // The level above which a frame is treated as speech for measurement and
+        // for gain adaptation — NOT the upload floor, which sits high enough to
+        // cut into quiet speech. Derived from ambient so a noisy room raises the
+        // bar rather than having its noise amplified.
+        private double AdaptFloor =>
+            Math.Max(ambientFloor * GainAdaptRatio, GainAdaptMinimum);
 
         // True if assistant audio (or the tail of it still coming out of the
         // speakers) covers this frame. Decrements the tail, so it must be called
@@ -364,6 +511,9 @@ namespace Personal_Assistant.LiveAudio
             utterancePeak = 0;
             utteranceSum = 0;
             utteranceFrames = 0;
+            utteranceSpeechSum = 0;
+            utteranceSpeechGainSum = 0;
+            utteranceSpeechFrames = 0;
             Raise(UploadGateOpened, nameof(UploadGateOpened));
 
             // Flush after the event so the session has already opened its
@@ -397,9 +547,23 @@ namespace Personal_Assistant.LiveAudio
             {
                 double mean = utteranceSum / utteranceFrames;
                 double headroom = ambientFloor > 0 ? utterancePeak / ambientFloor : 0;
+
+                int voiced = utteranceSpeechFrames;
+                double speech = voiced > 0 ? utteranceSpeechSum / voiced : 0;
+                double gain = voiced > 0 ? utteranceSpeechGainSum / voiced : 1.0;
+                double duty = 100.0 * voiced / utteranceFrames;
+
+                // `speech` and `out` are the numbers to compare between a good
+                // transcript and a bad one. `mean` is NOT comparable across
+                // utterances under continuous upload — it falls simply because a
+                // segment held more silence, which says nothing about how loud
+                // anyone was. `out` is what the model actually received, and it
+                // is what LiveInputTarget aims at.
                 Console.WriteLine(
                     $"[live-audio] utterance {utteranceFrames * BufferMs}ms  " +
                     $"peak={utterancePeak:F4} mean={mean:F4} " +
+                    $"speech={speech:F4} voiced={duty:F0}% " +
+                    $"gain={gain:F2}x out={speech * gain:F4} " +
                     $"ambient={ambientFloor:F4} floor={UploadFloor:F4} " +
                     $"headroom={headroom:F0}x hangover={HangoverMs}ms");
             }
@@ -427,14 +591,78 @@ namespace Personal_Assistant.LiveAudio
             onsetFrames = 0;
         }
 
+        // The one exit from this class, which is why the gain is applied here:
+        // the gated path, the continuous path and the pre-roll flush all pass
+        // through it, and a banked frame is emitted exactly once so scaling it in
+        // place cannot double up.
         private void Emit(byte[] frame)
         {
+            ApplyInputGain(frame);
+
             Interlocked.Increment(ref framesUploaded);
             Interlocked.Add(ref bytesUploaded, frame.Length);
             var handler = FrameReady;
             if (handler == null) return;
             try { handler(frame); }
             catch (Exception ex) { Console.WriteLine("[live-audio] FrameReady handler: " + ex.Message); }
+        }
+
+        // Updates the level estimate and the working gain. Runs on every frame so
+        // the peak envelope keeps decaying, but only ADAPTS on speech — see the
+        // input-gain notes at the top of the class for why holding through
+        // silence is the load-bearing half of this.
+        private void TrackInputGain(byte[] frame, double rms)
+        {
+            if (GainSetting > 0) return;   // pinned by config; nothing to adapt
+
+            double framePeak = FramePeak(frame);
+            peakEnvelope = Math.Max(framePeak, peakEnvelope * PeakDecay);
+
+            // Its own threshold, not the upload floor — see GainAdaptRatio.
+            if (rms < AdaptFloor) return;
+
+            // Symmetric, so this tracks the MEAN of the frame-RMS spread — the
+            // same statistic GainTarget was measured in. See the notes above for
+            // why it does not need an asymmetric attack.
+            speechRms = speechRms <= 0
+                ? rms
+                : speechRms + SpeechRmsAlpha * (rms - speechRms);
+
+            if (gainWarmup < GainWarmupFrames) { gainWarmup++; return; }
+
+            double wanted = MaxAutoGain;
+            if (speechRms > 0) wanted = Math.Min(wanted, GainTarget / speechRms);
+            if (peakEnvelope > 0) wanted = Math.Min(wanted, PeakCeiling / peakEnvelope);
+
+            // Never attenuate. Nothing observed on this mic comes close to full
+            // scale, so turning speech DOWN could only ever lose information —
+            // this is makeup gain, not a compressor.
+            if (wanted < 1.0) wanted = 1.0;
+
+            inputGain += (wanted < inputGain ? GainFall : GainRise) * (wanted - inputGain);
+        }
+
+        // Scales in place, clamping at full scale. The clamp should almost never
+        // fire — PeakCeiling exists so the gain is already low enough — but a
+        // transient that outruns the envelope has to be limited rather than
+        // wrapped, because a wrapped sample is a click and a click is something
+        // the model hears as a consonant.
+        private void ApplyInputGain(byte[] frame)
+        {
+            double gain = inputGain;
+            if (gain <= 1.0001 || frame == null) return;
+
+            int n = frame.Length / 2;
+            for (int i = 0; i < n; i++)
+            {
+                int s = (short)(frame[2 * i] | (frame[2 * i + 1] << 8));
+                int scaled = (int)(s * gain);
+                if (scaled > short.MaxValue) scaled = short.MaxValue;
+                else if (scaled < short.MinValue) scaled = short.MinValue;
+
+                frame[2 * i] = (byte)(scaled & 0xFF);
+                frame[2 * i + 1] = (byte)((scaled >> 8) & 0xFF);
+            }
         }
 
         // The room's noise floor. Seeded as a minimum over the first second, then
@@ -478,6 +706,24 @@ namespace Personal_Assistant.LiveAudio
                 sum += v * v;
             }
             return Math.Sqrt(sum / n);
+        }
+
+        // Largest absolute sample in one frame, 0..1. The gain stage caps on this
+        // rather than on RMS because speech has a crest factor around 4x — gain
+        // enough to put the MEAN on target would drive the loudest syllables past
+        // full scale.
+        internal static double FramePeak(byte[] pcm)
+        {
+            if (pcm == null || pcm.Length < 2) return 0.0;
+            int n = pcm.Length / 2;
+            int peak = 0;
+            for (int i = 0; i < n; i++)
+            {
+                int s = (short)(pcm[2 * i] | (pcm[2 * i + 1] << 8));
+                if (s < 0) s = -s;
+                if (s > peak) peak = s;
+            }
+            return peak / 32768.0;
         }
 
 
