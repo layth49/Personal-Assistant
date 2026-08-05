@@ -80,24 +80,50 @@ namespace Personal_Assistant.GeminiClient
             return client;
         }
 
+        // Whether Google Search grounding can be requested for a given model on
+        // THIS project. Measured 2026-08-04: every Gemini 3.x request carrying
+        // `google_search` returns 429 "exceeded your current quota" — the same
+        // request without it succeeds, and 2.5 grounding works fine. So the 3.x
+        // grounding allowance (documented as 5,000/month shared across 3.x) is
+        // not granted here.
+        //
+        // This matters more than it looks: asking for grounding a model cannot do
+        // is not a degraded answer, it is a hard failure of the whole request. It
+        // took out the Live session at setup AND the turn-based fallback, so an
+        // outage would have found no safety net. LAITH_GROUNDING=1 forces it back
+        // on if the allowance ever appears.
+        public static bool GroundingAvailableFor(string model)
+        {
+            string forced = Environment.GetEnvironmentVariable("LAITH_GROUNDING");
+            if (forced == "1") return true;
+            if (forced == "0") return false;
+            return !(model ?? string.Empty).StartsWith("gemini-3", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // The model id out of the endpoint URL, for the grounding check above.
+        private static string EndpointModel()
+        {
+            int slash = Endpoint.LastIndexOf('/');
+            int colon = Endpoint.LastIndexOf(':');
+            return slash >= 0 && colon > slash ? Endpoint.Substring(slash + 1, colon - slash - 1) : Endpoint;
+        }
+
         public static async Task<string> GenerateGeminiResponse(
             string inputText,
             IReadOnlyList<ConversationTurn> history)
         {
-            var requestBody = new
+            var requestBody = new Dictionary<string, object>
             {
-                system_instruction = new { parts = new[] { new { text = SystemPrompt } } },
-                contents = BuildContents(inputText, history),
+                ["system_instruction"] = new { parts = new[] { new { text = SystemPrompt } } },
+                ["contents"] = BuildContents(inputText, history),
                 // Google Search grounding — Gemini will run a web search when it
                 // helps answer the question, then cite the result. Lets the
                 // assistant answer about current events / facts past the model
                 // cutoff. Tool name is google_search (the snake_case form Gemini
                 // 2.0+ uses; the older googleSearchRetrieval is for 1.5 only).
-                tools = new[]
-                {
-                    new { google_search = new { } }
-                },
-                generationConfig = new
+                // Omitted entirely when the configured model has no grounding
+                // allowance — see GroundingAvailableFor.
+                ["generationConfig"] = new
                 {
                     temperature = 0.5,
                     topP = 0.5,
@@ -105,6 +131,11 @@ namespace Personal_Assistant.GeminiClient
                     maxOutputTokens = 200
                 }
             };
+
+            if (GroundingAvailableFor(EndpointModel()))
+            {
+                requestBody["tools"] = new[] { new { google_search = new { } } };
+            }
 
             var content = new StringContent(
                 JsonSerializer.Serialize(requestBody, JsonOpts),

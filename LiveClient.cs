@@ -63,6 +63,14 @@ namespace Personal_Assistant.Live
     // configuration for this project; a caller only has to supply Tools.
     public sealed class LiveSessionOptions
     {
+        public LiveSessionOptions()
+        {
+            // Set here rather than as an initialiser because it depends on Model:
+            // initialisers run in declaration order, so this would silently break
+            // if the two were ever reordered.
+            EnableGoogleSearch = GeminiService.GroundingAvailableFor(Model);
+        }
+
         // Both current Live models are preview and the ids move, so this is
         // env-overridable without a rebuild.
         public const string DefaultModel = "gemini-2.5-flash-native-audio-preview-12-2025";
@@ -110,7 +118,13 @@ namespace Personal_Assistant.Live
 
         // Keeps the Google Search grounding the turn-based path has today.
         // Live supports it in-session alongside function calling.
-        public bool EnableGoogleSearch { get; set; } = true;
+        //
+        // Defaults off for models with no grounding allowance on this project —
+        // currently every Gemini 3.x one. Requesting it there is not a degraded
+        // session, it is a 429 at setup that kills the connection outright, which
+        // is exactly how the gemini-3.1-flash-live-preview experiment "failed"
+        // while the model itself was fine. See GeminiService.GroundingAvailableFor.
+        public bool EnableGoogleSearch { get; set; }
 
         // Echo is settled: streaming the mic into a server-side VAD means the
         // model hears itself through the speakers, and five speaker runs on

@@ -235,6 +235,20 @@ namespace Personal_Assistant.Live
             this.options = options ?? new LiveSessionOptions();
             if (this.options.Tools == null) this.options.Tools = tools;
             this.options.SystemInstruction += BuildNameHints(this.context);
+
+            // Without grounding the model will still answer questions about the
+            // world — from training data, confidently, with no sign anything is
+            // missing. That is how "no announced release date for Re:Zero season
+            // 4 part 2" got said out loud as fact. If search is off, say so.
+            if (!this.options.EnableGoogleSearch)
+            {
+                this.options.SystemInstruction +=
+                    " You do NOT have web search in this session. For anything that depends on " +
+                    "current or recent information — news, release dates, prices, scores, " +
+                    "\"latest\" anything — say you can't look it up right now instead of answering " +
+                    "from memory. Offer to open a browser search with open_web_search. Answering " +
+                    "from memory and sounding certain is the worst thing you can do here.";
+            }
         }
 
         // The same model does transcription and reasoning, so the proper nouns it
@@ -335,6 +349,7 @@ namespace Personal_Assistant.Live
                 $"[live-session] opening — model '{options.Model}', " +
                 $"voice {(string.IsNullOrEmpty(options.Voice) ? "(server default — LAITH_LIVE_VOICE unset)" : options.Voice)}, " +
                 $"endpointing {(options.ManualActivityDetection ? "client (energy gate)" : "server VAD")}, " +
+                $"grounding {(options.EnableGoogleSearch ? "on" : "OFF")}, " +
                 $"hard cap {limits.HardCap.TotalSeconds:0}s, idle window {limits.IdleWindow.TotalSeconds:0}s");
 
             try
