@@ -90,7 +90,12 @@ namespace Personal_Assistant.Live
             "Never fabricate information; if you don't know or aren't sure, say so plainly.";
 
         public string Model { get; set; } =
-            Environment.GetEnvironmentVariable("LAITH_LIVE_MODEL") ?? DefaultModel;
+            // Whitespace-tolerant, not just null-tolerant: `setx VAR ""` is how
+            // you undo a setx, and it leaves an EMPTY value rather than removing
+            // the variable. `??` would have accepted that and sent an empty model
+            // id, failing in a way that looks nothing like "you unset the model".
+            Blank(Environment.GetEnvironmentVariable("LAITH_LIVE_MODEL")) ? DefaultModel
+                : Environment.GetEnvironmentVariable("LAITH_LIVE_MODEL").Trim();
 
         public string ApiKey { get; set; } = GeminiService.geminiApiKey;
 
@@ -129,7 +134,10 @@ namespace Personal_Assistant.Live
         // LAITH_LIVE_LANGUAGE only alongside a half-cascade model such as
         // gemini-3.1-flash-live-preview, whose separate ASR can be pinned.
         public string LanguageCode { get; set; } =
-            Environment.GetEnvironmentVariable("LAITH_LIVE_LANGUAGE");
+            Blank(Environment.GetEnvironmentVariable("LAITH_LIVE_LANGUAGE")) ? null
+                : Environment.GetEnvironmentVariable("LAITH_LIVE_LANGUAGE").Trim();
+
+        private static bool Blank(string s) => string.IsNullOrWhiteSpace(s);
 
         public bool InputAudioTranscription { get; set; } = true;
         public bool OutputAudioTranscription { get; set; } = true;
