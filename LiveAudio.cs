@@ -529,6 +529,17 @@ namespace Personal_Assistant.LiveAudio
 
         public bool IsPlaying { get { lock (gate) { return output != null; } } }
 
+        // Bytes still waiting to go to the device. Zero does NOT mean the room is
+        // silent — the driver holds ~DesiredLatency more — but it does mean this
+        // turn has stopped producing sound, which is the question the stalled-turn
+        // watchdog actually needs answered. "No audio has ARRIVED for a while" is
+        // a different question, and for a reply that downloads faster than it
+        // plays the two disagree by however much is buffered.
+        public int PendingBytes
+        {
+            get { lock (gate) { return buffer == null ? 0 : buffer.BufferedBytes; } }
+        }
+
         // 24 kHz mono PCM16, straight off the wire.
         public void Enqueue(byte[] pcm24)
         {

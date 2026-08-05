@@ -129,6 +129,13 @@ namespace Personal_Assistant.Live
         private volatile bool assistantTurnActive;
         private volatile bool toolRunning;
 
+        // Whether the server has ended the CURRENT model turn. Cleared when a turn
+        // opens, set by turnComplete.
+        //
+        // The stalled-turn rescue in the watchdog needs this and used to guess at
+        // it from audio arrival alone — see WatchdogAsync for what that cost.
+        private volatile bool turnCompleteSeen;
+
         // The user's turn — ONE signal, one meaning, whichever endpointer is in
         // charge.
         //
@@ -202,10 +209,24 @@ namespace Personal_Assistant.Live
         // written atomically across threads.
         private long lastAssistantAudioTicks;
 
-        // A model turn with no audio for this long, and no turnComplete, is not
-        // coming back. Long enough to survive ordinary network jitter between
-        // chunks, short enough that the user isn't left staring at a dead mic.
-        private static readonly TimeSpan AssistantAudioStallTimeout = TimeSpan.FromSeconds(5);
+        // A model turn with no audio for this long, no turnComplete, AND nothing
+        // left in the playback buffer is not coming back.
+        //
+        // This was 5 s back when arrival was the only test, and it had to be —
+        // "no chunk recently" is true for most of a long reply that is still being
+        // spoken, so anything shorter cut turns off mid-sentence. Requiring a dry
+        // buffer removed that ambiguity: the buffer running out means the room has
+        // ALREADY gone quiet, so this is no longer a guess about whether the reply
+        // has ended, only about whether more is coming after an audible gap.
+        //
+        // That is worth shortening, because turnComplete lands ~7 s after the last
+        // chunk on this model's long replies (measured) and the microphone stays
+        // gated shut until one or the other arrives. Every second here is a second
+        // the user cannot reply after the assistant has visibly stopped talking.
+        // 1.5 s still absorbs ordinary jitter, and a gap longer than that is one
+        // the user heard anyway. If a slow network ever starts chopping replies
+        // into two turns, this is the number to raise.
+        private static readonly TimeSpan AssistantAudioStallTimeout = TimeSpan.FromSeconds(1.5);
 
         // ---- speech bubble --------------------------------------------------
         //
@@ -566,6 +587,13 @@ namespace Personal_Assistant.Live
                 // speakers are still working through everything already buffered.
                 // Clearing it here would hand the floor back mid-sentence and end
                 // the barge-in watch while the reply is still audible.
+                //
+                // But it IS the end of the turn as far as the server is concerned,
+                // and the stalled-turn rescue needs to know that or it treats an
+                // ordinary long reply as a hang.
+                turnCompleteSeen = true;
+                Console.WriteLine("[live-session] model turn complete");
+
                 audio.EndAssistantAudio();
 
                 // No bubble flush here any more. The pump always renders the
@@ -657,6 +685,7 @@ namespace Personal_Assistant.Live
             {
                 assistantTurnActive = true;
                 replyNamesAssistant = false;
+                turnCompleteSeen = false;
                 StartWakewordWatch();
             }
 
@@ -1180,7 +1209,29 @@ namespace Personal_Assistant.Live
                     // reopens, so no user turn can arrive and the idle clock never
                     // runs. Nothing short of the hard cap would end it. Releasing
                     // the turn here turns that hang into a recovered conversation.
-                    if (assistantTurnActive)
+                    //
+                    // Two conditions beyond the timeout, and the second is the one
+                    // that was missing:
+                    //
+                    //   turnCompleteSeen — a turn the server has already ended is
+                    //   not stalled however long its audio takes to play out.
+                    //
+                    //   PendingBytes == 0 — the turn has stopped producing SOUND,
+                    //   which is not the same as no chunk having ARRIVED recently.
+                    //   The model streams a long reply far faster than it plays, so
+                    //   when the last chunk lands there can still be ten seconds
+                    //   buffered. Judging by arrival alone declared those turns dead
+                    //   mid-sentence and pulled the speech bubble off screen while
+                    //   the speakers were still going — measured at ~10 s early on a
+                    //   jet-engine answer, and it fired on essentially every long
+                    //   reply. Observed on this model: turnComplete itself lands
+                    //   ~5 s after the last chunk, so the timeout alone cannot
+                    //   separate the two cases either.
+                    //
+                    // A dry buffer with no turnComplete IS the wedge this exists
+                    // for: nothing more is coming, and without EndAudioInput the
+                    // playback monitor can never finish the turn.
+                    if (assistantTurnActive && !turnCompleteSeen && audio.Playback.PendingBytes == 0)
                     {
                         var since = now - new DateTime(Volatile.Read(ref lastAssistantAudioTicks), DateTimeKind.Utc);
                         if (since > AssistantAudioStallTimeout)
