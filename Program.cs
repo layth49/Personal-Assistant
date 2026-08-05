@@ -1522,9 +1522,45 @@ namespace Personal_Assistant
             {
                 lock (sync)
                 {
-                    pendingSubject = subject;
+                    pendingSubject = Canonical(subject);
                     pendingAtUtc = DateTime.UtcNow;
                 }
+            }
+
+            // Both sides of the match go through this, so a subject can only fail
+            // to match when the WORDS differ.
+            //
+            // The model retypes the subject on the confirming call and does not
+            // reproduce it byte for byte: the first real send_sms confirmation
+            // dropped a trailing full stop between the two calls, the Ordinal
+            // compare below missed, the gate silently re-armed, and the model
+            // announced it had sent a message that was never sent. Case,
+            // whitespace and trailing punctuation are not things a user can hear,
+            // so they cannot be things consent turns on.
+            //
+            // This lives here rather than in one handler because the gate is
+            // shared: power_control builds its subject the same way and would
+            // have failed the same way.
+            private static string Canonical(string subject)
+            {
+                if (string.IsNullOrWhiteSpace(subject)) return string.Empty;
+
+                var sb = new StringBuilder(subject.Length);
+                bool lastWasSpace = false;
+                foreach (char c in subject.Trim())
+                {
+                    if (char.IsWhiteSpace(c))
+                    {
+                        if (!lastWasSpace) sb.Append(' ');
+                        lastWasSpace = true;
+                    }
+                    else
+                    {
+                        sb.Append(char.ToLowerInvariant(c));
+                        lastWasSpace = false;
+                    }
+                }
+                return sb.ToString().TrimEnd('.', '!', '?', ',', ';', ':', ' ');
             }
 
             public static void Clear()
@@ -1539,9 +1575,18 @@ namespace Personal_Assistant
             {
                 lock (sync)
                 {
+                    string wanted = Canonical(subject);
                     if (pendingSubject == null ||
-                        !string.Equals(pendingSubject, subject, StringComparison.Ordinal))
+                        !string.Equals(pendingSubject, wanted, StringComparison.Ordinal))
                     {
+                        // The other two refusals below announce themselves; this one
+                        // used not to, which is exactly why an unsent SMS looked like
+                        // a sent one. A confirmation matching nothing is the most
+                        // suspicious of the three — it means the model confirmed
+                        // something the user was never asked about.
+                        Console.WriteLine(
+                            $"[confirm] '{wanted}' matches no armed request " +
+                            $"(pending: '{pendingSubject ?? "none"}') -> refused");
                         return false;
                     }
 
@@ -1697,17 +1742,11 @@ namespace Personal_Assistant
                 return ToolResult.Failed($"I don't have a number for {contact}.", "unknown_contact");
             }
 
-            // The subject binds the approval to this contact AND this body, so a
-            // "yes" cannot be spent on a message the user never heard read back.
-            //
-            // Normalised, because the model re-types the body on the confirming
-            // call and does not reproduce it byte for byte — the first real run of
-            // this dropped a trailing full stop between the two calls, the subject
-            // missed, and the gate silently re-asked while the model announced it
-            // had sent the message. Case, whitespace and trailing punctuation are
-            // not meaningful differences; different WORDS still miss, which is the
-            // property actually worth protecting.
-            string subject = "send_sms:" + contact.Trim().ToLowerInvariant() + ":" + NormalizeForConsent(message);
+            // Binds the approval to this contact AND this body, so a "yes" cannot
+            // be spent on a message the user never heard read back. ConfirmationGate
+            // canonicalises both sides, so trivial re-typing by the model does not
+            // break the match while different words still do.
+            string subject = "send_sms:" + contact + ":" + message;
 
             if (Confirmation.IsNo(confirmed))
             {
@@ -1724,23 +1763,14 @@ namespace Personal_Assistant
                 // changed, it expired, or the model issued it unprompted. Say so
                 // out loud: this case previously looked identical to a first ask,
                 // and the model responded by announcing it had sent the message.
-                if (Confirmation.IsYes(confirmed))
-                {
-                    Console.WriteLine(
-                        $"[confirm] send_sms 'yes' matched no armed request -> NOT sent. " +
-                        $"contact={contact} message=\"{message}\"");
-                }
-
                 ConfirmationGate.Arm(subject);
                 string question = $"You'd like to send \"{message}\" to {contact}. Should I send it?";
                 return ToolResult
                     .Speak(question)
                     .With("status", "needs_confirmation")
-                    .With("sent", "false")
                     .With("instruction",
                         "NOT sent. Ask the question verbatim and wait for the user's answer. " +
                         "Do not tell the user the message has been sent.")
-                    .With("question", question)
                     .With("contact", contact)
                     .With("message", message);
             }
@@ -1759,32 +1789,6 @@ namespace Personal_Assistant
                 .With("message", message);
         }
 
-        // Collapses the differences a model introduces when it repeats a body back
-        // — case, run-together whitespace, and trailing punctuation — while leaving
-        // the words themselves intact. Consent is bound to what the user HEARD,
-        // and they cannot hear a full stop.
-        private static string NormalizeForConsent(string text)
-        {
-            if (string.IsNullOrWhiteSpace(text)) return string.Empty;
-
-            var sb = new StringBuilder(text.Length);
-            bool lastWasSpace = false;
-            foreach (char c in text.Trim())
-            {
-                if (char.IsWhiteSpace(c))
-                {
-                    if (!lastWasSpace) sb.Append(' ');
-                    lastWasSpace = true;
-                }
-                else
-                {
-                    sb.Append(char.ToLowerInvariant(c));
-                    lastWasSpace = false;
-                }
-            }
-
-            return sb.ToString().TrimEnd('.', '!', '?', ',', ';', ':', ' ');
-        }
 
         // Pulls the message body out of "text mom I'll be late", for the keyword
         // fallback path. Everything after the contact's name is the body; if that

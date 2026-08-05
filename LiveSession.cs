@@ -199,7 +199,6 @@ namespace Personal_Assistant.Live
         private readonly StringBuilder inputText = new StringBuilder();
         private bool inputTurnClosed = true;
 
-        private bool bubbleShown;
         private DateTime lastBubbleUpdateUtc;
 
         // Transcript fragments arrive per-word — the prayer-times reply produced
@@ -602,24 +601,28 @@ namespace Personal_Assistant.Live
             lock (bubbleSync)
             {
                 replyText.Append(fragment);
-                reply = replyText.ToString();
-                userLabel = lastInputTranscript;
 
-                if (bubbleShown)
+                // bubbleShown is derivable: a fragment is never empty, so the
+                // bubble is up exactly when there is reply text.
+                post = replyText.Length == fragment.Length;
+                if (!post && DateTime.UtcNow - lastBubbleUpdateUtc < BubbleUpdateInterval)
                 {
-                    if (DateTime.UtcNow - lastBubbleUpdateUtc < BubbleUpdateInterval) return;
-                    post = false;
+                    // Return before ToString(): building the full reply only to
+                    // discard it allocated a growing copy per fragment, and a
+                    // reply runs to about forty of them.
+                    return;
                 }
-                else
-                {
-                    bubbleShown = true;
-                    post = true;
 
+                if (post)
+                {
                     // The assistant is replying, so the user's turn is over: the
                     // next input fragment starts a fresh utterance rather than
                     // extending the one now shown on the bubble.
                     inputTurnClosed = true;
                 }
+
+                reply = replyText.ToString();
+                userLabel = lastInputTranscript;
                 lastBubbleUpdateUtc = DateTime.UtcNow;
             }
 
@@ -641,7 +644,7 @@ namespace Personal_Assistant.Live
             string userLabel, reply;
             lock (bubbleSync)
             {
-                if (!bubbleShown || replyText.Length == 0) return;
+                if (replyText.Length == 0) return;
                 reply = replyText.ToString();
                 userLabel = lastInputTranscript;
                 lastBubbleUpdateUtc = DateTime.UtcNow;
@@ -656,8 +659,7 @@ namespace Personal_Assistant.Live
             bool wasShown;
             lock (bubbleSync)
             {
-                wasShown = bubbleShown;
-                bubbleShown = false;
+                wasShown = replyText.Length > 0;
                 replyText.Clear();
             }
             if (wasShown) TryBubble(() => speech.HideBubble());

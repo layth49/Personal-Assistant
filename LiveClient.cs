@@ -178,6 +178,11 @@ namespace Personal_Assistant.Live
         // Mic audio must go up as 16 kHz mono PCM16 little-endian.
         public const int InputSampleRate = 16000;
 
+        // Built once. Concatenating this per frame boxed InputSampleRate
+        // and allocated an identical string 50 times a second — which now
+        // runs for the whole session, since server VAD uploads continuously.
+        private const string InputMimeType = "audio/pcm;rate=16000";
+
         private const int ReceiveBufferSize = 16 * 1024;
 
         // Field names are already the exact wire spellings (function_declarations,
@@ -306,7 +311,7 @@ namespace Personal_Assistant.Live
                 {
                     ["audio"] = new Dictionary<string, object>
                     {
-                        ["mimeType"] = "audio/pcm;rate=" + InputSampleRate,
+                        ["mimeType"] = InputMimeType,
                         ["data"] = Convert.ToBase64String(pcm16, 0, count)
                     }
                 }

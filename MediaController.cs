@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Threading.Tasks;
 using Windows.Media.Control;
 using WindowsInput;
@@ -47,10 +47,8 @@ namespace Personal_Assistant.MediaControl
             string want = play ? "play" : "pause";
             try
             {
-                GlobalSystemMediaTransportControlsSessionManager manager =
-                    await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
-
-                GlobalSystemMediaTransportControlsSession session = manager?.GetCurrentSession();
+                GlobalSystemMediaTransportControlsSession session =
+                    await NowPlayingReader.TryGetCurrentSessionAsync();
                 if (session == null)
                 {
                     // Nothing owns the media session, so there is nothing to play

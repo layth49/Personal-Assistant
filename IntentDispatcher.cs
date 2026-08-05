@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -231,8 +231,7 @@ namespace Personal_Assistant.Dispatch
                     .Failed(null, error)
                     .With("instruction",
                         $"The call was REJECTED and '{name}' did not run — do not describe its " +
-                        $"result. Retry with the correct parameters: {expected}")
-                    .With("expected_parameters", expected);
+                        $"result. Retry with the correct parameters: {expected}");
             }
             Console.WriteLine($"[dispatch] RunTool '{name}' args=[{Describe(cleanArgs)}]");
             return await RunAsync(command, cleanArgs, speak);

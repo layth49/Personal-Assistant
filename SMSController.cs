@@ -92,18 +92,19 @@ namespace Personal_Assistant.SMSController
             }
         }
 
-        // How long to wait for each Phone Link control to appear. The window is
-        // launched ~1.5s earlier and populates progressively, so a single
-        // FindFirstDescendant right after launch legitimately misses — which is
-        // what produced the null message box.
-        private static readonly TimeSpan ElementTimeout = TimeSpan.FromSeconds(10);
+        // Budget for the WHOLE compose flow, not per control. The window is
+        // launched ~1.5s earlier and populates progressively, so one
+        // FindFirstDescendant right after launch legitimately misses — but 10s
+        // per control across three controls could outlast the session's 30s tool
+        // timeout, which reports failure to the model while the automation keeps
+        // running and the mic gate stays shut.
+        private static readonly TimeSpan ComposeBudget = TimeSpan.FromSeconds(8);
 
         // Polls for an element instead of taking one shot at it. Returns null on
         // timeout; every call site treats that as a hard failure.
         private static AutomationElement WaitForElement(
-            Window window, ConditionFactory cf, string automationId, TimeSpan timeout)
+            Window window, ConditionFactory cf, string automationId, DateTime deadline)
         {
-            var deadline = DateTime.UtcNow + timeout;
             do
             {
                 var found = window.FindFirstDescendant(cf.ByAutomationId(automationId));
@@ -144,43 +145,36 @@ namespace Personal_Assistant.SMSController
 
                 try
                 {
-                    // Each step is required. Previously the first two were `?.` and
-                    // the third was a bare dereference, so a compose click that
-                    // never landed walked silently into a NullReferenceException on
-                    // the message box — reporting the failure two steps after the
-                    // one that actually broke.
+                    // Every step is required, and a missing control means the
+                    // send did NOT happen. Previously the first two were `?.` and
+                    // the third a bare dereference, so a compose click that never
+                    // landed walked silently into a NullReferenceException on the
+                    // message box — blaming a step two later than the one that broke.
+                    DateTime deadline = DateTime.UtcNow + ComposeBudget;
 
-                    // 1. Find and click the Compose button
-                    var composeButton = WaitForElement(
-                        window, conditionFactory, "NewMessageButton", ElementTimeout)?.AsButton();
-                    if (composeButton == null)
+                    AutomationElement Require(string automationId, string label)
                     {
-                        Console.WriteLine("[sms] compose button never appeared — nothing was sent.");
-                        return false;
+                        var found = WaitForElement(window, conditionFactory, automationId, deadline);
+                        if (found == null)
+                        {
+                            Console.WriteLine($"[sms] {label} never appeared — nothing was sent.");
+                        }
+                        return found;
                     }
+
+                    var composeButton = Require("NewMessageButton", "compose button")?.AsButton();
+                    if (composeButton == null) return false;
                     composeButton.Invoke();
                     Wait.UntilInputIsProcessed(); // Let the UI catch up
 
-                    // 2. Find the "To" field, type number, press Enter
-                    var toField = WaitForElement(
-                        window, conditionFactory, "TextBox", ElementTimeout)?.AsTextBox();
-                    if (toField == null)
-                    {
-                        Console.WriteLine("[sms] recipient box never appeared — nothing was sent.");
-                        return false;
-                    }
+                    var toField = Require("TextBox", "recipient box")?.AsTextBox();
+                    if (toField == null) return false;
                     toField.Enter(contactNumber);
                     Keyboard.Press(VirtualKeyShort.ENTER);
                     Wait.UntilInputIsProcessed();
 
-                    // 3. Find the message box, type message, press Enter
-                    var messageBox = WaitForElement(
-                        window, conditionFactory, "InputTextBox", ElementTimeout)?.AsTextBox();
-                    if (messageBox == null)
-                    {
-                        Console.WriteLine("[sms] message box never appeared — nothing was sent.");
-                        return false;
-                    }
+                    var messageBox = Require("InputTextBox", "message box")?.AsTextBox();
+                    if (messageBox == null) return false;
                     messageBox.Text = message;
                     Keyboard.Press(VirtualKeyShort.ENTER);
 
