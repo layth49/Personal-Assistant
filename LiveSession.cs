@@ -216,6 +216,18 @@ namespace Personal_Assistant.Live
         //
         // There is no Azure synth here to flip the state dict that normally
         // retracts it, which is exactly what HideBubble exists for.
+        //
+        // Every one of those Python calls takes the GIL, and they used to run on
+        // LiveClient's receive loop — the same single thread that decodes the
+        // model's audio and hands it to playback. A reply produces roughly forty
+        // transcript fragments, so that thread was acquiring the GIL up to ~8
+        // times a second while it was the only thing keeping the voice fed. The
+        // bubble is decoration; it must never be able to stutter the audio. So it
+        // gets its own thread, and the receive loop only ever sets fields.
+        //
+        // Latest-wins rather than a queue, because the bubble has no history —
+        // only a current appearance. Intermediate states are worth nothing, and a
+        // queue would just accumulate lag behind a slow render.
         private readonly object bubbleSync = new object();
         private readonly StringBuilder replyText = new StringBuilder();
 
@@ -223,12 +235,24 @@ namespace Personal_Assistant.Live
         private readonly StringBuilder inputText = new StringBuilder();
         private bool inputTurnClosed = true;
 
-        private DateTime lastBubbleUpdateUtc;
+        // The appearance the bubble SHOULD have. The pump reconciles the real one
+        // to this and tracks what is actually on screen itself, which is what lets
+        // an arbitrary run of post/grow/hide collapse to the single right call.
+        // The text is read out of replyText under this lock at render time, so a
+        // growing reply costs one string per RENDER rather than one per fragment.
+        private bool bubbleWanted;
+        private string bubbleLabel = string.Empty;
+        private long bubbleVersion;
 
-        // Transcript fragments arrive per-word — the prayer-times reply produced
-        // roughly forty. Each update takes the Python GIL and re-renders the
-        // window, so they are coalesced; TurnComplete flushes the final text so
-        // throttling can never leave the last words off the bubble.
+        private Thread bubblePump;
+        private readonly ManualResetEventSlim bubbleSignal = new ManualResetEventSlim(false);
+        private volatile bool bubblePumpStopping;
+
+        // Fragments arrive per-word, and re-rendering the window forty times for
+        // one reply is wasted work even off the audio thread. The pump paces
+        // itself to this — and because it always renders the LATEST state rather
+        // than the one it was woken for, pacing can never leave the tail of a
+        // reply off the bubble the way a plain throttle could.
         private static readonly TimeSpan BubbleUpdateInterval = TimeSpan.FromMilliseconds(120);
 
         public LiveSession(
@@ -363,6 +387,10 @@ namespace Personal_Assistant.Live
 
             try
             {
+                // Before HookEvents, so the first transcript fragment of the
+                // session already has somewhere to go.
+                StartBubblePump();
+
                 client = new LiveClient(options);
                 audio = new LiveAudioPipeline();
 
@@ -540,9 +568,10 @@ namespace Personal_Assistant.Live
                 // the barge-in watch while the reply is still audible.
                 audio.EndAssistantAudio();
 
-                // Model output is complete, so this is the full reply text even if
-                // the last fragments landed inside the coalescing window.
-                FlushBubble();
+                // No bubble flush here any more. The pump always renders the
+                // LATEST state rather than the one it was woken for, so the final
+                // fragment lands on its own — a flush would only be re-asserting
+                // text the pump already has.
             };
 
             audio.Playback.PlaybackStarted += OnPlaybackStarted;
@@ -671,85 +700,180 @@ namespace Personal_Assistant.Live
             }
         }
 
+        // All three of these only ever set fields and wake the pump. Nothing on
+        // LiveClient's receive loop touches Python any more, which is the whole
+        // point — see the bubble field block above.
         private void ShowOrGrowBubble(string fragment)
         {
             if (speech == null) return;
 
-            string userLabel, reply;
-            bool post;
             lock (bubbleSync)
             {
-                replyText.Append(fragment);
-
-                // bubbleShown is derivable: a fragment is never empty, so the
-                // bubble is up exactly when there is reply text.
-                post = replyText.Length == fragment.Length;
-                if (!post && DateTime.UtcNow - lastBubbleUpdateUtc < BubbleUpdateInterval)
-                {
-                    // Return before ToString(): building the full reply only to
-                    // discard it allocated a growing copy per fragment, and a
-                    // reply runs to about forty of them.
-                    return;
-                }
-
-                if (post)
+                // A fragment is never empty, so an empty buffer means this is the
+                // first of a reply — no separate "is the bubble up" flag to keep
+                // in step with it.
+                if (replyText.Length == 0)
                 {
                     // The assistant is replying, so the user's turn is over: the
                     // next input fragment starts a fresh utterance rather than
                     // extending the one now shown on the bubble.
                     inputTurnClosed = true;
                 }
+                replyText.Append(fragment);
 
-                reply = replyText.ToString();
-                userLabel = lastInputTranscript;
-                lastBubbleUpdateUtc = DateTime.UtcNow;
+                bubbleWanted = true;
+                bubbleLabel = lastInputTranscript;
+                bubbleVersion++;
+                bubbleSignal.Set();
             }
-
-            // Outside the lock: these take the Python GIL, and holding a lock
-            // across the GIL is how you deadlock against the bubble daemon.
-            TryBubble(() =>
-            {
-                if (post) speech.SpeechBubble(userLabel, reply);
-                else speech.UpdateBubble(userLabel, reply);
-            });
-        }
-
-        // Flushes the complete reply text, so the coalescing above can't drop the
-        // tail of a turn. Called on turnComplete, while the audio is still playing.
-        private void FlushBubble()
-        {
-            if (speech == null) return;
-
-            string userLabel, reply;
-            lock (bubbleSync)
-            {
-                if (replyText.Length == 0) return;
-                reply = replyText.ToString();
-                userLabel = lastInputTranscript;
-                lastBubbleUpdateUtc = DateTime.UtcNow;
-            }
-            TryBubble(() => speech.UpdateBubble(userLabel, reply));
         }
 
         private void ClearBubble()
         {
             if (speech == null) return;
 
-            bool wasShown;
             lock (bubbleSync)
             {
-                wasShown = replyText.Length > 0;
                 replyText.Clear();
+                bubbleWanted = false;
+                bubbleVersion++;
+                bubbleSignal.Set();
             }
-            if (wasShown) TryBubble(() => speech.HideBubble());
         }
 
-        // The bubble is decoration. A Python-side failure must never take down a
-        // conversation that is otherwise working.
-        private static void TryBubble(Action action)
+        // ---- bubble pump ----------------------------------------------------
+
+        private void StartBubblePump()
         {
-            try { action(); }
-            catch (Exception ex) { Console.WriteLine($"[bubble] live-path update failed: {ex.Message}"); }
+            if (speech == null || bubblePump != null) return;
+
+            bubblePumpStopping = false;
+            bubblePump = new Thread(BubblePumpLoop)
+            {
+                IsBackground = true,
+                Name = "laith-live-bubble",
+            };
+            bubblePump.Start();
+        }
+
+        // Reconciles the real bubble to the wanted one, forever, on its own
+        // thread. It owns `shown` rather than reading it from shared state,
+        // because it is the only thing that can change what is on screen — which
+        // is what lets any run of post/grow/hide collapse to the one call that
+        // ends up being right.
+        private void BubblePumpLoop()
+        {
+            bool shown = false;
+            long rendered = -1;
+            DateTime lastRenderUtc = DateTime.MinValue;
+
+            try
+            {
+                while (true)
+                {
+                    bubbleSignal.Wait();
+                    if (bubblePumpStopping) break;
+
+                    bool wanted;
+                    string label, text;
+                    long version;
+                    lock (bubbleSync)
+                    {
+                        version = bubbleVersion;
+
+                        // Checked and reset under the same lock the setters take,
+                        // so a change made between the read and the reset cannot
+                        // be lost — the signal it set survives.
+                        if (version == rendered)
+                        {
+                            bubbleSignal.Reset();
+                            continue;
+                        }
+
+                        wanted = bubbleWanted;
+                        label = bubbleLabel;
+                        text = wanted ? replyText.ToString() : string.Empty;
+                    }
+
+                    // Pace only the case that actually repeats — text growing on a
+                    // bubble already up. Posting and retracting happen once each
+                    // and a delay on either would read as lag.
+                    //
+                    // The signal is deliberately NOT reset before sleeping: the
+                    // loop comes straight back, re-reads, and renders whatever the
+                    // latest state is by then. That is why pacing here can't drop
+                    // the tail of a reply the way the old throttle could, and why
+                    // turnComplete no longer needs to flush anything.
+                    if (shown && wanted)
+                    {
+                        TimeSpan since = DateTime.UtcNow - lastRenderUtc;
+                        if (since < BubbleUpdateInterval)
+                        {
+                            Thread.Sleep(BubbleUpdateInterval - since);
+                            continue;
+                        }
+                    }
+
+                    try
+                    {
+                        if (!wanted)
+                        {
+                            if (shown) { speech.HideBubble(); shown = false; }
+                        }
+                        else if (!shown)
+                        {
+                            speech.SpeechBubble(label, text);
+                            shown = true;
+                        }
+                        else
+                        {
+                            speech.UpdateBubble(label, text);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // The bubble is decoration. A Python-side failure must
+                        // never take down a conversation that is otherwise working
+                        // — and must not kill the pump either, or every later
+                        // bubble in the session goes missing too.
+                        Console.WriteLine($"[bubble] live-path update failed: {ex.Message}");
+                    }
+
+                    rendered = version;
+                    lastRenderUtc = DateTime.UtcNow;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[bubble] pump stopped: {ex.Message}");
+            }
+            finally
+            {
+                // A bubble must never outlive the conversation that posted it, and
+                // on this path nothing else would ever retract it.
+                if (shown)
+                {
+                    try { speech.HideBubble(); } catch { }
+                }
+            }
+        }
+
+        // Stops the pump where it stands rather than waiting for it to drain — the
+        // retraction ShutdownAsync just asked for is guaranteed by the loop's
+        // finally, not by processing the queue, so there is nothing to drain FOR.
+        private void StopBubblePump()
+        {
+            Thread pump = bubblePump;
+            if (pump == null) return;
+            bubblePump = null;
+
+            bubblePumpStopping = true;
+            bubbleSignal.Set();
+
+            // Bounded, because a wedged Python side must not stop the session
+            // closing — the finally above is what guarantees the retraction, and a
+            // pump that can't run is a pump whose bubble is already gone with it.
+            try { pump.Join(TimeSpan.FromSeconds(2)); } catch { }
         }
 
         private void OnPlaybackStarted()
@@ -1145,8 +1269,11 @@ namespace Personal_Assistant.Live
             StopWakewordWatch();
 
             // A bubble must never outlive the conversation that posted it — on a
-            // mid-reply close nothing else would ever retract it.
+            // mid-reply close nothing else would ever retract it. Ask first, then
+            // stop the pump: StopBubblePump retracts whatever is still on screen
+            // as it exits, so the retraction survives either way round.
             ClearBubble();
+            StopBubblePump();
 
             // Read the totals while the devices are still alive — the close log
             // is written after they have been disposed.
@@ -1254,6 +1381,13 @@ namespace Personal_Assistant.Live
             try { uplink.CompleteAdding(); } catch { }
             try { uplink.Dispose(); } catch { }
             StopWakewordWatch();
+
+            // bubbleSignal is deliberately NOT disposed. Bubble setters run from
+            // LiveClient's receive loop, which can still deliver a late event
+            // after this returns; a disposed event would turn that harmless
+            // no-op into an ObjectDisposedException on the socket's own thread.
+            // One ManualResetEventSlim per conversation is not worth that.
+            StopBubblePump();
             try { audio?.Dispose(); } catch { }
             try { client?.Dispose(); } catch { }
             try { capReg.Dispose(); } catch { }
