@@ -1,5 +1,6 @@
 ﻿using Microsoft.CognitiveServices.Speech;
 using Personal_Assistant.AppLaunching;
+using Personal_Assistant.Configuration;
 using Personal_Assistant.Arduino;
 using Personal_Assistant.AudioControl;
 using Personal_Assistant.Diagnostics;
@@ -117,10 +118,11 @@ namespace Personal_Assistant
             lines.AddRange(nightGreetings);
             lines.Add(Goodbye);
 
-            // Fired timers and alarms speak outside any Live session too. Must
-            // match ReminderService.Fire's wording exactly or the cache misses.
-            lines.Add("Your timer is done.");
-            lines.Add("Your alarm is going off.");
+            // Fired timers and alarms speak outside any Live session too. Taken
+            // from ReminderService rather than retyped — the wording has to match
+            // exactly or every pre-rendered clip misses.
+            lines.Add(ReminderService.AnnouncementFor(null, ReminderKind.Timer));
+            lines.Add(ReminderService.AnnouncementFor(null, ReminderKind.Alarm));
             return lines;
         }
 
@@ -137,15 +139,16 @@ namespace Personal_Assistant
         public static async Task Main(string[] args)
         {
             CheckEnvironmentVariables();
+            LaithConfig.Dump();
 
             // Offline mode: render the greeting/goodbye clips in the configured
             // Live voice and exit. Rendering goes through the Live API, which is
             // unmetered on this project, rather than the TTS model, which is
             // 3/min and 10/day. Re-run after changing LAITH_LIVE_VOICE.
-            int renderAt = args == null ? -1 : Array.IndexOf(args, "--render-clips");
+            int renderAt = Array.IndexOf(args, "--render-clips");
             if (renderAt >= 0)
             {
-                string voice = Environment.GetEnvironmentVariable("LAITH_LIVE_VOICE");
+                string voice = LiveSessionOptions.ConfiguredVoice;
 
                 // Any text after the switch is rendered instead of the standard
                 // set — for pre-rendering reminder labels you use often, so they
@@ -240,14 +243,14 @@ namespace Personal_Assistant
             // labelled reminder ("Reminder: take the bins out.") is user-supplied
             // text that cannot be pre-rendered, and falls back to Azure.
             var reminders = new ReminderService(
-                message => speechManager.SayClip("⏰", message),
+                message => speechManager.SayClip("⏰", message, renderOnMiss: true),
                 timerWidgets,
                 // Rendering a clip takes ~5-7s, so a labelled reminder gets its
                 // line rendered when the timer is SET rather than when it fires.
                 // By the time it goes off the clip is already cached, and the
                 // announcement is instant and in the right voice.
                 prepare: message => VoiceClipRenderer.TryEnsureAsync(
-                    Environment.GetEnvironmentVariable("LAITH_LIVE_VOICE"), message));
+                    LiveSessionOptions.ConfiguredVoice, message));
 
             // Shared dependencies handed to every command handler.
             var context = new CommandContext

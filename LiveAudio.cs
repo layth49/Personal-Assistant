@@ -1,4 +1,5 @@
-using NAudio.Wave;
+﻿using NAudio.Wave;
+using Personal_Assistant.Configuration;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -82,19 +83,9 @@ namespace Personal_Assistant.LiveAudio
         // the model cannot start until activityEnd. Lower it if replies feel
         // sluggish, raise it if sentences keep getting cut in half.
         private static readonly int HangoverMs =
-            ReadInt("LAITH_LIVE_HANGOVER_MS", 1200, min: 300, max: 5000);
+            LaithConfig.Int("LiveHangoverMs", 1200, min: 300, max: 5000);
         private static readonly int HangoverFrames = Math.Max(1, HangoverMs / BufferMs);
 
-        private static int ReadInt(string name, int fallback, int min, int max)
-        {
-            string raw = Environment.GetEnvironmentVariable(name);
-            if (!string.IsNullOrWhiteSpace(raw) &&
-                int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed))
-            {
-                return Math.Min(Math.Max(parsed, min), max);
-            }
-            return fallback;
-        }
 
         // Speakers are still sounding after the code thinks playback stopped.
         // Counted in FRAMES, not wall-clock: a frame count cannot drift from the
@@ -169,7 +160,7 @@ namespace Personal_Assistant.LiveAudio
 
         public LiveAudioCapture()
         {
-            floorOverride = ReadDouble("LAITH_LIVE_UPLOAD_FLOOR", 0.0);
+            floorOverride = LaithConfig.Double("LiveUploadFloor", 0.0, 0.0, 1.0);
             if (floorOverride > 0)
             {
                 Console.WriteLine(
@@ -483,18 +474,6 @@ namespace Personal_Assistant.LiveAudio
             return Math.Sqrt(sum / n);
         }
 
-        private static double ReadDouble(string name, double fallback)
-        {
-            string raw = Environment.GetEnvironmentVariable(name);
-            double parsed;
-            if (!string.IsNullOrWhiteSpace(raw) &&
-                double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out parsed) &&
-                parsed > 0)
-            {
-                return parsed;
-            }
-            return fallback;
-        }
 
         public void Dispose()
         {

@@ -4,6 +4,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using Personal_Assistant.Configuration;
 using System.Threading;
 using System.Threading.Tasks;
 using Personal_Assistant.Dispatch;
@@ -18,11 +19,18 @@ namespace Personal_Assistant.GeminiClient
         // (Microsoft guidance: do not new-up HttpClient per request on .NET Framework).
         private static readonly HttpClient httpClient = CreateHttpClient();
 
+        // gemini-2.5-flash-lite 404s — "no longer available to new users" — which
+        // silently broke this path, and this path is the fallback that only runs
+        // when the Live socket is already failing.
+        //
+        // Declared, not parsed back out of the URL: the grounding check below
+        // needs the model id, and recovering it with string-slicing meant any
+        // change to the URL shape would silently yield a wrong id and fail OPEN,
+        // re-enabling grounding on a model that 429s for it.
+        public const string ModelId = "gemini-3.1-flash-lite";
+
         private const string Endpoint =
-            // gemini-2.5-flash-lite 404s here — "no longer available to new users"
-            // — which silently broke this path, and this path is the fallback that
-            // only runs when the Live socket is already failing.
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent";
+            "https://generativelanguage.googleapis.com/v1beta/models/" + ModelId + ":generateContent";
 
         private const string SystemPrompt =
             "You are L.A.I.T.H., Layth's personal voice assistant running on his computer. " +
@@ -90,23 +98,24 @@ namespace Personal_Assistant.GeminiClient
         // This matters more than it looks: asking for grounding a model cannot do
         // is not a degraded answer, it is a hard failure of the whole request. It
         // took out the Live session at setup AND the turn-based fallback, so an
-        // outage would have found no safety net. LAITH_GROUNDING=1 forces it back
-        // on if the allowance ever appears.
+        // outage would have found no safety net. The `Grounding` setting forces it
+        // either way if the allowance ever appears.
         public static bool GroundingAvailableFor(string model)
         {
-            string forced = Environment.GetEnvironmentVariable("LAITH_GROUNDING");
-            if (forced == "1") return true;
-            if (forced == "0") return false;
+            bool? forced = LaithConfig.TriState("Grounding");
+            if (forced.HasValue) return forced.Value;
             return !(model ?? string.Empty).StartsWith("gemini-3", StringComparison.OrdinalIgnoreCase);
         }
 
-        // The model id out of the endpoint URL, for the grounding check above.
-        private static string EndpointModel()
-        {
-            int slash = Endpoint.LastIndexOf('/');
-            int colon = Endpoint.LastIndexOf(':');
-            return slash >= 0 && colon > slash ? Endpoint.Substring(slash + 1, colon - slash - 1) : Endpoint;
-        }
+        // Appended to a system prompt whenever grounding is unavailable. Without
+        // it the model still answers questions about the world — from training
+        // data, confidently, with nothing to show the answer wasn't looked up.
+        // That is how a wrong Re:Zero release date got stated as fact.
+        public const string NoSearchCaveat =
+            " You do NOT have web search available. For anything that depends on current or recent " +
+            "information — news, release dates, prices, scores, \"latest\" anything — say you can't " +
+            "look it up right now instead of answering from memory. Answering from memory and " +
+            "sounding certain is the worst thing you can do here.";
 
         public static async Task<string> GenerateGeminiResponse(
             string inputText,
@@ -114,7 +123,13 @@ namespace Personal_Assistant.GeminiClient
         {
             var requestBody = new Dictionary<string, object>
             {
-                ["system_instruction"] = new { parts = new[] { new { text = SystemPrompt } } },
+                ["system_instruction"] = new
+                {
+                    parts = new[]
+                    {
+                        new { text = GroundingAvailableFor(ModelId) ? SystemPrompt : SystemPrompt + NoSearchCaveat }
+                    }
+                },
                 ["contents"] = BuildContents(inputText, history),
                 // Google Search grounding — Gemini will run a web search when it
                 // helps answer the question, then cite the result. Lets the
@@ -132,7 +147,7 @@ namespace Personal_Assistant.GeminiClient
                 }
             };
 
-            if (GroundingAvailableFor(EndpointModel()))
+            if (GroundingAvailableFor(ModelId))
             {
                 requestBody["tools"] = new[] { new { google_search = new { } } };
             }

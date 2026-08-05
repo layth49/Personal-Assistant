@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -6,8 +6,10 @@ using System.Globalization;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Personal_Assistant.Configuration;
 using Personal_Assistant.Diagnostics;
 using Personal_Assistant.Dispatch;
+using Personal_Assistant.GeminiClient;
 using Personal_Assistant.LiveAudio;
 using Personal_Assistant.SpeechManager;
 
@@ -24,34 +26,22 @@ namespace Personal_Assistant.Live
         // Comfortably under the API's own 15-minute audio-only session cap so we
         // are never the party that finds out what the server does at the limit.
         public TimeSpan HardCap { get; set; } =
-            ReadTimeSpan("LAITH_LIVE_HARD_CAP_SECONDS", TimeSpan.FromMinutes(10));
+            LaithConfig.Seconds("LiveHardCapSeconds", 600, 30, 870);
 
         // How long the user may go quiet — while actually able to be heard, see
         // IdleElapsed — before the conversation closes. local-laith's measured
         // follow-up window, so follow-ups don't need re-waking.
         public TimeSpan IdleWindow { get; set; } =
-            ReadTimeSpan("LAITH_LIVE_IDLE_SECONDS", TimeSpan.FromSeconds(12));
+            LaithConfig.Seconds("LiveIdleSeconds", 12, 3, 120);
 
         // A handler that never returns must not become a stuck session by proxy.
         public TimeSpan ToolTimeout { get; set; } =
-            ReadTimeSpan("LAITH_LIVE_TOOL_TIMEOUT_SECONDS", TimeSpan.FromSeconds(30));
+            LaithConfig.Seconds("LiveToolTimeoutSeconds", 30, 5, 120);
 
         // How often the watchdog re-checks. Fine enough that the idle accumulator
         // tracks reality, coarse enough to be free.
         public TimeSpan TickInterval { get; set; } = TimeSpan.FromMilliseconds(250);
 
-        private static TimeSpan ReadTimeSpan(string name, TimeSpan fallback)
-        {
-            string raw = Environment.GetEnvironmentVariable(name);
-            double seconds;
-            if (!string.IsNullOrWhiteSpace(raw) &&
-                double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out seconds) &&
-                seconds > 0)
-            {
-                return TimeSpan.FromSeconds(seconds);
-            }
-            return fallback;
-        }
     }
 
     // Why a session ended. Distinguishes the ordinary exits from the ones that
@@ -242,12 +232,8 @@ namespace Personal_Assistant.Live
             // 4 part 2" got said out loud as fact. If search is off, say so.
             if (!this.options.EnableGoogleSearch)
             {
-                this.options.SystemInstruction +=
-                    " You do NOT have web search in this session. For anything that depends on " +
-                    "current or recent information — news, release dates, prices, scores, " +
-                    "\"latest\" anything — say you can't look it up right now instead of answering " +
-                    "from memory. Offer to open a browser search with open_web_search. Answering " +
-                    "from memory and sounding certain is the worst thing you can do here.";
+                this.options.SystemInstruction += GeminiService.NoSearchCaveat +
+                    " Offer to open a browser search with open_web_search instead.";
             }
         }
 

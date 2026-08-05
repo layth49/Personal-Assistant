@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net.WebSockets;
@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Personal_Assistant.Configuration;
 using Personal_Assistant.Dispatch;
 using Personal_Assistant.GeminiClient;
 
@@ -63,14 +64,6 @@ namespace Personal_Assistant.Live
     // configuration for this project; a caller only has to supply Tools.
     public sealed class LiveSessionOptions
     {
-        public LiveSessionOptions()
-        {
-            // Set here rather than as an initialiser because it depends on Model:
-            // initialisers run in declaration order, so this would silently break
-            // if the two were ever reordered.
-            EnableGoogleSearch = GeminiService.GroundingAvailableFor(Model);
-        }
-
         // Both current Live models are preview and the ids move, so this is
         // env-overridable without a rebuild.
         public const string DefaultModel = "gemini-2.5-flash-native-audio-preview-12-2025";
@@ -97,13 +90,7 @@ namespace Personal_Assistant.Live
             "Tone is direct and casual, like a capable assistant who knows Layth well — not stiff or overly formal. " +
             "Never fabricate information; if you don't know or aren't sure, say so plainly.";
 
-        public string Model { get; set; } =
-            // Whitespace-tolerant, not just null-tolerant: `setx VAR ""` is how
-            // you undo a setx, and it leaves an EMPTY value rather than removing
-            // the variable. `??` would have accepted that and sent an empty model
-            // id, failing in a way that looks nothing like "you unset the model".
-            Blank(Environment.GetEnvironmentVariable("LAITH_LIVE_MODEL")) ? DefaultModel
-                : Environment.GetEnvironmentVariable("LAITH_LIVE_MODEL").Trim();
+        public string Model { get; set; } = LaithConfig.Text("LiveModel", DefaultModel);
 
         public string ApiKey { get; set; } = GeminiService.geminiApiKey;
 
@@ -111,8 +98,15 @@ namespace Personal_Assistant.Live
 
         // Prebuilt voice name (Kore, Puck, Charon, ...). Null leaves the
         // model's default.
-        public string Voice { get; set; } =
-            Environment.GetEnvironmentVariable("LAITH_LIVE_VOICE");
+        //
+        // ConfiguredVoice is the ONE accessor for this setting. The clip cache is
+        // keyed on the voice string, so if the value read when a clip is rendered
+        // and the value sent to the session ever differ — by a stray space, say —
+        // the cache silently misses forever and the greeting quietly reverts to
+        // the Azure voice. Reading it in one place makes that impossible.
+        public static string ConfiguredVoice => LaithConfig.Text("LiveVoice", null);
+
+        public string Voice { get; set; } = ConfiguredVoice;
 
         public IReadOnlyList<ToolDefinition> Tools { get; set; }
 
@@ -124,34 +118,35 @@ namespace Personal_Assistant.Live
         // session, it is a 429 at setup that kills the connection outright, which
         // is exactly how the gemini-3.1-flash-live-preview experiment "failed"
         // while the model itself was fine. See GeminiService.GroundingAvailableFor.
-        public bool EnableGoogleSearch { get; set; }
+        // Derived, not snapshotted: C# runs object initialisers AFTER the
+        // constructor, so caching this in the ctor meant
+        // `new LiveSessionOptions { Model = "gemini-3.1-flash-live-preview" }`
+        // computed grounding from the DEFAULT model and re-created the 429-at-
+        // setup this flag exists to prevent.
+        private bool? enableGoogleSearch;
+        public bool EnableGoogleSearch
+        {
+            get => enableGoogleSearch ?? GeminiService.GroundingAvailableFor(Model);
+            set => enableGoogleSearch = value;
+        }
 
-        // Echo is settled: streaming the mic into a server-side VAD means the
-        // model hears itself through the speakers, and five speaker runs on
-        // local-laith established that no level threshold separates bleed from
-        // speech. So the client owns turn boundaries via activityStart /
-        // activityEnd, and mic frames stop uploading while the assistant talks.
-        // Do not flip this on without real AEC.
+        // Who decides where a user's turn ends. Previously forced to the client:
+        // without the half-duplex gate, no level threshold separated speaker
+        // bleed from speech, so the model would interrupt itself.
         //
-        // Switchable, because the settled conclusion above was reached on a
-        // pipeline WITHOUT the half-duplex gate. That gate drops every mic frame
-        // while assistant audio plays, so the model cannot hear itself and the
-        // server's VAD only ever sees Layth — which is what makes server-side
-        // endpointing safe to try at all. It is still UNPROVEN on speakers, where
-        // the echo tail is the only thing covering the gap between playback
-        // ending and sound stopping. Set LAITH_LIVE_SERVER_VAD=0 to revert.
+        // The gate now drops every mic frame while assistant audio plays, so the
+        // model cannot hear itself and the server's VAD only ever sees Layth —
+        // which is what makes server endpointing safe, and it stopped sentences
+        // being cut in half at a pause. Still UNPROVEN against a mistuned echo
+        // tail on speakers; set LiveServerVad=false to revert.
         public bool ManualActivityDetection { get; set; } =
-            Environment.GetEnvironmentVariable("LAITH_LIVE_SERVER_VAD") == "0";
+            !LaithConfig.Bool("LiveServerVad", true);
 
         // BCP-47 code for the input ASR, e.g. "en-US". Unset by default: the
-        // native-audio models this normally runs on do not accept it. Set
-        // LAITH_LIVE_LANGUAGE only alongside a half-cascade model such as
-        // gemini-3.1-flash-live-preview, whose separate ASR can be pinned.
-        public string LanguageCode { get; set; } =
-            Blank(Environment.GetEnvironmentVariable("LAITH_LIVE_LANGUAGE")) ? null
-                : Environment.GetEnvironmentVariable("LAITH_LIVE_LANGUAGE").Trim();
-
-        private static bool Blank(string s) => string.IsNullOrWhiteSpace(s);
+        // native-audio models this normally runs on ignore it. Meaningful only
+        // for a half-cascade model such as gemini-3.1-flash-live-preview, whose
+        // separate ASR can be pinned.
+        public string LanguageCode { get; set; } = LaithConfig.Text("LiveLanguage", null);
 
         public bool InputAudioTranscription { get; set; } = true;
         public bool OutputAudioTranscription { get; set; } = true;

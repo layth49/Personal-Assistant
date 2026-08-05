@@ -1,6 +1,7 @@
 ﻿using Microsoft.CognitiveServices.Speech;
 using Microsoft.CognitiveServices.Speech.Audio;
 using Personal_Assistant.Diagnostics;
+using Personal_Assistant.Live;
 using Personal_Assistant.VoiceClips;
 using Python.Runtime;
 using System;
@@ -467,23 +468,35 @@ namespace Personal_Assistant.SpeechManager
         // Identical bracketing to Say: the bubble, BeginSpeaking/EndSpeaking and
         // sayGate all apply, because a clip is assistant audio like any other and
         // the echo gate has to know about it.
-        public async Task SayClip(string userInput, string response)
+        /// <param name="renderOnMiss">
+        /// Whether an unrendered line may be rendered right now — which takes 5-7s.
+        /// TRUE only for reminders, where "a beat late in the right voice" beats a
+        /// different voice appearing from nowhere. FALSE for the greeting and the
+        /// goodbye: the greeting exists to cover socket setup, so blocking it would
+        /// turn an instant hello into seven seconds of silence after the wake word,
+        /// which is worse than the wrong voice for one utterance.
+        /// </param>
+        public async Task SayClip(string userInput, string response, bool renderOnMiss = false)
         {
-            string voice = Environment.GetEnvironmentVariable("LAITH_LIVE_VOICE");
+            string voice = LiveSessionOptions.ConfiguredVoice;
 
-            // A miss is rendered now rather than dropping to the other voice.
-            // Layth's call: a labelled reminder arriving a beat late is better
-            // than a different voice appearing out of nowhere. Only the FIRST
-            // utterance of a given line pays this; it is cached afterwards.
             if (!VoiceClipCache.TryGet(voice, response, out string clip))
             {
-                await VoiceClipRenderer.TryEnsureAsync(voice, response);
-            }
+                if (!renderOnMiss)
+                {
+                    // Speak now in the old voice, and render in the background so
+                    // the NEXT time this line comes up it is a hit.
+                    _ = Task.Run(() => VoiceClipRenderer.TryEnsureAsync(voice, response));
+                    await Say(userInput, response);
+                    return;
+                }
 
-            if (!VoiceClipCache.TryGet(voice, response, out clip))
-            {
-                await Say(userInput, response);
-                return;
+                if (!await VoiceClipRenderer.TryEnsureAsync(voice, response) ||
+                    !VoiceClipCache.TryGet(voice, response, out clip))
+                {
+                    await Say(userInput, response);
+                    return;
+                }
             }
 
             await sayGate.WaitAsync();

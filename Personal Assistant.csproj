@@ -268,6 +268,7 @@
       <Private>True</Private>
       <Private>True</Private>
     </Reference>
+    <Reference Include="System.Configuration" />
     <Reference Include="System.Core" />
     <Reference Include="System.Device" />
     <Reference Include="System.Diagnostics.DiagnosticSource, Version=9.0.0.7, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
@@ -436,6 +437,7 @@
     <Compile Include="LatencyTracker.cs" />
     <Compile Include="LightAutomator.cs" />
     <Compile Include="LiveAudio.cs" />
+    <Compile Include="LaithConfig.cs" />
     <Compile Include="LiveClient.cs" />
     <Compile Include="LiveSession.cs" />
     <Compile Include="VoiceClips.cs" />
