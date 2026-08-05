@@ -252,9 +252,17 @@ namespace Personal_Assistant.Dispatch
             {
                 // Pronunciation-critical answers. The bubble still shows the plain
                 // text, so the SSML markup never reaches the screen.
-                var synth = context.Speech.SynthesizeSsmlAsync(result.Ssml);
-                context.Speech.SpeechBubble(context.RecognizedText, result.Speech ?? string.Empty);
-                await synth;
+                //
+                // Through SaySsml rather than driving the synth and the bubble
+                // directly: that is the only form that takes sayGate and brackets
+                // the audio in BeginSpeaking/EndSpeaking. Hand-rolled, this was the
+                // one speech path in the codebase doing neither — a reminder firing
+                // during the ~15s prayer-times announcement started a second synth
+                // over the top of it and its SpeechBubble replaced the shared
+                // `state`, so the first bubble's retract flipped the wrong dict and
+                // it never came off screen.
+                await context.Speech.SaySsml(
+                    context.RecognizedText, result.Speech ?? string.Empty, result.Ssml);
             }
             else if (speak && !string.IsNullOrWhiteSpace(result.Speech))
             {

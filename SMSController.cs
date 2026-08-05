@@ -21,7 +21,12 @@ namespace Personal_Assistant.SMSController
         private readonly InputSimulator simulator = new InputSimulator();
 
         // The canned message behind "text her to introduce yourself".
-        private const string IntroductionText =
+        //
+        // Public because the substitution has to happen ABOVE the confirmation
+        // gate, in Program.HandleSendSmsAsync, not here. See IsIntroductionRequest
+        // there — swapping the body at this depth meant the user approved one
+        // message and a different one was sent.
+        public const string IntroductionText =
             "Hello! This was sent by L.A.I.T.H.49, AKA Layth's Logical Assistant for Intelligent Task Handling 49!";
 
         // Sends `message` to `contactNumber` through Phone Link. Returns whether it
@@ -53,10 +58,10 @@ namespace Personal_Assistant.SMSController
                 return false;
             }
 
-            if (message.IndexOf("introduce yourself", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                message = IntroductionText;
-            }
+            // No body rewriting here, deliberately. Whatever reaches this method
+            // is what the user was read back and said yes to, and the last place
+            // a message may change is above that read-back — see
+            // Program.HandleSendSmsAsync.
 
             try
             {

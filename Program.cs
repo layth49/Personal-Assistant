@@ -1764,6 +1764,15 @@ namespace Personal_Assistant
                     "empty_message");
             }
 
+            // "text her to introduce yourself" is an instruction, not a body.
+            // Substituting the canned introduction has to happen HERE, above
+            // everything else: the read-back below quotes `message`, the gate
+            // subject binds to `message`, and the result reports `message`. Doing
+            // the swap inside SMSControl.SendSMS — i.e. after the user had already
+            // said yes — meant the read-back quoted one text, the gate consented
+            // to it, and a different one went to a real phone.
+            if (IsIntroductionRequest(message)) message = SMSControl.IntroductionText;
+
             if (ctx.Contacts == null ||
                 !ctx.Contacts.TryGetValue(contact, out string number) ||
                 string.IsNullOrWhiteSpace(number))
@@ -1818,6 +1827,22 @@ namespace Personal_Assistant
                 .With("message", message);
         }
 
+
+        // Whether the "body" is really the standing request to send the canned
+        // self-introduction, left over from when this flow dictated its own text.
+        //
+        // Matched whole, not scanned for. The substring test this replaces fired
+        // on any occurrence anywhere, so "text mom that I still need to introduce
+        // yourself to the new manager" had its entire body thrown away and
+        // replaced with the introduction.
+        private static bool IsIntroductionRequest(string message)
+        {
+            string t = message.Trim().TrimEnd('.', '!', '?').Trim();
+            return t.Equals("introduce yourself", StringComparison.OrdinalIgnoreCase)
+                || t.Equals("introduce yourself to them", StringComparison.OrdinalIgnoreCase)
+                || t.Equals("introduce yourself to her", StringComparison.OrdinalIgnoreCase)
+                || t.Equals("introduce yourself to him", StringComparison.OrdinalIgnoreCase);
+        }
 
         // Pulls the message body out of "text mom I'll be late", for the keyword
         // fallback path. Everything after the contact's name is the body; if that
