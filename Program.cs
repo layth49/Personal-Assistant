@@ -144,7 +144,7 @@ namespace Personal_Assistant
             // Offline mode: render the greeting/goodbye clips in the configured
             // Live voice and exit. Rendering goes through the Live API, which is
             // unmetered on this project, rather than the TTS model, which is
-            // 3/min and 10/day. Re-run after changing LAITH_LIVE_VOICE.
+            // 3/min and 10/day. Re-run after changing LiveVoice.
             int renderAt = Array.IndexOf(args, "--render-clips");
             if (renderAt >= 0)
             {
@@ -512,6 +512,21 @@ namespace Personal_Assistant
                     // voice a result. Awaiting the goodbye is what keeps it from
                     // being cut off mid-word by the process ending.
                     await ctx.Speech.SayClip(ctx.RecognizedText, Goodbye);
+
+                    // Close the session BEFORE Python goes away, not after.
+                    // Environment.Exit fires ProcessExit, which closes it anyway —
+                    // but by then the interpreter is gone, and disposing a session
+                    // stops its bubble pump, whose exit path retracts the bubble
+                    // through pythonnet. That is a Py.GIL() into a shut-down
+                    // interpreter, and HideBubble only catches PythonException.
+                    // This tool runs from inside a Live session that has almost
+                    // certainly posted a bubble for the model's own goodbye, so
+                    // the ordering is reachable on the ordinary path.
+                    //
+                    // CloseActiveSession takes the field with Interlocked.Exchange,
+                    // so the ProcessExit handler simply finds nothing to do.
+                    CloseActiveSession("exit_assistant");
+
                     PythonEngine.Shutdown();
                     Environment.Exit(0);
                 }));

@@ -112,7 +112,9 @@ namespace Personal_Assistant.VoiceClips
         {
             if (string.IsNullOrEmpty(voice))
             {
-                Console.WriteLine("[clips] no voice configured — set LAITH_LIVE_VOICE first");
+                Console.WriteLine(
+                    "[clips] no voice configured — set LiveVoice in " +
+                    "'Personal Assistant.exe.config' first");
                 return 0;
             }
 

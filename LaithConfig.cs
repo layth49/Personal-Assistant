@@ -24,9 +24,23 @@ namespace Personal_Assistant.Configuration
     // SPEECH_REGION, CONTACTS_PATH. Those are not settings and are not listed here.
     public static class LaithConfig
     {
-        // key -> (value, source), recorded as each setting resolves so Dump() can
-        // report what actually took effect rather than re-deriving it.
-        private static readonly List<string> resolved = new List<string>();
+        // key -> "key=value (source)", recorded as each setting resolves so Dump()
+        // can report what actually took effect rather than re-deriving it.
+        //
+        // Keyed and sorted rather than appended, for two reasons. Most of these
+        // are read from INSTANCE initialisers (LiveSessionOptions, LiveAudioCapture),
+        // so every conversation re-resolves the same handful of settings — an
+        // append-only list grew for the life of the process and would have made a
+        // later Dump() print each setting once per session. And it is locked
+        // because those constructions happen on session threads, not just at
+        // startup. Sorted keeps the startup line in a stable, scannable order.
+        private static readonly SortedDictionary<string, string> resolved =
+            new SortedDictionary<string, string>(StringComparer.Ordinal);
+
+        private static void Note(string key, string line)
+        {
+            lock (resolved) { resolved[key] = line; }
+        }
 
         private const string EnvPrefix = "LAITH_";
 
@@ -67,7 +81,7 @@ namespace Personal_Assistant.Configuration
 
         private static T Record<T>(string key, T value, string source)
         {
-            resolved.Add($"{key}={value} ({source})");
+            Note(key, $"{key}={value} ({source})");
             return value;
         }
 
@@ -141,7 +155,7 @@ namespace Personal_Assistant.Configuration
         public static bool? TriState(string key)
         {
             bool? v = TriState(key, out string source);
-            resolved.Add($"{key}={(v.HasValue ? v.ToString() : "auto")} ({source})");
+            Note(key, $"{key}={(v.HasValue ? v.ToString() : "auto")} ({source})");
             return v;
         }
 
@@ -152,12 +166,17 @@ namespace Personal_Assistant.Configuration
         /// </summary>
         public static void Dump()
         {
-            if (resolved.Count == 0)
+            string line;
+            lock (resolved)
             {
-                Console.WriteLine("[config] all settings at their defaults");
-                return;
+                if (resolved.Count == 0)
+                {
+                    Console.WriteLine("[config] all settings at their defaults");
+                    return;
+                }
+                line = string.Join("  ", resolved.Values);
             }
-            Console.WriteLine("[config] " + string.Join("  ", resolved));
+            Console.WriteLine("[config] " + line);
         }
     }
 }

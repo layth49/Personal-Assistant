@@ -787,30 +787,39 @@ namespace Personal_Assistant.LiveAudio
         }
 
         // 24 kHz mono PCM16, straight off the wire.
-        public void Enqueue(byte[] pcm24)
+        //
+        // Returns false when the bytes were NOT accepted — no output device, or
+        // a rejected AddSamples. That return value is load-bearing rather than
+        // informational: PlaybackFinished is what reopens the microphone gate,
+        // and it can only ever fire for audio this method took. A caller that
+        // shut the gate for audio that was refused has to reopen it itself, or
+        // the session goes deaf for the rest of its life. See
+        // LiveAudioPipeline.EnqueueAssistantAudio.
+        public bool Enqueue(byte[] pcm24)
         {
-            if (pcm24 == null || pcm24.Length == 0) return;
-            Enqueue(pcm24, 0, pcm24.Length);
+            if (pcm24 == null || pcm24.Length == 0) return false;
+            return Enqueue(pcm24, 0, pcm24.Length);
         }
 
-        public void Enqueue(byte[] pcm24, int offset, int count)
+        public bool Enqueue(byte[] pcm24, int offset, int count)
         {
-            if (disposed || pcm24 == null || count <= 0) return;
+            if (disposed || pcm24 == null || count <= 0) return false;
             lock (gate)
             {
                 EnsureOutput();
-                if (output == null) return;
+                if (output == null) return false;
                 inputEnded = false;
                 try { buffer.AddSamples(pcm24, offset, count); }
                 catch (Exception ex)
                 {
                     Console.WriteLine("[live-audio] playback enqueue failed: " + ex.Message);
-                    return;
+                    return false;
                 }
                 // Counted only once the bytes are really in, or a rejected
                 // AddSamples would leave the drain test permanently unsatisfied.
                 bytesEnqueued += count;
                 MaybeStart();
+                return true;
             }
         }
 
@@ -1046,10 +1055,21 @@ namespace Personal_Assistant.LiveAudio
         // One frame of model audio. Closing the mic gate here rather than on
         // PlaybackStarted is deliberate: the gate must already be shut before the
         // first sound reaches the room.
+        //
+        // If playback REFUSES the frame there is no sound coming, so the gate has
+        // to be reopened here — nothing else would. The only thing that normally
+        // reopens it is PlaybackFinished, which the playback side can only raise
+        // for audio it accepted, and every downstream rescue routes through the
+        // same dead end: the watchdog's stall path calls EndAudioInput, which
+        // returns immediately when there is no output device. So an output device
+        // that fails to open (in use, none default, a Bluetooth drop) used to
+        // latch the microphone shut, keep `userHasTheFloor` false so the idle
+        // clock never advanced, and run the whole conversation to the 600s hard
+        // cap in silence.
         public void EnqueueAssistantAudio(byte[] pcm24)
         {
             Capture.BeginAssistantAudio();
-            Playback.Enqueue(pcm24);
+            if (!Playback.Enqueue(pcm24)) Capture.EndAssistantAudio();
         }
 
         public void EndAssistantAudio() => Playback.EndAudioInput();

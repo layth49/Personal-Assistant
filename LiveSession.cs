@@ -401,7 +401,7 @@ namespace Personal_Assistant.Live
             Console.WriteLine($"[session] opening at {openedLocal:HH:mm:ss}");
             Console.WriteLine(
                 $"[live-session] opening — model '{options.Model}', " +
-                $"voice {(string.IsNullOrEmpty(options.Voice) ? "(server default — LAITH_LIVE_VOICE unset)" : options.Voice)}, " +
+                $"voice {(string.IsNullOrEmpty(options.Voice) ? "(server default — LiveVoice unset)" : options.Voice)}, " +
                 $"endpointing {(options.ManualActivityDetection ? "client (energy gate)" : "server VAD")}, " +
                 $"grounding {(options.EnableGoogleSearch ? "on" : "OFF")}, " +
                 $"hard cap {limits.HardCap.TotalSeconds:0}s, idle window {limits.IdleWindow.TotalSeconds:0}s");
