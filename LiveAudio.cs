@@ -369,6 +369,37 @@ namespace Personal_Assistant.LiveAudio
             Volatile.Write(ref echoTail, EchoTailFrames);
         }
 
+        // The same gate, for assistant audio this pipeline did NOT produce: a
+        // fired timer, a prayer announcement, a standing rule. Those play through
+        // SpeechService (a clip, or Azure TTS) on a completely separate output
+        // path, so EnqueueAssistantAudio never sees them and the microphone stayed
+        // wide open while the speakers were talking — on speakers, the Live model
+        // then answered the assistant's own voice.
+        //
+        // Deliberately a SECOND flag rather than reusing assistantSpeaking. The
+        // two sources overlap (a timer can fire mid-reply), and sharing one bool
+        // would let whichever finished first reopen the gate while the other was
+        // still audible. Sharing a counter instead would put the model's audio
+        // path — the one that works — at the mercy of an unbalanced external
+        // Begin/End. Two independent flags, OR'd at the single point of use,
+        // cannot interfere with each other in either direction.
+        private volatile bool externalAudio;
+
+        public bool ExternalAudioPlaying => externalAudio;
+
+        public void BeginExternalAudio()
+        {
+            externalAudio = true;
+        }
+
+        public void EndExternalAudio()
+        {
+            externalAudio = false;
+            // Same speaker-tail guard the model's audio gets: the sound is still
+            // leaving the room for a few frames after the last sample is handed over.
+            Volatile.Write(ref echoTail, EchoTailFrames);
+        }
+
         // Listen afresh from right now: no echo tail, no half-formed onset, no
         // stale pre-roll.
         //
@@ -386,6 +417,10 @@ namespace Personal_Assistant.LiveAudio
         public void RestartCapture()
         {
             assistantSpeaking = false;
+            // Cleared too, so a barge-in can never be swallowed by an external
+            // announcement whose End was missed. This is also the recovery path
+            // if BeginExternalAudio were ever left latched on.
+            externalAudio = false;
             Volatile.Write(ref echoTail, 0);
             DropPreRoll();
             if (gateOpen) CloseGate();
@@ -496,7 +531,7 @@ namespace Personal_Assistant.LiveAudio
         // exactly once per frame.
         private bool ConsumeAssistantAudioFrame()
         {
-            if (assistantSpeaking) return true;
+            if (assistantSpeaking || externalAudio) return true;
             int remaining = Volatile.Read(ref echoTail);
             if (remaining <= 0) return false;
             Volatile.Write(ref echoTail, remaining - 1);
@@ -1030,11 +1065,21 @@ namespace Personal_Assistant.LiveAudio
     }
 
     // Capture and playback wired half-duplex. This is the surface Phase 3
-    // consumes: it hooks FrameReady to SendAudioAsync, the gate transitions to
-    // activityStart/activityEnd, and routes Begin/EndAssistantAudio through
-    // SpeechService.BeginSpeaking/EndSpeaking — there is exactly one
-    // SpeechService (SpeechService.Current) and every path that produces
-    // assistant audio goes through that bracket.
+    // consumes: it hooks FrameReady to SendAudioAsync and the gate transitions to
+    // activityStart/activityEnd.
+    //
+    // NOTE, corrected 2026-08-07: this comment used to claim it "routes
+    // Begin/EndAssistantAudio through SpeechService.BeginSpeaking/EndSpeaking"
+    // and that "every path that produces assistant audio goes through that
+    // bracket". Neither was true — nothing here referenced SpeechService, and
+    // LiveSession never took sayGate — so a timer or announcement firing during a
+    // conversation played over the reply AND into the open microphone.
+    //
+    // The mic gate now really does close for both, but the wiring is the other
+    // way round from what that claim described: LiveSession subscribes to
+    // SpeechService.AssistantSpeechStarted/Ended and calls
+    // Capture.Begin/EndExternalAudio. This class still knows nothing about
+    // SpeechService, which is what keeps it testable without Azure.
     public sealed class LiveAudioPipeline : IDisposable
     {
         public LiveAudioCapture Capture { get; }

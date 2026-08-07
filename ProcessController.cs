@@ -29,16 +29,49 @@ namespace Personal_Assistant.ProcessControl
                 "winlogon", "services", "lsass", "smss", "explorer"
             };
 
-        // Kills every process whose name matches `name` (with or without a
-        // trailing ".exe"). Returns how many were terminated and the normalized
-        // name that was matched against.
-        public KillResult KillByName(string name)
+        // Whether any process with this (image) name is running. Used by standing
+        // triggers to notice an app starting or stopping, so it runs on the
+        // trigger ticker once a second: GetProcessesByName is a single filtered
+        // snapshot rather than a full enumeration, which is cheap enough for that,
+        // but keep anything heavier out of this path.
+        // Virtual so a harness can drive the app_starts / app_stops triggers off a
+        // flag instead of a real program starting and stopping on cue.
+        public virtual bool IsRunning(string name)
+        {
+            string bare = Normalize(name);
+            if (bare.Length == 0) return false;
+            try
+            {
+                Process[] found = Process.GetProcessesByName(bare);
+                foreach (Process p in found) p.Dispose();
+                return found.Length > 0;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[process] could not check '{bare}': {ex.Message}");
+                return false;
+            }
+        }
+
+        // Trims and drops a trailing ".exe" — users say "discord", Task Manager
+        // says "Discord.exe", and Process.GetProcessesByName wants neither the
+        // extension nor the whitespace.
+        private static string Normalize(string name)
         {
             string bare = (name ?? string.Empty).Trim();
             if (bare.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
             {
                 bare = bare.Substring(0, bare.Length - 4);
             }
+            return bare;
+        }
+
+        // Kills every process whose name matches `name` (with or without a
+        // trailing ".exe"). Returns how many were terminated and the normalized
+        // name that was matched against.
+        public KillResult KillByName(string name)
+        {
+            string bare = Normalize(name);
 
             if (bare.Length == 0 || Protected.Contains(bare))
             {

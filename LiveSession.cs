@@ -428,6 +428,17 @@ namespace Personal_Assistant.Live
                 // and the truncation this was meant to fix survives the change.
                 audio.Capture.UploadContinuously = !options.ManualActivityDetection;
 
+                // Anything that speaks outside this session — a fired timer, a
+                // prayer announcement, a standing rule — plays through
+                // SpeechService on a separate output path this pipeline never
+                // sees. Without this the microphone stayed open through it, and
+                // on speakers the model answered the assistant's own voice.
+                //
+                // These two events are raised inside sayGate and EndSpeaking is in
+                // a finally on every SpeechService path, so they always come in
+                // pairs. Unhooked in TeardownAsync.
+                HookExternalAudio();
+
                 HookEvents();
 
                 await client.ConnectAsync(ct).ConfigureAwait(false);
@@ -1376,6 +1387,11 @@ namespace Personal_Assistant.Live
 
             // Disposal, not just closure. CloseAsync can itself fail; Dispose
             // aborts, and both are idempotent.
+            // Before the pipeline goes: these handlers close over `audio`, and a
+            // stale subscription on the one long-lived SpeechService would have
+            // every future session's announcements poking a disposed capture.
+            UnhookExternalAudio();
+
             try { client?.Dispose(); } catch { }
             try { audio?.Dispose(); } catch { }
             client = null;
@@ -1384,6 +1400,50 @@ namespace Personal_Assistant.Live
             try { capReg.Dispose(); } catch { }
             try { sessionCts?.Dispose(); } catch { }
             sessionCts = null;
+        }
+
+        // Handlers kept in fields so they can be unsubscribed by identity — a
+        // lambda subscribed inline cannot be, and this session outlives none of
+        // the SpeechService it attaches to.
+        private Action<string> onExternalSpeechStarted;
+        private Action onExternalSpeechEnded;
+
+        private void HookExternalAudio()
+        {
+            if (speech == null) return; // no SpeechService (the smoke harness)
+
+            onExternalSpeechStarted = _ =>
+            {
+                // Read once: teardown can null `audio` between the check and use.
+                LiveAudioPipeline pipeline = audio;
+                if (pipeline == null) return;
+                Console.WriteLine("[live-session] external audio started — closing the mic gate");
+                pipeline.Capture.BeginExternalAudio();
+            };
+            onExternalSpeechEnded = () =>
+            {
+                LiveAudioPipeline pipeline = audio;
+                if (pipeline == null) return;
+                pipeline.Capture.EndExternalAudio();
+            };
+
+            speech.AssistantSpeechStarted += onExternalSpeechStarted;
+            speech.AssistantSpeechEnded += onExternalSpeechEnded;
+        }
+
+        private void UnhookExternalAudio()
+        {
+            if (speech == null) return;
+            if (onExternalSpeechStarted != null)
+            {
+                speech.AssistantSpeechStarted -= onExternalSpeechStarted;
+                onExternalSpeechStarted = null;
+            }
+            if (onExternalSpeechEnded != null)
+            {
+                speech.AssistantSpeechEnded -= onExternalSpeechEnded;
+                onExternalSpeechEnded = null;
+            }
         }
 
         private void LogClose()

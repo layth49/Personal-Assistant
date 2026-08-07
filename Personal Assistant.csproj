@@ -429,8 +429,10 @@
     <Compile Include="AppLauncher.cs" />
     <Compile Include="Arduino.cs" />
     <Compile Include="AudioController.cs" />
+    <Compile Include="BatteryReader.cs" />
     <Compile Include="ConversationMemory.cs" />
     <Compile Include="GeminiClient.cs" />
+    <Compile Include="FinishedFileWatcher.cs" />
     <Compile Include="Geolocator.cs" />
     <Compile Include="IntentDispatcher.cs" />
     <Compile Include="IsExternalInit.cs" />
@@ -444,7 +446,9 @@
     <Compile Include="MediaController.cs" />
     <Compile Include="NowPlayingReader.cs" />
     <Compile Include="PlaystationController.cs" />
+    <Compile Include="PrayerAnnouncer.cs" />
     <Compile Include="PrayerTimesCalculator.cs" />
+    <Compile Include="PresenceGate.cs" />
     <Compile Include="ProcessController.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="ReminderService.cs" />
@@ -454,7 +458,10 @@
     <Compile Include="SpeechManager.cs" />
     <Compile Include="TimerWidgetHost.cs" />
     <Compile Include="ToolRegistry.cs" />
+    <Compile Include="TriggerService.cs" />
+    <Compile Include="TriggerSpec.cs" />
     <Compile Include="VoiceCommand.cs" />
+    <Compile Include="VoiceTriggers.cs" />
     <Compile Include="WeatherService.cs" />
   </ItemGroup>
   <ItemGroup>

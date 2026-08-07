@@ -202,6 +202,19 @@ namespace Personal_Assistant.Reminders
         internal static bool TryParseNextOccurrence(string timeText, out DateTime fireAt)
         {
             fireAt = default(DateTime);
+            return TryParseTimeOfDay(timeText, out TimeSpan tod) && ToNextOccurrence(tod, out fireAt);
+        }
+
+        /// <summary>
+        /// Parses a spoken or written clock time into a time of day, leniently:
+        /// "17:30", "5:30 PM", "7 AM", "07:00". Split out from
+        /// TryParseNextOccurrence because standing rules need the time of day
+        /// itself, not the next moment it comes round — a daily rule is stored as
+        /// "08:00", and which 08:00 it means is decided every day.
+        /// </summary>
+        public static bool TryParseTimeOfDay(string timeText, out TimeSpan timeOfDay)
+        {
+            timeOfDay = default(TimeSpan);
             if (string.IsNullOrWhiteSpace(timeText)) return false;
 
             string t = timeText.Trim();
@@ -212,7 +225,8 @@ namespace Personal_Assistant.Reminders
             {
                 if (tod >= TimeSpan.Zero && tod < TimeSpan.FromDays(1))
                 {
-                    return ToNextOccurrence(tod, out fireAt);
+                    timeOfDay = tod;
+                    return true;
                 }
             }
 
@@ -225,7 +239,8 @@ namespace Personal_Assistant.Reminders
                     DateTimeStyles.None, out DateTime parsed) ||
                 DateTime.TryParse(t, CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed))
             {
-                return ToNextOccurrence(parsed.TimeOfDay, out fireAt);
+                timeOfDay = parsed.TimeOfDay;
+                return true;
             }
 
             return false;

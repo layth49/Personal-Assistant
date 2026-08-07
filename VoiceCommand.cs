@@ -155,6 +155,14 @@ namespace Personal_Assistant.Dispatch
         public MediaController Media { get; init; }
         public NowPlayingReader NowPlaying { get; init; }
         public ReminderService Reminders { get; init; }
+        public Personal_Assistant.Power.BatteryReader Battery { get; init; }
+            = new Personal_Assistant.Power.BatteryReader();
+
+        // Standing rules the user created by voice. Null when the trigger engine
+        // isn't wired — the Live smoke harness builds a context without one — and
+        // BuildRegistry then simply doesn't offer set_trigger/list/cancel.
+        public Personal_Assistant.Triggers.VoiceTriggers VoiceTriggers { get; init; }
+
         public IReadOnlyDictionary<string, string> Contacts { get; init; }
         public string IpAddressPlug { get; init; }
         public string IpAddressSwitch { get; init; }
