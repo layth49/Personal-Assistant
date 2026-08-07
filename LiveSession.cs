@@ -35,8 +35,16 @@ namespace Personal_Assistant.Live
             LaithConfig.Seconds("LiveIdleSeconds", 12, 3, 120);
 
         // A handler that never returns must not become a stuck session by proxy.
+        //
+        // Sized off turn_on_playstation, the slowest handler: up to 30s waiting for
+        // the Remote Play window, then a 6s settle, then the navigation keystrokes
+        // — over 36s before it can possibly return. At the previous 30s a launch
+        // that was working perfectly reported "timed out" to the model, which then
+        // told the user it had failed while the game was loading in front of them.
+        // The microphone is gated shut for this whole span, so it is not free; the
+        // hard cap is what bounds it in the end.
         public TimeSpan ToolTimeout { get; set; } =
-            LaithConfig.Seconds("LiveToolTimeoutSeconds", 30, 5, 120);
+            LaithConfig.Seconds("LiveToolTimeoutSeconds", 60, 5, 120);
 
         // How often the watchdog re-checks. Fine enough that the idle accumulator
         // tracks reality, coarse enough to be free.
@@ -1001,7 +1009,7 @@ namespace Personal_Assistant.Live
             if (calls == null || calls.Count == 0) return;
 
             toolRunning = true;
-            audio.Capture.BeginAssistantAudio();
+            audio?.Capture?.BeginAssistantAudio();
 
             var results = new List<LiveFunctionResult>(calls.Count);
             try
@@ -1056,9 +1064,17 @@ namespace Personal_Assistant.Live
                 // Drop anything withdrawn while it was running, then send ONE
                 // toolResponse carrying the batch, id-matched.
                 results.RemoveAll(r => IsCancelled(r.Id));
-                if (results.Count > 0 && client.IsOpen)
+
+                // Read into locals first. This method is fire-and-forget, so
+                // ShutdownAsync can null both fields between the test and the use —
+                // and IsOpen is false for a disposed client anyway, so a session
+                // that ended simply skips the send instead of logging a failure
+                // for having been shut down on purpose.
+                LiveClient c = client;
+                CancellationTokenSource cts = sessionCts;
+                if (results.Count > 0 && c != null && cts != null && c.IsOpen)
                 {
-                    await client.SendToolResponseAsync(results, sessionCts.Token).ConfigureAwait(false);
+                    await c.SendToolResponseAsync(results, cts.Token).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) { }
@@ -1068,7 +1084,15 @@ namespace Personal_Assistant.Live
             }
             finally
             {
-                audio.Capture.EndAssistantAudio();
+                // Null-guarded because this method is fire-and-forget
+                // (`_ = HandleToolCallAsync(calls)`) and can still be running when
+                // ShutdownAsync sets `audio` to null — a hard cap or a Ctrl+C while
+                // a tool is in flight. Unguarded, the NullReferenceException thrown
+                // FROM a finally propagates out of a task nobody awaits: the batch
+                // never cleared toolRunning, and the failure surfaced only as an
+                // unobserved task exception at GC, i.e. nowhere. The [crash] logger
+                // added in 3ca8b45 would not have caught it either.
+                audio?.Capture?.EndAssistantAudio();
                 toolRunning = false;
             }
         }

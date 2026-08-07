@@ -24,6 +24,24 @@ namespace Personal_Assistant.MediaControl
     // as a fallback for sessions that don't implement the explicit controls,
     // and there it is guarded by the reported playback status so it still
     // cannot flip a session that is already in the requested state.
+    // What a play/pause command managed to do.
+    //
+    // Three states rather than a bool because the caller speaks the difference:
+    // "nothing is playing" and "the session refused" are different sentences, and
+    // collapsing them meant the assistant announced "Nothing is playing right now"
+    // about a session that was playing and had merely declined the command.
+    public enum MediaCommandResult
+    {
+        /// <summary>The session is now in the requested state.</summary>
+        Done,
+
+        /// <summary>Nothing owns the system media session.</summary>
+        NoSession,
+
+        /// <summary>A session exists, but the command did not take.</summary>
+        Refused,
+    }
+
     public class MediaController
     {
         private readonly InputSimulator simulator = new InputSimulator();
@@ -37,12 +55,12 @@ namespace Personal_Assistant.MediaControl
         public void Stop() => Press(VirtualKeyCode.MEDIA_STOP);
 
         /// <summary>Ensures playback is running. Idempotent.</summary>
-        public Task<bool> PlayAsync() => SetPlaybackAsync(play: true);
+        public Task<MediaCommandResult> PlayAsync() => SetPlaybackAsync(play: true);
 
         /// <summary>Ensures playback is paused. Idempotent.</summary>
-        public Task<bool> PauseAsync() => SetPlaybackAsync(play: false);
+        public Task<MediaCommandResult> PauseAsync() => SetPlaybackAsync(play: false);
 
-        private async Task<bool> SetPlaybackAsync(bool play)
+        private async Task<MediaCommandResult> SetPlaybackAsync(bool play)
         {
             string want = play ? "play" : "pause";
             try
@@ -55,8 +73,22 @@ namespace Personal_Assistant.MediaControl
                     // or pause. Pressing the key here would hand the command to
                     // whatever grabs the session next.
                     Console.WriteLine($"[media] no active media session — {want} ignored.");
-                    return false;
+                    return MediaCommandResult.NoSession;
                 }
+
+                // Whether the playback state was actually READ and found to be the
+                // opposite of what was asked for. The toggle fallback below is only
+                // safe when this is true.
+                //
+                // MEDIA_PLAY_PAUSE moves the session whichever way it is currently
+                // facing, so firing it without having established that direction is
+                // a coin flip — and this class exists precisely because that coin
+                // flip turned "unpause my video" into a pause. Two paths used to
+                // take it anyway: the refusal path justified itself with "the status
+                // check above already established the state needs changing", which
+                // holds only when info is non-null, and the catch block ran it
+                // having read nothing at all.
+                bool knownWrongState = false;
 
                 // Already in the requested state: report success without touching
                 // anything. This is what makes the command idempotent.
@@ -70,8 +102,12 @@ namespace Personal_Assistant.MediaControl
                     if ((play && playing) || (!play && paused))
                     {
                         Console.WriteLine($"[media] already {(play ? "playing" : "paused")}.");
-                        return true;
+                        return MediaCommandResult.Done;
                     }
+
+                    // Only Playing and Paused say which way the toggle would move
+                    // it. Stopped, Changing, Closed and Opened do not.
+                    knownWrongState = playing || paused;
                 }
 
                 bool ok = play
@@ -81,23 +117,34 @@ namespace Personal_Assistant.MediaControl
                 if (ok)
                 {
                     Console.WriteLine($"[media] {want} via SMTC.");
-                    return true;
+                    return MediaCommandResult.Done;
                 }
 
                 // The session exists but refused the explicit control. Some apps
-                // implement only the toggle, and the status check above already
-                // established the state needs changing, so a toggle is safe here.
-                Console.WriteLine($"[media] SMTC refused {want}; falling back to the toggle key.");
-                PlayPause();
-                return true;
+                // implement only the toggle, and here — and only here — the status
+                // read above told us which way it is facing.
+                if (knownWrongState)
+                {
+                    Console.WriteLine($"[media] SMTC refused {want}; toggling instead (state is known).");
+                    PlayPause();
+                    return MediaCommandResult.Done;
+                }
+
+                Console.WriteLine(
+                    $"[media] SMTC refused {want} and the playback state is unknown — " +
+                    "not guessing with the toggle key.");
+                return MediaCommandResult.Refused;
             }
             catch (Exception ex)
             {
-                // WinRT interop on .NET Framework: surface and fall back rather
-                // than take down the turn.
-                Console.WriteLine($"[media] {want} failed ({ex.Message}); falling back to the toggle key.");
-                PlayPause();
-                return true;
+                // WinRT interop on .NET Framework does throw here. Surface it — but
+                // do NOT fall back to the toggle: this path has read nothing, so a
+                // toggle is as likely to be wrong as right, and "play" while already
+                // playing would PAUSE the thing the user asked to resume. Reporting
+                // the failure is worse than doing nothing only if the guess would
+                // have been better than a coin flip, and it isn't.
+                Console.WriteLine($"[media] {want} failed: {ex.Message}");
+                return MediaCommandResult.Refused;
             }
         }
 

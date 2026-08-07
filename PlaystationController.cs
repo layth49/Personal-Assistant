@@ -67,6 +67,12 @@ namespace Personal_Assistant.PlaystationController
             // means buying the settle time back explicitly.
             await Task.Delay(6000);
 
+            // Reported, not swallowed. Remote Play coming up is not the same as the
+            // game launching, and the caller turns `true` into "<game> is ready!
+            // Have fun!" — so returning true after this threw announced a game that
+            // is not running. That is the same untruthful success
+            // SMSController.SendMessageToContact was changed to stop producing.
+            bool navigated = true;
             try
             {
                 SetForegroundWindow(handle);
@@ -74,12 +80,13 @@ namespace Personal_Assistant.PlaystationController
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error: {ex.Message}");
+                Console.WriteLine($"[playstation] could not navigate to '{game}': {ex.Message}");
+                navigated = false;
             }
 
             remoteplay.CloseMainWindow();
             simulator.Keyboard.KeyPress(VirtualKeyCode.RETURN);
-            return true;
+            return navigated;
         }
 
         // Polls until the process has a valid, visible main window handle,
