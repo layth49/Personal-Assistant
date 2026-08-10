@@ -455,6 +455,8 @@
     <Compile Include="ScreenshotService.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="SMSController.cs" />
+    <Compile Include="SuggestionCatalogue.cs" />
+    <Compile Include="SuggestionService.cs" />
     <Compile Include="SpeechManager.cs" />
     <Compile Include="TimerWidgetHost.cs" />
     <Compile Include="ToolRegistry.cs" />
@@ -489,7 +491,9 @@
     </Content>
     <Content Include="logo.ico" />
     <Content Include="requirements.txt" />
-    <Content Include="SpeechBubble.py" />
+    <Content Include="SpeechBubble.py">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <Target Name="EnsureNuGetPackageBuildImports" BeforeTargets="PrepareForBuild">

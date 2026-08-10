@@ -19,6 +19,7 @@ using Personal_Assistant.Reminders;
 using Personal_Assistant.ScreenCapture;
 using Personal_Assistant.SMSController;
 using Personal_Assistant.SpeechManager;
+using Personal_Assistant.Suggestions;
 using Personal_Assistant.Triggers;
 using Personal_Assistant.VoiceClips;
 using Personal_Assistant.WeatherService;
@@ -199,10 +200,19 @@ namespace Personal_Assistant
             PythonEngine.Initialize();
             PythonEngine.BeginAllowThreads();
 
+            // Python modules ship next to the exe, so each deployed copy imports its
+            // own. This used to point at a single shared folder, which meant a .py
+            // deployed while working on one branch silently rebound the other
+            // branch's imports — the 2026-08-03 bubble race was exactly that.
+            // The shared folder stays on the path *after* the app directory purely
+            // as a fallback, so an output dir missing a module still starts.
             using (Py.GIL())
             {
                 dynamic sys = Py.Import("sys");
-                sys.path.append(@"C:\Users\layth\LAITH\local");
+                sys.path.append(AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\'));
+
+                string extra = LaithConfig.Text("PythonModulePath", @"C:\Users\layth\LAITH\local");
+                if (!string.IsNullOrWhiteSpace(extra)) sys.path.append(extra.TrimEnd('\\'));
             }
 
             // Tracks per-turn stt/llm/tts latency so we can see what's actually
@@ -290,9 +300,10 @@ namespace Personal_Assistant
                 isBusy: () => System.Threading.Volatile.Read(ref activeSession) != null);
             var triggers = new TriggerService(presence);
 
+            PrayerAnnouncer prayerAnnouncer = null;
             if (LaithConfig.Bool("PrayerAnnouncements", true))
             {
-                var prayerAnnouncer = new PrayerAnnouncer(
+                prayerAnnouncer = new PrayerAnnouncer(
                     triggers,
                     location,
                     // 🕌 as the bubble's "you said" label, the way a fired reminder
@@ -320,6 +331,21 @@ namespace Personal_Assistant
             // cannot happen before Restore(), which is called after both are set.
             IntentDispatcher dispatcherRef = null;
             ToolRegistry registryRef = null;
+            ConversationMemory conversationMemoryRef = null;
+
+            // Things the assistant volunteers. Same cycle as the standing rules
+            // below, resolved the same way — a suggestion's accept action runs a
+            // tool, so it needs the dispatcher that doesn't exist yet.
+            //
+            // 💡 as the bubble label, alongside ⏰ / 🕌 / 📌: this one is the
+            // assistant speaking first, which nothing else in the app does.
+            var suggestions = new SuggestionService(
+                triggers,
+                message => speechManager.SayClip("💡", message, renderOnMiss: true),
+                // Recorded as a model turn so the TURN-BASED path can resolve
+                // "yes" from history. The Live path can't — it gets no history —
+                // and is handled by LiveSession.BuildSuggestionHint instead.
+                remember: offer => conversationMemoryRef?.AddModel(offer));
 
             var voiceTriggers = new VoiceTriggers(
                 triggers,
@@ -337,6 +363,7 @@ namespace Personal_Assistant
             {
                 Speech = speechManager,
                 VoiceTriggers = voiceTriggers,
+                Suggestions = suggestions,
                 Lights = lightControl,
                 Playstation = playstationControl,
                 Sms = smsControl,
@@ -366,6 +393,7 @@ namespace Personal_Assistant
             // parameter, and those must not write over the real conversation.
             var conversationMemory = new ConversationMemory(persist: true);
             conversationMemory.Restore();
+            conversationMemoryRef = conversationMemory;
             var dispatcher = new IntentDispatcher(
                 registry,
                 context,
@@ -381,6 +409,19 @@ namespace Personal_Assistant
             dispatcherRef = dispatcher;
             registryRef = registry;
             voiceTriggers.Restore();
+
+            // Suggestions last: every accept action runs a tool through the
+            // dispatcher, and Start() arms an evaluator that could fire within the
+            // minute. Registering the catalogue before dispatcherRef was set would
+            // put a null on the trigger ticker — a background thread, i.e. the
+            // failure that takes the process down with nothing on the console.
+            SuggestionCatalogue.Register(
+                suggestions,
+                context,
+                prayerAnnouncer,
+                PresenceGate.IdleTime,
+                (name, toolArgs, speak) => dispatcher.RunToolByNameAsync(name, toolArgs, speak));
+            suggestions.Start();
 
             // Let the `repeat` tool run other tools by name (validated). Speaking
             // is explicit rather than defaulted: the repeated actions are the only
@@ -1396,6 +1437,83 @@ namespace Personal_Assistant
                             : $"Cancelled {n} {(n == 1 ? "reminder" : "reminders")}.")
                         .With("cancelled_count", n.ToString()));
                 }));
+
+            // Answering "yes" to something the assistant offered on its own.
+            //
+            // Only registered when there is a suggestion service, and the model is
+            // told what is pending through the Live session's system instruction
+            // (see LiveSession.BuildSuggestionHint) — a fresh session has no
+            // conversation history, so without that hint "yeah, go on" refers to
+            // nothing it can see.
+            if (context.Suggestions != null)
+            {
+                var suggestions = context.Suggestions;
+
+                registry.Add(new VoiceCommand(
+                    ToolDefinition.Create("accept_suggestion",
+                        "Call this ONLY when the user agrees to something you offered them " +
+                        "unprompted — \"yes\", \"go on\", \"do it\", \"sure\". Never call it for " +
+                        "an ordinary request; use the tool that does the thing instead. If they " +
+                        "decline or change the subject, do not call it at all."),
+                    lower => false, // no keyword path — "yes" alone is far too broad
+                    async (ctx, args) =>
+                    {
+                        string said = await suggestions.AcceptPendingAsync();
+                        if (said == null)
+                        {
+                            // Nothing pending. Saying so beats silently doing
+                            // nothing, which reads as the assistant ignoring you.
+                            return ToolResult.Failed(
+                                "Sorry, I'm not sure what you're saying yes to.",
+                                "no live suggestion pending");
+                        }
+                        return ToolResult.Speak(said).With("accepted", "yes");
+                    }));
+
+                registry.Add(new VoiceCommand(
+                    ToolDefinition.Create("adjust_suggestions",
+                        "Change how often the assistant volunteers things on its own — use this " +
+                        "when the user says it's being annoying, too quiet, or to stop " +
+                        "suggesting things. Takes effect immediately and lasts until the app " +
+                        "restarts; the Suggestions setting in the config is what decides the " +
+                        "level it starts at.",
+                        new ToolParameter("level", "string",
+                            "off = never volunteer anything. rare = a few times a day at most. " +
+                            "normal = the default. chatty = surface things readily.",
+                            AllowedValues: new List<string> { "off", "rare", "normal", "chatty" })),
+                    lower => lower.Contains("stop suggesting") ||
+                             lower.Contains("suggest less") || lower.Contains("suggest more"),
+                    (ctx, args) =>
+                    {
+                        args.TryGetValue("level", out string level);
+                        if (!Enum.TryParse(level, ignoreCase: true, out SuggestionLevel parsed))
+                        {
+                            return Task.FromResult(ToolResult.Failed(
+                                "I'm not sure how often you want me to speak up.",
+                                $"unknown suggestion level '{level}'"));
+                        }
+
+                        SuggestionBudget.SetLevelForThisRun(parsed);
+
+                        // A pending offer belongs to the old setting. Being told
+                        // to shut up and then acting on the thing you were told to
+                        // shut up about is the wrong way round.
+                        if (parsed == SuggestionLevel.Off) suggestions.DeclinePending();
+
+                        string said;
+                        switch (parsed)
+                        {
+                            case SuggestionLevel.Off: said = "Alright, I'll keep quiet."; break;
+                            case SuggestionLevel.Rare: said = "Okay, I'll only mention the big things."; break;
+                            case SuggestionLevel.Chatty: said = "Okay, I'll speak up more often."; break;
+                            default: said = "Okay, back to normal."; break;
+                        }
+                        return Task.FromResult(ToolResult
+                            .Speak(said)
+                            .With("level", parsed.ToString().ToLowerInvariant())
+                            .With("pacing", suggestions.Budget.Describe()));
+                    }));
+            }
 
             // --- Standing rules (LLM-only; the phrasing is too open for keywords) ----
 

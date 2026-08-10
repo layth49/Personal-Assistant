@@ -163,6 +163,11 @@ namespace Personal_Assistant.Dispatch
         // BuildRegistry then simply doesn't offer set_trigger/list/cancel.
         public Personal_Assistant.Triggers.VoiceTriggers VoiceTriggers { get; init; }
 
+        // Things the assistant has offered on its own initiative. Null when
+        // suggestions are switched off or in a harness, and BuildRegistry then
+        // doesn't offer accept_suggestion.
+        public Personal_Assistant.Suggestions.SuggestionService Suggestions { get; init; }
+
         public IReadOnlyDictionary<string, string> Contacts { get; init; }
         public string IpAddressPlug { get; init; }
         public string IpAddressSwitch { get; init; }

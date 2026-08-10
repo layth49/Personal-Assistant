@@ -234,6 +234,64 @@ namespace Personal_Assistant.PrayerTimesCalculator
             }
         }
 
+        /// <summary>
+        /// The next prayer due, using the location already resolved for the
+        /// announcements. False before the first successful location lookup, or
+        /// if today's times can't be calculated — callers must treat "don't know"
+        /// as a real answer rather than assuming one.
+        ///
+        /// Exists so other features can reason about prayer times without each
+        /// doing its own location lookup: the suggestion that offers a Fajr alarm
+        /// at 1am is asking exactly this question.
+        /// </summary>
+        public bool TryGetNextPrayer(out string name, out DateTime at)
+        {
+            name = null;
+            at = default(DateTime);
+
+            if (!latitude.HasValue || !longitude.HasValue) return false;
+
+            try
+            {
+                DateTime now = DateTime.Now;
+                var calculator = new GetPrayerTimes(latitude.Value, longitude.Value);
+
+                // Today's remaining prayers, then tomorrow's first. After Isha the
+                // next prayer is tomorrow's Fajr, and answering "Fajr, this
+                // morning, hours ago" is worse than answering nothing.
+                for (int dayOffset = 0; dayOffset <= 1; dayOffset++)
+                {
+                    DateTime day = now.Date.AddDays(dayOffset);
+                    Times times = calculator.CalculatePrayerTimes(day);
+                    bool isFriday = day.DayOfWeek == DayOfWeek.Friday;
+
+                    var ordered = new List<KeyValuePair<string, TimeSpan>>
+                    {
+                        new KeyValuePair<string, TimeSpan>("Fajr", times.Fajr),
+                        new KeyValuePair<string, TimeSpan>(isFriday ? "Jumuah" : "Dhuhr", times.Dhuhr),
+                        new KeyValuePair<string, TimeSpan>("Asr", times.Asr),
+                        new KeyValuePair<string, TimeSpan>("Maghrib", times.Maghrib),
+                        new KeyValuePair<string, TimeSpan>("Isha", times.Isha),
+                    };
+
+                    foreach (KeyValuePair<string, TimeSpan> prayer in ordered)
+                    {
+                        DateTime when = day.Add(prayer.Value);
+                        if (when <= now) continue;
+                        name = prayer.Key;
+                        at = when;
+                        return true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[prayer] next-prayer lookup failed: {ex.Message}");
+            }
+
+            return false;
+        }
+
         private async Task<bool> EnsureLocationAsync()
         {
             if (latitude.HasValue && longitude.HasValue) return true;

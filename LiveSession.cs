@@ -12,6 +12,7 @@ using Personal_Assistant.Dispatch;
 using Personal_Assistant.GeminiClient;
 using Personal_Assistant.LiveAudio;
 using Personal_Assistant.SpeechManager;
+using Personal_Assistant.Suggestions;
 
 namespace Personal_Assistant.Live
 {
@@ -301,6 +302,7 @@ namespace Personal_Assistant.Live
             this.options = options ?? new LiveSessionOptions();
             if (this.options.Tools == null) this.options.Tools = tools;
             this.options.SystemInstruction += BuildNameHints(this.context);
+            this.options.SystemInstruction += BuildSuggestionHint(this.context);
 
             // Without grounding the model will still answer questions about the
             // world — from training data, confidently, with no sign anything is
@@ -319,6 +321,28 @@ namespace Personal_Assistant.Live
         // "Layth" -> "Leith"/"Lathe". There is no phrase-list/speech-context
         // parameter on the Live API the way Azure has boost_phrases, so the
         // system instruction is the only place to bias this.
+        // Tells the model what the assistant offered while no session was open.
+        //
+        // A Live session starts with no conversation history at all — only this
+        // instruction — so without this, a user answering "yeah, go on" to an
+        // offer made two minutes ago is answering something the model cannot see,
+        // and it will either invent a reason or ask what they mean.
+        //
+        // Built in the constructor, which runs at the wake word, so it always
+        // reflects what is pending at the moment the user actually starts talking.
+        private static string BuildSuggestionHint(CommandContext context)
+        {
+            PendingSuggestion pending = context?.Suggestions?.Pending;
+            if (pending == null || !pending.IsLive) return string.Empty;
+
+            return
+                "\n\nJust now, before this conversation started, you said to the user: \"" +
+                pending.Offer + "\" They may be replying to that. If they agree — \"yes\", " +
+                "\"go on\", \"do it\", \"sure\" — call accept_suggestion and say nothing else " +
+                "first. If they decline or talk about something else, ignore this entirely and " +
+                "do not mention it.";
+        }
+
         private static string BuildNameHints(CommandContext context)
         {
             var sb = new StringBuilder();
