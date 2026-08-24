@@ -1,7 +1,9 @@
+﻿using Personal_Assistant.Configuration;
 using Personal_Assistant.Dispatch;
 using Personal_Assistant.Power;
 using Personal_Assistant.Presence;
 using Personal_Assistant.ProcessControl;
+using Personal_Assistant.Resume;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -55,6 +57,17 @@ namespace Personal_Assistant.Triggers
                 // Physical security. A door that opens on a schedule while the
                 // house is empty is a different category of mistake.
                 { "control_door", "controls a physical door" },
+                // Call screening. The awkward one, because "fires while nobody is
+                // there" is the whole POINT of screening — so the reasoning is not
+                // the usual one. Arming it is a decision about the next half hour
+                // of Layth's life ("I'm stepping out, cover the phone"), and a
+                // standing rule cannot know that; a rule that armed screening
+                // every weekday at nine would answer calls he was sitting next to.
+                { "screen_calls", "answers real phone calls on your behalf" },
+                { "answer_call", "would pick up a real call with nobody there to decide" },
+                // The mirror image: hanging up on a real person, mid-sentence,
+                // because a predicate went true.
+                { "end_call", "would hang up on someone mid-call" },
                 // Would stop the process that runs the triggers.
                 { "exit_assistant", "would shut the assistant down" },
                 // Self-replication and self-deletion loops.
@@ -114,12 +127,53 @@ namespace Personal_Assistant.Triggers
         /// rather than resurrected — a "remind me at 6" from yesterday must not
         /// come back at 6 today just because the app restarted.
         /// </summary>
-        public void Restore()
+        public ResumeSummary Restore() => Restore(null);
+
+        /// <summary>
+        /// As above, but able to tell a rule that EXPIRED from one that was
+        /// MISSED.
+        ///
+        /// Those used to be the same thing here, and it was the quiet half of the
+        /// timer bug: "remind me at 6pm", on a day the machine was rebooted at 5,
+        /// came back as a spent one-shot and was deleted at startup without a
+        /// word. From the user's side that is indistinguishable from the rule
+        /// never having been set. Given <paramref name="lastSeen"/> we can say
+        /// which side of the downtime its moment fell on, and a rule whose moment
+        /// arrived while nobody was running is reported rather than binned.
+        /// </summary>
+        public ResumeSummary Restore(DateTime? lastSeen)
         {
+            var summary = new ResumeSummary();
+
             List<TriggerSpec> loaded = TriggerStore.Load();
             DateTime now = DateTime.Now;
+            TimeSpan catchUp = TimeSpan.FromMinutes(
+                LaithConfig.Int("ReminderCatchUpMinutes", 60, 0, 10080));
 
-            var live = loaded.Where(s => !s.IsExpired(now)).ToList();
+            var live = new List<TriggerSpec>();
+
+            foreach (TriggerSpec spec in loaded)
+            {
+                if (!spec.IsExpired(now))
+                {
+                    live.Add(spec);
+                    continue;
+                }
+
+                DateTime due = spec.DueAt();
+
+                // Due while we were off, and recent enough to still matter.
+                bool missedDuringDowntime = lastSeen.HasValue && due > lastSeen.Value;
+                if (missedDuringDowntime && now - due <= catchUp)
+                {
+                    summary.Missed.Add(DescribeMissedRule(spec, now - due));
+                }
+                else
+                {
+                    summary.Dropped.Add(spec.Describe());
+                }
+            }
+
             int dropped = loaded.Count - live.Count;
 
             lock (gate)
@@ -130,10 +184,33 @@ namespace Personal_Assistant.Triggers
             }
             foreach (TriggerSpec spec in live) Bind(spec);
 
-            if (loaded.Count == 0) return;
+            summary.Resumed.AddRange(live.Select(s => s.Describe()));
+
+            if (loaded.Count == 0) return summary;
             Console.WriteLine(
                 $"[triggers] restored {live.Count} standing rule(s)" +
                 (dropped > 0 ? $", dropped {dropped} spent one-shot(s)" : ""));
+            foreach (string s in summary.Dropped) Console.WriteLine($"[triggers] expired unheard: {s}");
+
+            return summary;
+        }
+
+        // Phrased to slot into ResumeSummary's one sentence, so it reads as
+        // "While I was off, your reminder to take the bins out came due 20
+        // minutes ago." A rule with no message names what it would have done.
+        private static string DescribeMissedRule(TriggerSpec spec, TimeSpan late)
+        {
+            string what =
+                !string.IsNullOrWhiteSpace(spec.Message) ? $"your reminder to {spec.Message.TrimEnd('.', '!', '?')}" :
+                !string.IsNullOrWhiteSpace(spec.RunTool) ? $"your rule to run {spec.RunTool.Replace('_', ' ')}" :
+                "one of your reminders";
+
+            string when =
+                late < TimeSpan.FromMinutes(2) ? "just now" :
+                late < TimeSpan.FromHours(1) ? $"{late.TotalMinutes:F0} minutes ago" :
+                $"{late.TotalHours:F0} hours ago";
+
+            return $"{what} came due {when}";
         }
 
         /// <summary>
@@ -287,9 +364,29 @@ namespace Personal_Assistant.Triggers
                 }
                 if (!isKnownTool(spec.RunTool))
                 {
-                    return new TriggerRejection(
-                        "I don't have anything that does that.",
-                        $"unknown tool '{spec.RunTool}'");
+                    // A tool that does not exist cannot be what the user asked
+                    // for — they can't request a capability the assistant has
+                    // never had. Small models bolt a plausible-sounding tool onto
+                    // most rules (a 4B model invented `web_search` for "tell me
+                    // when my download finishes"), and refusing the whole rule
+                    // over it loses the part the user actually wanted.
+                    //
+                    // Dropping it is NOT the silent-substitution failure this file
+                    // guards against elsewhere: that one discards what the user
+                    // asked for, this one discards something they never said. A
+                    // rule with nothing left to do is still refused, below.
+                    Console.WriteLine(
+                        $"[triggers] dropping invented run_tool '{spec.RunTool}' — no such tool");
+                    spec.RunTool = null;
+                    spec.RunToolArgs = null;
+                    hasTool = false;
+
+                    if (!hasMessage && !speaksForItself)
+                    {
+                        return new TriggerRejection(
+                            "What should I do when that happens?",
+                            "the only action named was a tool that doesn't exist");
+                    }
                 }
                 if (runTool == null)
                 {

@@ -431,6 +431,7 @@
     <Compile Include="AudioController.cs" />
     <Compile Include="BatteryReader.cs" />
     <Compile Include="ConversationMemory.cs" />
+    <Compile Include="Downtime.cs" />
     <Compile Include="GeminiClient.cs" />
     <Compile Include="FinishedFileWatcher.cs" />
     <Compile Include="Geolocator.cs" />

@@ -16,6 +16,7 @@ using Personal_Assistant.PrayerTimesCalculator;
 using Personal_Assistant.Presence;
 using Personal_Assistant.ProcessControl;
 using Personal_Assistant.Reminders;
+using Personal_Assistant.Resume;
 using Personal_Assistant.ScreenCapture;
 using Personal_Assistant.SMSController;
 using Personal_Assistant.SpeechManager;
@@ -274,6 +275,20 @@ namespace Personal_Assistant
             // whatever the assistant is already saying. The widget host mirrors
             // each one as an on-screen floating countdown.
             var timerWidgets = new TimerWidgetHost();
+
+            // How long the assistant was off, read BEFORE the heartbeat starts.
+            // Start() overwrites the single value this reads, so reversing these
+            // two lines reports "no downtime" for every restart, forever, and
+            // every paused timer silently degrades to wall-clock.
+            DateTime? lastSeen = Downtime.ReadLastSeen();
+            TimeSpan downtime = Downtime.GapSince(lastSeen);
+            var heartbeat = new Downtime();
+            heartbeat.Start();
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => heartbeat.Dispose();
+            Console.WriteLine(lastSeen.HasValue
+                ? $"[resume] last seen {lastSeen:ddd HH:mm} — off for {Downtime.Describe(downtime)}"
+                : "[resume] no heartbeat from a previous run");
+
             // A fired reminder has no user utterance, so use a clock as the
             // bubble's "you said" label — a nice reminder indicator now that the
             // bubble renders emoji. It's only shown, never spoken.
@@ -415,7 +430,33 @@ namespace Personal_Assistant
             // moment it is armed would otherwise hit a null.
             dispatcherRef = dispatcher;
             registryRef = registry;
-            voiceTriggers.Restore();
+            // Everything that was pending when the assistant last stopped, picked
+            // back up in one pass.
+            //
+            // Each service reports what it found rather than announcing it, so
+            // the whole restart produces ONE sentence instead of four services
+            // talking over each other at the moment the desktop finishes loading.
+            var resumed = new ResumeSummary();
+            resumed.Absorb(voiceTriggers.Restore(lastSeen));
+
+            Console.WriteLine($"[resume] {resumed.LogLine()}");
+
+            // Said through the trigger engine rather than straight out, so it
+            // gets the presence gate and quiet hours like every other unprompted
+            // line. Booting at 3am for a reboot and walking away should not mean
+            // the catch-up is spoken to an empty room and then lost — a generous
+            // grace keeps it waiting until somebody is actually there.
+            string catchUp = resumed.SpokenLine();
+            if (!string.IsNullOrWhiteSpace(catchUp))
+            {
+                triggers.AddOneShot(
+                    "resume:report",
+                    // Far enough after the startup greeting that the two don't
+                    // land on top of each other.
+                    DateTime.Now.AddSeconds(20),
+                    () => speechManager.SayClip("↩️", catchUp, renderOnMiss: true),
+                    grace: TimeSpan.FromHours(8));
+            }
 
             // Suggestions last: every accept action runs a tool through the
             // dispatcher, and Start() arms an evaluator that could fire within the
