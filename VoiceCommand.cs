@@ -172,6 +172,12 @@ namespace Personal_Assistant.Dispatch
         // reminder-listing tools simply say nothing about watches when it is.
         public Personal_Assistant.Events.EventWatchService Watches { get; init; }
 
+        // Answering the phone through Phone Link. Null unless the CallScreening
+        // config switch is on, and BuildRegistry then doesn't offer screen_calls
+        // or end_call at all — a tool the model can see is a tool it will reach
+        // for, and there is no useful failure message for "that feature is off".
+        public Personal_Assistant.CallScreening.CallScreeningService CallScreening { get; init; }
+
         public IReadOnlyDictionary<string, string> Contacts { get; init; }
         public string IpAddressPlug { get; init; }
         public string IpAddressSwitch { get; init; }

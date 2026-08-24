@@ -3,6 +3,7 @@ using Personal_Assistant.AppLaunching;
 using Personal_Assistant.Configuration;
 using Personal_Assistant.Arduino;
 using Personal_Assistant.AudioControl;
+using Personal_Assistant.CallScreening;
 using Personal_Assistant.Diagnostics;
 using Personal_Assistant.Dispatch;
 using Personal_Assistant.Events;
@@ -116,7 +117,13 @@ namespace Personal_Assistant
         // Every line spoken outside a Live conversation, i.e. everything that
         // needs a pre-rendered clip to stay in voice. Keep in sync with the
         // greeting pools; --render-clips reads exactly this.
-        public static IReadOnlyList<string> ClipLines()
+        /// <param name="callers">
+        /// Contact names to pre-render a screened-call greeting for. A screened
+        /// caller hears a fixed recording otherwise, which sounds exactly like an
+        /// answering machine — see CallGreeting. Rendering cannot happen during
+        /// the call, so it happens here.
+        /// </param>
+        public static IReadOnlyList<string> ClipLines(IEnumerable<string> callers = null)
         {
             var lines = new List<string>();
             lines.AddRange(morningGreetings);
@@ -136,6 +143,12 @@ namespace Personal_Assistant
             // changing that setting needs a re-run of --render-clips the same way
             // changing the voice does.
             lines.AddRange(PrayerAnnouncer.ClipLines());
+
+            // One per contact, so the FIRST call from anyone in the address book
+            // is already greeted by name. A caller with no clip still gets the
+            // stock recording and has one rendered afterwards, so this is a head
+            // start rather than a requirement.
+            lines.AddRange(CallGreeting.LinesFor(callers));
             return lines;
         }
 
@@ -177,7 +190,24 @@ namespace Personal_Assistant
                 for (int i = renderAt + 1; i < args.Length; i++) extra.Add(args[i]);
 
                 int failed = await VoiceClipRenderer.RenderAsync(
-                    extra.Count > 0 ? extra : ClipLines(), voice);
+                    extra.Count > 0 ? extra : ClipLines(LoadContacts()?.Keys), voice);
+
+                // The CALL voice as well, when it differs. Greeting clips are
+                // keyed by voice, so rendering only the assistant's would leave
+                // every screened caller falling back to the stock recording while
+                // the log cheerfully reported the clips as rendered.
+                string callVoice = CallGreeting.Voice;
+                if (!string.IsNullOrEmpty(callVoice) && callVoice != voice)
+                {
+                    var named = CallGreeting.LinesFor(LoadContacts()?.Keys);
+                    if (named.Count > 0)
+                    {
+                        Console.WriteLine(
+                            $"[clips] and {named.Count} call greeting(s) in the call voice '{callVoice}'");
+                        failed += await VoiceClipRenderer.RenderAsync(named, callVoice);
+                    }
+                }
+
                 Environment.Exit(failed == 0 ? 0 : 1);
             }
 
@@ -191,6 +221,28 @@ namespace Personal_Assistant
             // may leave a WebSocket streaming silence behind it.
             AppDomain.CurrentDomain.ProcessExit += (s, e) => CloseActiveSession("process exiting");
             Console.CancelKeyPress += (s, e) => CloseActiveSession("Ctrl+C");
+
+            // And the same two hooks for the CALL AUDIO ROUTING, which is the
+            // higher-stakes of the two. A leaked Live session costs tokens; a
+            // process that dies with the Windows *communications* role pointed at
+            // a virtual cable silently breaks the next real call or Teams
+            // meeting, with nothing on screen to explain why. VoiceMeeter did
+            // exactly this on 2026-08-15 and the assistant went deaf until the
+            // roles were put back by hand.
+            //
+            // Registered here rather than beside the call-screening service
+            // below, and unconditionally rather than behind the CallScreening
+            // switch, because the state that needs repairing outlives the setting
+            // that created it: a crash yesterday with screening on has to be
+            // cleaned up today even if the switch has since been turned off.
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => CallAudioRouter.RestoreAll("process exiting");
+            Console.CancelKeyPress += (s, e) => CallAudioRouter.RestoreAll("Ctrl+C");
+
+            // The third restore path: neither hook runs when the process is
+            // killed outright, so a persisted "a call was in flight" record is
+            // repaired at startup, before anything else opens an audio device.
+            string audioRepair = CallAudioRouter.RepairAfterCrash();
+            if (audioRepair != null) Console.WriteLine($"[call-audio] {audioRepair}");
 
             // A crash on a background thread — an NAudio capture callback, the
             // Live receive pump, the bubble pump — takes the process down with no
@@ -336,8 +388,19 @@ namespace Personal_Assistant
             // below and cleared when the session closes; reading it through a
             // lambda means the gate sees the current value, not the null it was
             // at construction.
+            //
+            // A SCREENED CALL COUNTS AS A CONVERSATION, and for a sharper reason
+            // than a Live session does. The caller's audio arrives by WASAPI
+            // loopback on the speakers, so anything spoken unprompted during a call
+            // is not merely rude — it goes down the phone line, and then comes
+            // straight back up it into Gemini as though the caller had said it.
+            // Assigned below (the service is constructed after the trigger engine
+            // it needs), so this reads the current value rather than the null it
+            // was at construction — the same knot as `watcherRef`.
+            CallScreeningService callScreening = null;
             var presence = new PresenceGate(
-                isBusy: () => System.Threading.Volatile.Read(ref activeSession) != null);
+                isBusy: () => System.Threading.Volatile.Read(ref activeSession) != null ||
+                              callScreening?.IsOnCall == true);
             var triggers = new TriggerService(presence);
 
             PrayerAnnouncer prayerAnnouncer = null;
@@ -411,6 +474,37 @@ namespace Personal_Assistant
                 prepare: message => VoiceClipRenderer.TryEnsureAsync(
                     LiveSessionOptions.ConfiguredVoice, message));
 
+            // Answering the phone. Off by default, and constructed at all only
+            // when it is on — a disabled feature should cost nothing, and this one
+            // owns a polling thread and a UI Automation client.
+            //
+            // Nothing is answered until `screen_calls` arms it and the arm expires
+            // on its own; see CallScreeningService.
+            if (LaithConfig.Bool("CallScreening", false))
+            {
+                // The gate and the media controller are what a live call uses to
+                // quiet the machine: the inbound leg is a loopback on the speakers,
+                // so a notification chime or a paused-then-resumed track would be
+                // heard by the caller and fed back to the model.
+                callScreening = new CallScreeningService(
+                    triggers, presence, media,
+                    // How a message a caller left gets spoken when Layth is back
+                    // at the machine, for the times the text did not reach him.
+                    // Through SpeechManager like every other unprompted line, so
+                    // it queues behind whatever is already being said rather than
+                    // talking over it.
+                    announce: line => speechManager.SayClip("📞", line, renderOnMiss: true));
+                callScreening.Start();
+
+                // Same teardown discipline as the Live session above, and for a
+                // sharper version of the same reason: a leaked socket costs
+                // tokens, but a process that dies mid-call leaves a real person
+                // connected to a laptop that is no longer listening. Both hooks,
+                // because ProcessExit does not run for Ctrl+C.
+                AppDomain.CurrentDomain.ProcessExit += (s, e) => HangUpAnyCall(callScreening, "process exiting");
+                Console.CancelKeyPress += (s, e) => HangUpAnyCall(callScreening, "Ctrl+C");
+            }
+
             // Shared dependencies handed to every command handler.
             var context = new CommandContext
             {
@@ -418,6 +512,7 @@ namespace Personal_Assistant
                 VoiceTriggers = voiceTriggers,
                 Suggestions = suggestions,
                 Watches = watcher,
+                CallScreening = callScreening,
                 Lights = lightControl,
                 Playstation = playstationControl,
                 Sms = smsControl,
@@ -441,6 +536,14 @@ namespace Personal_Assistant
             // matcher in the registry is only used as a fallback if Gemini is
             // unavailable / malformed / times out.
             var registry = BuildRegistry(context);
+
+            // What a person on the other end of a screened call may reach: two
+            // read-only tools out of the registry above, and nothing else. This has
+            // to happen after BuildRegistry (there is nothing to borrow before it)
+            // and it must happen at all — a service that never gets this call runs
+            // with CallTools.None, so a caller can leave a message and do nothing
+            // else. Fails closed on purpose; see CallTools.
+            callScreening?.UseAssistantTools(registry, context);
 
             // persist:true only here. Every other ConversationMemory in the
             // codebase is one a harness or a smoke test constructed to satisfy a
@@ -471,6 +574,10 @@ namespace Personal_Assistant
             var resumed = new ResumeSummary();
             resumed.Absorb(voiceTriggers.Restore(lastSeen));
             resumed.Absorb(watcher.Restore());
+            // An armed screening window survives a restart. Crashing inside one is
+            // exactly when dropping it silently would be worst: Layth walked away
+            // believing the phone was covered. Absorb ignores a null service.
+            resumed.Absorb(callScreening?.Restore());
             // Reminders last of the three: an anchored one whose moment passed
             // during downtime hands itself to the watcher, which must already
             // have loaded its own store or the new watch is written into a list
@@ -687,6 +794,36 @@ namespace Personal_Assistant
             if (session == null) return;
             Console.WriteLine($"[loop] {why} — closing the open Live session");
             try { session.Dispose(); } catch { }
+        }
+
+        // Puts the phone down on the way out.
+        //
+        // The Live-session teardown above exists because a leaked socket costs
+        // tokens. This exists because a leaked CALL costs a real person sitting on
+        // an open line talking to an assistant that no longer exists — and Phone
+        // Link will happily hold that call for as long as the caller lets it.
+        //
+        // One attempt, not the usual two: ProcessExit gets roughly two seconds,
+        // and a hang-up is two UIA clicks. Missing it is survivable (Layth can
+        // click End call); overrunning the budget means the handler is killed
+        // partway and nothing else in the teardown chain runs either.
+        private static void HangUpAnyCall(CallScreeningService screening, string why)
+        {
+            if (screening == null) return;
+            try
+            {
+                // Unconditional, and BEFORE the early return. A headset whose audio
+                // services are disabled stays that way after the process is gone,
+                // and route B can have disabled one without there being a call left
+                // to hang up. CallAudioRouter.RestoreAll gets its own hook for the
+                // same reason.
+                screening.RestoreHeadset(why);
+
+                if (screening.CurrentLocation() == CallLocation.None) return;
+                Console.WriteLine($"[call] {why} — hanging up the call in progress");
+                screening.EndCallAsync(attempts: 1).Wait(TimeSpan.FromSeconds(2));
+            }
+            catch { /* teardown; there is nobody left to tell */ }
         }
 
         // Builds the command catalogue. Each VoiceCommand carries its LLM tool
@@ -1655,6 +1792,164 @@ namespace Personal_Assistant
                             .Speak(said)
                             .With("level", parsed.ToString().ToLowerInvariant())
                             .With("pacing", suggestions.Budget.Describe()));
+                    }));
+            }
+
+            // --- Call screening -------------------------------------------------------
+
+            // Only offered when the feature is switched on AND wired. A tool the
+            // model can see is a tool it will reach for, and "call screening is
+            // disabled in App.config" is not an answer anyone wants spoken back
+            // to them mid-sentence.
+            if (context.CallScreening != null)
+            {
+                var screening = context.CallScreening;
+
+                registry.Add(new VoiceCommand(
+                    ToolDefinition.Create("screen_calls",
+                        "Have the assistant answer incoming phone calls through Phone Link for a " +
+                        "while — it picks up, plays a greeting, and hangs up. Use for \"screen my " +
+                        "calls\", \"take my calls while I'm out\", and to turn it off again. It " +
+                        "stops on its own after the time is up.",
+                        new ToolParameter("state", "string",
+                            "\"on\" to start screening calls, \"off\" to stop.",
+                            AllowedValues: new[] { "on", "off" }),
+                        new ToolParameter("minutes", "integer",
+                            "How long to keep screening for, 1 to 480. Omit unless the user said " +
+                            "how long, and the configured default is used.",
+                            Required: false)),
+                    lower => lower.Contains("screen my calls") || lower.Contains("screen calls"),
+                    async (ctx, args) =>
+                    {
+                        args.TryGetValue("state", out string state);
+                        if (string.Equals(state, "off", StringComparison.OrdinalIgnoreCase))
+                        {
+                            bool was = screening.Disarm();
+                            return ToolResult
+                                .Speak(was
+                                    ? "Okay, I've stopped screening your calls."
+                                    : "I wasn't screening your calls.")
+                                .With("armed", "false");
+                        }
+
+                        TimeSpan? window = null;
+                        if (args.TryGetValue("minutes", out string raw) &&
+                            int.TryParse(raw, out int minutes) && minutes > 0)
+                        {
+                            window = TimeSpan.FromMinutes(Math.Min(minutes, 480));
+                        }
+
+                        // Async because arming now PROVES the call audio path
+                        // first — a tone into each leg, and does it come back —
+                        // which takes a couple of seconds and is worth every one
+                        // of them. A refusal, not a silent no-op: arming into a
+                        // path that cannot answer looks exactly like a phone
+                        // nobody picked up, except that the user was told it was
+                        // handled. The refusal names the broken leg.
+                        ArmResult armed = await screening.ArmAsync(window);
+                        if (armed.Refusal != null)
+                        {
+                            return ToolResult.Failed(armed.Refusal.Spoken, armed.Refusal.Reason);
+                        }
+
+                        // Screening with no expiry has no "until" to say, and
+                        // inventing one ("until 11:59 PM") would be a lie he might
+                        // plan around.
+                        if (armed.Indefinite)
+                        {
+                            return ToolResult
+                                .Speak("Okay, I'm screening your calls.")
+                                .With("armed", "true")
+                                .With("armed_until", "indefinite");
+                        }
+
+                        DateTime until = armed.Until;
+                        return ToolResult
+                            .Speak($"Okay, I'll screen your calls until {until:h:mm tt}.")
+                            .With("armed", "true")
+                            .With("armed_until", until.ToString("HH:mm"))
+                            .With("minutes", ((int)Math.Round((until - DateTime.Now).TotalMinutes)).ToString());
+                    },
+                    text =>
+                    {
+                        string lower = text.ToLower();
+                        return new Dictionary<string, string>
+                        {
+                            ["state"] = lower.Contains("stop") || lower.Contains("don't") ||
+                                        lower.Contains("do not") ? "off" : "on"
+                        };
+                    }));
+
+                registry.Add(new VoiceCommand(
+                    ToolDefinition.Create("end_call",
+                        "Hang up the phone call that is currently connected through Phone Link. " +
+                        "Only for a live call — this does not stop call screening, which is " +
+                        "screen_calls with state \"off\"."),
+                    lower => lower.Contains("hang up"),
+                    async (ctx, args) =>
+                    {
+                        // Asked first so "there's no call" and "I couldn't end it"
+                        // are different sentences. They are very different facts.
+                        if (screening.CurrentLocation() == CallLocation.None)
+                        {
+                            return ToolResult.Speak("There's no call to hang up.")
+                                .With("call", "none");
+                        }
+
+                        bool ended = await screening.EndCallAsync();
+                        return ended
+                            ? ToolResult.Speak("Hung up.").With("call", "ended")
+                            : ToolResult.Failed(
+                                "I couldn't hang up — you may need to end it in Phone Link.",
+                                "the call survived both hang-up clicks");
+                    }));
+
+                registry.Add(new VoiceCommand(
+                    ToolDefinition.Create("list_calls",
+                        "Read back the calls the assistant screened while the user was away, " +
+                        "including any message it took. Use for \"did anyone call?\", \"any " +
+                        "messages?\", \"who rang while I was out?\".",
+                        new ToolParameter("count", "integer",
+                            "How many of the most recent calls to report, 1 to 20. Omit for the " +
+                            "last few.", Required: false)),
+                    lower => lower.Contains("did anyone call") || lower.Contains("any messages"),
+                    (ctx, args) =>
+                    {
+                        int wanted = 3;
+                        if (args.TryGetValue("count", out string raw) &&
+                            int.TryParse(raw, out int parsed) && parsed > 0)
+                        {
+                            wanted = Math.Min(parsed, 20);
+                        }
+
+                        IReadOnlyList<CallRecord> all = CallScreeningService.Log();
+                        if (all.Count == 0)
+                        {
+                            return Task.FromResult(ToolResult.Speak("Nobody's called.")
+                                .With("calls", "0"));
+                        }
+
+                        // Newest first — "did anyone call?" is a question about the
+                        // most recent one, not the oldest one still on file.
+                        var recent = all.Skip(Math.Max(0, all.Count - wanted)).Reverse().ToList();
+
+                        var result = ToolResult
+                            .Speak(string.Join(". ", recent.Select(c => c.Describe())))
+                            .With("calls", recent.Count.ToString())
+                            .With("total_on_record", all.Count.ToString());
+
+                        // The message text goes up as its own field as well as
+                        // inside the sentence: the model is expected to relay a
+                        // message in the caller's words, and burying it in prose is
+                        // how it ends up paraphrased.
+                        for (int i = 0; i < recent.Count; i++)
+                        {
+                            result = result.With($"call_{i + 1}_from", recent[i].Caller);
+                            if (!string.IsNullOrWhiteSpace(recent[i].Message))
+                                result = result.With($"call_{i + 1}_message", recent[i].Message);
+                        }
+
+                        return Task.FromResult(result);
                     }));
             }
 
