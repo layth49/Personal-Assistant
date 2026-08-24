@@ -54,6 +54,38 @@ namespace Personal_Assistant.MediaControl
 
         public void Stop() => Press(VirtualKeyCode.MEDIA_STOP);
 
+        /// <summary>
+        /// Whether something is actually playing right now.
+        /// </summary>
+        /// <remarks>
+        /// Exists because PauseAsync reports Done both for "I paused it" and for
+        /// "it was already paused", and one caller needs to tell those apart: call
+        /// screening pauses media for the duration of a call (the caller's audio
+        /// arrives by loopback on the speakers, so anything else playing there goes
+        /// down the phone line) and must put back exactly what it interrupted.
+        /// Resuming playback that Layth had deliberately paused would be worse than
+        /// not resuming at all.
+        /// </remarks>
+        public async Task<bool> IsPlayingAsync()
+        {
+            try
+            {
+                GlobalSystemMediaTransportControlsSession session =
+                    await NowPlayingReader.TryGetCurrentSessionAsync();
+                GlobalSystemMediaTransportControlsSessionPlaybackInfo info = session?.GetPlaybackInfo();
+                return info != null &&
+                       info.PlaybackStatus ==
+                       GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
+            }
+            catch (Exception ex)
+            {
+                // "Don't know" reads as "not playing", which costs a resume rather
+                // than causing an unasked-for one.
+                Console.WriteLine($"[media] playback state unreadable: {ex.Message}");
+                return false;
+            }
+        }
+
         /// <summary>Ensures playback is running. Idempotent.</summary>
         public Task<MediaCommandResult> PlayAsync() => SetPlaybackAsync(play: true);
 

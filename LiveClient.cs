@@ -151,6 +151,19 @@ namespace Personal_Assistant.Live
         public bool InputAudioTranscription { get; set; } = true;
         public bool OutputAudioTranscription { get; set; } = true;
 
+        // Reasoning-token budget, or null to leave the model's default alone.
+        //
+        // The ONLY addition Phase 3 of call screening needed on this class, and it
+        // is here rather than in the call session because BuildSetupMessage is
+        // private — the plan allowed exactly this one seam and nothing else.
+        //
+        // A screened call sets 0. Measured 2026-08-15 (bakeoff/calltext): accepted
+        // by the native-audio model, removes reasoning tokens entirely, and saves
+        // ~330 ms before the first word. Null everywhere else, so the everyday
+        // assistant — which is allowed to think — is untouched, and no setup
+        // message it sends changes shape.
+        public int? ThinkingBudget { get; set; }
+
         // How long to wait for `setupComplete` before giving up. The handshake
         // is normally sub-second; a long stall means a bad key or model id.
         public TimeSpan SetupTimeout { get; set; } = TimeSpan.FromSeconds(20);
@@ -447,6 +460,17 @@ namespace Personal_Assistant.Live
             {
                 ["responseModalities"] = new[] { "AUDIO" }
             };
+
+            // Omitted unless asked for. An unconditional thinkingConfig would
+            // change the setup message every session sends on the strength of a
+            // setting only the call path uses.
+            if (options.ThinkingBudget.HasValue)
+            {
+                generationConfig["thinkingConfig"] = new Dictionary<string, object>
+                {
+                    ["thinkingBudget"] = options.ThinkingBudget.Value
+                };
+            }
 
             if (!string.IsNullOrEmpty(options.Voice) || !string.IsNullOrEmpty(options.LanguageCode))
             {

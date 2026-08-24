@@ -192,18 +192,46 @@ namespace Personal_Assistant.Presence
             return PresenceVerdict.Yes;
         }
 
-        // Silences every unprompted announcement for a while. Not wired to a voice
-        // tool yet; this is the API a "not now, be quiet" command would call.
+        // Silences every unprompted announcement for a while. Wired to call
+        // screening (nothing may speak into a live phone call — the caller's audio
+        // arrives by loopback on the speakers, so an announcement would be heard by
+        // the caller AND fed back to the model as though they had said it), and
+        // this is also the API a "not now, be quiet" command would call.
         public void MuteFor(TimeSpan duration)
         {
             lock (gate) { mutedUntil = DateTime.Now.Add(duration); }
             Console.WriteLine($"[presence] muted for {duration.TotalMinutes:F0}m");
         }
 
-        public void Unmute()
+        public void Unmute() => MuteUntil(null);
+
+        /// <summary>When the current mute ends, or null when nothing is muted.</summary>
+        public DateTime? MutedUntil
         {
-            lock (gate) { mutedUntil = null; }
-            Console.WriteLine("[presence] unmuted");
+            get
+            {
+                lock (gate)
+                {
+                    return mutedUntil.HasValue && DateTime.Now < mutedUntil.Value ? mutedUntil : null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Sets the mute deadline outright — null unmutes.
+        /// </summary>
+        /// <remarks>
+        /// The primitive behind MuteFor/Unmute, exposed so a temporary hold can put
+        /// back what it found rather than clearing it. A screened call mutes for its
+        /// own duration; if Layth had already asked for quiet until midnight, ending
+        /// that early because a stranger rang is not what he asked for.
+        /// </remarks>
+        public void MuteUntil(DateTime? until)
+        {
+            lock (gate) { mutedUntil = until; }
+            Console.WriteLine(until.HasValue
+                ? $"[presence] muted until {until.Value:HH:mm}"
+                : "[presence] unmuted");
         }
 
         // Time since the last keyboard or mouse input anywhere on the desktop.
