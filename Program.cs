@@ -148,6 +148,13 @@ namespace Personal_Assistant
 
         public static async Task Main(string[] args)
         {
+            // FIRST, ahead of even the config dump: anything written before this
+            // is not captured, and the config dump is one of the lines most worth
+            // having. The app is a WinExe with no console, so without this every
+            // Console.WriteLine in the process goes nowhere — which is how a whole
+            // screened call could fail leaving no record of why.
+            FileLog.Start();
+
             CheckEnvironmentVariables();
             LaithConfig.Dump();
 

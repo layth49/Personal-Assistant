@@ -439,6 +439,7 @@
     <Compile Include="LatencyTracker.cs" />
     <Compile Include="LightAutomator.cs" />
     <Compile Include="LiveAudio.cs" />
+    <Compile Include="FileLog.cs" />
     <Compile Include="LaithConfig.cs" />
     <Compile Include="LiveClient.cs" />
     <Compile Include="LiveSession.cs" />
