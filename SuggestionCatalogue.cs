@@ -1,4 +1,4 @@
-using Personal_Assistant.Dispatch;
+﻿using Personal_Assistant.Dispatch;
 using Personal_Assistant.Power;
 using Personal_Assistant.PrayerTimesCalculator;
 using Personal_Assistant.Triggers;
@@ -48,6 +48,12 @@ namespace Personal_Assistant.Suggestions
                 "fajr-alarm",
                 propose: () =>
                 {
+                    // Null when prayer announcements are switched off, which is a
+                    // supported configuration — without this the proposal throws on
+                    // every evaluation and logs an error a minute for a feature the
+                    // user deliberately turned off.
+                    if (prayers == null) return null;
+
                     DateTime now = DateTime.Now;
                     // Small hours only: after midnight and before 4am. Offering
                     // this at 9pm would be nagging about something eight hours off.
