@@ -15,25 +15,78 @@ My Personal Voice Assistant!
 ![Python](https://img.shields.io/badge/python-FFD43B?style=for-the-badge&logo=python)
 ## Features
 
-- Use AI to answer any questions 
+**Ask it things**
+- Use AI to answer any questions
+- Tell the Date/Time
+- Search up/Google anything
+- Open/Search on YouTube
+- Tell the local Weather, and the forecast
+- Tell me the current day's Prayer Times
+- Tell me what's playing, and how much battery is left
+
+**Tell it to do things**
 - Turn on/off my lights
 - Open/Close my door
 - Turn on my PS5 and open a game for me
 - Send an SMS Message to anyone in my contacts
-- Tell the Date/Time
-- Search up/Google anything
-- Open/Search on YouTube
-- Tell the local Weather
-- Tell me the current day's Prayer Times
-- Open my IDE
+- Open my IDE, or any app
 - Turn off/Restart my computer
+- Volume, media playback, switching audio output, screenshots, killing a process
+- Timers, alarms and reminders, with an on-screen countdown
+
+**Things it does on its own**
+- Announces each prayer before it arrives — calculated locally, no API call
+- **Standing rules** you set by voice, and it keeps them: *"tell me when Discord
+  closes"*, *"every weekday at 8 turn on the bedroom light"*, *"tell me when my
+  download finishes"*, *"warn me when I'm down to half an hour of battery"*
+- **Suggestions** — it notices something and offers, rather than waiting to be
+  asked: *"it's 1am and Fajr is at 5:10, want an alarm?"* Say *"stop suggesting
+  things"* and it will.
+- Nothing unprompted is said to an empty desk, in the middle of the night, or
+  over the top of a conversation you're already having.
+
+**It picks up where it left off**
+
+Shut it down, reboot, pull the plug — nothing pending is lost. A heartbeat
+records when it was last alive, and on the next start everything still
+outstanding is worked out from that. What "resuming" means depends on what the
+thing is:
+
+| | across a shutdown |
+|---|---|
+| a plain timer — *"ten minutes"* | **pauses**, and comes back with the time that was left |
+| an alarm — *"wake me at 7"* | keeps its moment; 7am is still 7am |
+| an event timer — *"a timer for that release"* | keeps its deadline, **and gets checked** |
+| standing rules | re-armed; ones that came due while it was off are reported instead of silently binned |
+
+Anything that came due while it was off arrives as **one** sentence — *"while I
+was off, your alarm went off 20 minutes ago and your reminder to check the oven
+came due an hour ago"* — held until you're actually at the desk. Things too
+stale to be worth saying are logged rather than spoken, and never just dropped.
+
+**It waits for things that haven't happened yet**
+
+> *"When does the next part of Re:Zero season 4 come out?"*
+> — *"August 12th."*
+> *"Start a timer for that release."*
+
+A countdown expiring proves nothing: the episode might have shipped early,
+slipped a week, or been pulled. So a timer tied to a real event is a **deadline
+to go and look**, not an announcement to read out. When it runs out — even if
+that happens across three reboots — it checks with a web search and either
+offers (*"Re:Zero Season 4 part 2 is out. Want me to open it?"*) or tells you it
+slipped and quietly keeps checking, backing off as it goes. It only opens a
+browser if you say yes.
 
 
 ## Roadmap
 
 - [x] Ability to interrupt L.A.I.T.H
-- [ ] Multi-turn context/memory
+- [x] Multi-turn context/memory — now kept across restarts too
+- [x] Proactive announcements, standing rules and suggestions
+- [x] Interrupted work resumed after a restart, including waiting on real events
 - [ ] Give L.A.I.T.H. computer control
+- [ ] Let it see the screen
   
 ## Acknowledgements
 
