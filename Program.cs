@@ -2035,9 +2035,12 @@ namespace Personal_Assistant
                         // run unattended is the assistant's call to make, out loud,
                         // in VoiceTriggers.Validate.
                         new ToolParameter("run_tool", "string",
-                            "Optional tool to run when it fires — name the tool the user actually " +
-                            "asked for, e.g. control_lights, send_sms, power_control. Never " +
-                            "substitute a different action from the one they asked for.",
+                            "OMIT THIS unless the user asked for an ACTION as well as being told. " +
+                            "\"Tell me when X\" and \"let me know when X\" are notifications and " +
+                            "need only a message — adding a tool to those is wrong and the rule " +
+                            "will be rejected. Use it only for \"when X, DO Y\", and then name the " +
+                            "tool the user actually asked for, e.g. control_lights, send_sms. " +
+                            "Never substitute a different action from the one they asked for.",
                             Required: false),
                         new ToolParameter("run_tool_args", "string",
                             "Optional JSON object of arguments for run_tool, " +
