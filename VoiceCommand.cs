@@ -168,6 +168,10 @@ namespace Personal_Assistant.Dispatch
         // doesn't offer accept_suggestion.
         public Personal_Assistant.Suggestions.SuggestionService Suggestions { get; init; }
 
+        // Real-world events the user is waiting on. Null in a harness, and the
+        // reminder-listing tools simply say nothing about watches when it is.
+        public Personal_Assistant.Events.EventWatchService Watches { get; init; }
+
         public IReadOnlyDictionary<string, string> Contacts { get; init; }
         public string IpAddressPlug { get; init; }
         public string IpAddressSwitch { get; init; }

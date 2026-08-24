@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -450,6 +451,112 @@ namespace Personal_Assistant.GeminiClient
             }
         }
 
+        // The model used to check whether a real-world event has actually
+        // happened. Pinned SEPARATELY from ModelId, and deliberately not allowed
+        // to inherit it.
+        //
+        // ModelId is gemini-3.1-flash-lite, and GroundingAvailableFor documents
+        // that every 3.x request carrying google_search 429s on this project. A
+        // verification that quietly ran without search would not be a degraded
+        // check — it would be the model answering from training data and sounding
+        // certain, which is precisely how a wrong Re:Zero release date got stated
+        // as fact (see NoSearchCaveat). For this call, no search means no answer.
+        public static string VerifyModelId =>
+            LaithConfig.Text("EventVerifyModel", "gemini-2.5-flash");
+
+        /// <summary>
+        /// Asks, with web search, whether <paramref name="subject"/> has happened
+        /// yet. Never throws: every failure becomes an Unknown carrying the
+        /// reason, because the caller's job is to decide whether to re-check and
+        /// "the lookup broke" and "the event hasn't happened" must not look the
+        /// same to it.
+        /// </summary>
+        public static async Task<EventVerdict> VerifyEventAsync(
+            string subject, CancellationToken cancel = default(CancellationToken))
+        {
+            if (string.IsNullOrWhiteSpace(subject))
+            {
+                return EventVerdict.Unknown("no subject to check");
+            }
+
+            string model = VerifyModelId;
+
+            // The one refusal that matters. Everything below assumes the answer
+            // came from a search; without grounding this call can only launder
+            // training data into something that reads like a fact-check.
+            if (!GroundingAvailableFor(model))
+            {
+                return EventVerdict.Unknown(
+                    $"grounding is unavailable for {model}, and an unsearched answer is worthless here");
+            }
+
+            string endpoint =
+                "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
+
+            // A rigid one-line format rather than JSON mode: structured output and
+            // the google_search tool cannot be requested together, and losing
+            // search to gain a schema is the wrong half of that trade. One line
+            // with two pipes is something a parser can be lenient about.
+            string instruction =
+                "You check whether a specific real-world event has already happened. " +
+                $"Today is {DateTime.Now:dddd d MMMM yyyy}, local time {DateTime.Now:HH:mm}. " +
+                "You have Google Search: use it, and answer only from what you find. " +
+                "If the search results do not settle it, say UNKNOWN — never guess from memory.";
+
+            string question =
+                $"Event: {subject}\n\n" +
+                "Has it happened yet? Reply with EXACTLY one line, nothing else, in this format:\n" +
+                "STATUS | one short sentence | url\n" +
+                "STATUS is HAPPENED, NOT_YET, or UNKNOWN. " +
+                "The sentence is spoken aloud, so: under 20 words, no markdown, no asterisks. " +
+                "The url is a single direct link to where it can be watched or read, or the word NONE.";
+
+            var requestBody = new Dictionary<string, object>
+            {
+                ["system_instruction"] = new { parts = new[] { new { text = instruction } } },
+                ["contents"] = new[]
+                {
+                    new { role = "user", parts = new[] { new { text = question } } }
+                },
+                ["tools"] = new[] { new { google_search = new { } } },
+                ["generationConfig"] = new
+                {
+                    // Low but not zero: this is a lookup, and creative rephrasing
+                    // of a release date is the failure mode.
+                    temperature = 0.1,
+                    // Roomy on purpose. 2.5 spends part of this budget thinking
+                    // before it writes, and a cap tight enough for one line of
+                    // output comes back empty rather than short.
+                    maxOutputTokens = 800
+                }
+            };
+
+            try
+            {
+                var content = new StringContent(
+                    JsonSerializer.Serialize(requestBody, RawJsonOpts), Encoding.UTF8, "application/json");
+
+                using (HttpResponseMessage response =
+                    await httpClient.PostAsync(endpoint, content, cancel).ConfigureAwait(false))
+                {
+                    string body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        return EventVerdict.Unknown($"{(int)response.StatusCode} {response.ReasonPhrase}");
+                    }
+                    return EventVerdict.Parse(ExtractText(body));
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                return EventVerdict.Unknown("the check was cancelled");
+            }
+            catch (Exception ex)
+            {
+                return EventVerdict.Unknown(ex.Message);
+            }
+        }
+
         private static string ExtractText(string json)
         {
             using (JsonDocument doc = JsonDocument.Parse(json))
@@ -476,6 +583,89 @@ namespace Personal_Assistant.GeminiClient
                 }
                 return sb.ToString();
             }
+        }
+    }
+
+    // What a grounded check found out about a real-world event.
+    public sealed class EventVerdict
+    {
+        public enum Outcome
+        {
+            Happened, // the search says it has
+            NotYet,   // the search says it hasn't
+            Unknown   // the search didn't settle it, or the lookup failed
+        }
+
+        public Outcome Result { get; private set; }
+
+        // One speakable sentence, or the failure reason when Result is Unknown.
+        public string Detail { get; private set; }
+
+        // Where to go to see it, or null. Only ever populated on Happened —
+        // offering to open a link for something that has not been released is
+        // offering to open a 404.
+        public string Url { get; private set; }
+
+        public static EventVerdict Unknown(string reason) =>
+            new EventVerdict { Result = Outcome.Unknown, Detail = reason };
+
+        /// <summary>
+        /// Reads the one-line "STATUS | sentence | url" reply. Lenient about
+        /// everything except the status word: a model that wraps the line in
+        /// quotes, adds a full stop, or omits the url is still understood, but
+        /// one whose status cannot be read is Unknown rather than assumed — the
+        /// whole point of this type is that "it happened" is never a default.
+        /// </summary>
+        public static EventVerdict Parse(string reply)
+        {
+            if (string.IsNullOrWhiteSpace(reply))
+            {
+                return Unknown("the check came back empty");
+            }
+
+            // Models sometimes prepend a courtesy line. The one that matters is
+            // the first containing a status word.
+            string line = reply
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                .FirstOrDefault(l => l.IndexOf("HAPPENED", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                     l.IndexOf("NOT_YET", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                     l.IndexOf("UNKNOWN", StringComparison.OrdinalIgnoreCase) >= 0);
+
+            if (line == null) return Unknown("the check didn't answer in the expected form");
+
+            string[] parts = line.Split('|');
+            string status = parts[0].Trim().Trim('"', '*', '`', '.').ToUpperInvariant();
+            string detail = parts.Length > 1 ? parts[1].Trim().Trim('"', '*', '`') : null;
+            string url = parts.Length > 2 ? parts[2].Trim().Trim('"', '*', '`', '.', ',') : null;
+
+            if (string.IsNullOrWhiteSpace(url) ||
+                url.Equals("NONE", StringComparison.OrdinalIgnoreCase) ||
+                !(url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                  url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)))
+            {
+                // Anything that is not plainly an http(s) URL is discarded rather
+                // than repaired. This value ends up in Process.Start, and guessing
+                // at a half-formed one is how a search result becomes a command.
+                url = null;
+            }
+
+            // NOT_YET is checked before HAPPENED: the string "NOT_YET" contains
+            // neither as a substring of the other, but a sentence like "has not
+            // happened yet" trips a naive Contains("HAPPENED") on the whole line.
+            if (status.Contains("NOT_YET") || status.Contains("NOT YET"))
+            {
+                return new EventVerdict { Result = Outcome.NotYet, Detail = detail };
+            }
+            if (status.Contains("UNKNOWN"))
+            {
+                return Unknown(detail ?? "the search didn't settle it");
+            }
+            if (status.Contains("HAPPENED"))
+            {
+                return new EventVerdict { Result = Outcome.Happened, Detail = detail, Url = url };
+            }
+
+            return Unknown("the check didn't answer in the expected form");
         }
     }
 }

@@ -316,6 +316,47 @@ namespace Personal_Assistant.Suggestions
         }
 
         /// <summary>
+        /// Makes an offer the user is already expecting, right now, bypassing the
+        /// frequency budget.
+        ///
+        /// The budget exists to stop the assistant volunteering things nobody
+        /// asked for. This is the opposite case: the user explicitly asked to be
+        /// told when something happened, and it just happened. Running that
+        /// through a ninety-minute minimum gap — or dropping it because eight
+        /// unrelated suggestions were already made today — would silently swallow
+        /// the one announcement that was actually requested, and the user would
+        /// have no way to tell that from the event never occurring.
+        ///
+        /// It still goes through the pending/accept machinery, because that is
+        /// what makes "yes, go on" resolve to something, and it still records
+        /// against the budget on the way out so a confirmed offer is not
+        /// immediately followed by an unrelated one.
+        /// </summary>
+        public async Task OfferNow(string name, string offer, Func<Task<string>> accept)
+        {
+            if (string.IsNullOrWhiteSpace(offer)) return;
+
+            lock (gate)
+            {
+                Pending = new PendingSuggestion
+                {
+                    Name = name ?? "offer",
+                    Offer = offer,
+                    Accept = accept,
+                    ExpiresAt = DateTime.Now.AddMinutes(10)
+                };
+            }
+
+            Budget.Record();
+            Console.WriteLine($"[suggest] offering '{name}' (asked for): {offer}");
+
+            try { remember?.Invoke(offer); }
+            catch (Exception ex) { Console.WriteLine($"[suggest] remember failed: {ex.Message}"); }
+
+            await announce(offer).ConfigureAwait(false);
+        }
+
+        /// <summary>
         /// Looks for something worth saying right now, and says at most one thing.
         /// Normally driven by the once-a-minute tick that <see cref="Start"/>
         /// arms; public so it can be run on demand — which is what makes the

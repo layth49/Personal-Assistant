@@ -5,6 +5,7 @@ using Personal_Assistant.Arduino;
 using Personal_Assistant.AudioControl;
 using Personal_Assistant.Diagnostics;
 using Personal_Assistant.Dispatch;
+using Personal_Assistant.Events;
 using Personal_Assistant.GeminiClient;
 using Personal_Assistant.Geolocator;
 using Personal_Assistant.LightAutomator;
@@ -29,6 +30,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
@@ -289,6 +291,11 @@ namespace Personal_Assistant
                 ? $"[resume] last seen {lastSeen:ddd HH:mm} — off for {Downtime.Describe(downtime)}"
                 : "[resume] no heartbeat from a previous run");
 
+            // Set below, once the trigger engine and the suggestion service it
+            // needs exist. Captured by reference for the same reason dispatcherRef
+            // is: reminders are constructed first, but an anchored one coming due
+            // has to reach the watcher, and nothing can come due before Restore.
+            EventWatchService watcherRef = null;
             // A fired reminder has no user utterance, so use a clock as the
             // bubble's "you said" label — a nice reminder indicator now that the
             // bubble renders emoji. It's only shown, never spoken.
@@ -305,7 +312,18 @@ namespace Personal_Assistant
                 // By the time it goes off the clip is already cached, and the
                 // announcement is instant and in the right voice.
                 prepare: message => VoiceClipRenderer.TryEnsureAsync(
-                    LiveSessionOptions.ConfiguredVoice, message));
+                    LiveSessionOptions.ConfiguredVoice, message),
+                // persist:true only here, like ConversationMemory. Every harness
+                // gets the default false so it cannot write over real timers.
+                persist: true,
+                // A timer tied to a real event hands itself to the watcher
+                // instead of announcing. Null-safe because the watcher is
+                // assigned below and nothing can fire before Restore.
+                onEventDue: item =>
+                {
+                    watcherRef?.Begin(item.Subject, item.Label, item.FireAt);
+                    return Task.CompletedTask;
+                });
 
             // Everything LAITH does without being asked. The gate decides whether
             // an unprompted announcement is welcome (is anyone here? is it the
@@ -369,6 +387,19 @@ namespace Personal_Assistant
                 // and is handled by LiveSession.BuildSuggestionHint instead.
                 remember: offer => conversationMemoryRef?.AddModel(offer));
 
+            // Things the user is waiting on that the world decides rather than
+            // the clock. 🔔 as the bubble label, alongside ⏰ / 🕌 / 📌 / 💡.
+            //
+            // Given `suggestions` so a confirmed event becomes an OFFER ("it's
+            // out — want me to open it?") rather than a browser window appearing
+            // on its own. Nothing here opens a link without a spoken yes.
+            var watcher = new EventWatchService(
+                triggers,
+                message => speechManager.SayClip("🔔", message, renderOnMiss: true),
+                suggestions,
+                persist: true);
+            watcherRef = watcher;
+
             var voiceTriggers = new VoiceTriggers(
                 triggers,
                 processes,
@@ -386,6 +417,7 @@ namespace Personal_Assistant
                 Speech = speechManager,
                 VoiceTriggers = voiceTriggers,
                 Suggestions = suggestions,
+                Watches = watcher,
                 Lights = lightControl,
                 Playstation = playstationControl,
                 Sms = smsControl,
@@ -438,6 +470,13 @@ namespace Personal_Assistant
             // talking over each other at the moment the desktop finishes loading.
             var resumed = new ResumeSummary();
             resumed.Absorb(voiceTriggers.Restore(lastSeen));
+            resumed.Absorb(watcher.Restore());
+            // Reminders last of the three: an anchored one whose moment passed
+            // during downtime hands itself to the watcher, which must already
+            // have loaded its own store or the new watch is written into a list
+            // that Restore is about to clear.
+            resumed.Absorb(reminders.Restore(lastSeen));
+            watcher.Start();
 
             Console.WriteLine($"[resume] {resumed.LogLine()}");
 
@@ -1344,6 +1383,15 @@ namespace Personal_Assistant
                         "e.g. 10 minutes = 600)."),
                     new ToolParameter("label", "string",
                         "What to remind the user about when it fires, if they said. Omit for a plain timer.",
+                        Required: false),
+                    new ToolParameter("event_subject", "string",
+                        "ONLY when the countdown is until a real-world event that either happens or " +
+                        "doesn't — a game or episode release, a match kickoff, a launch. Give a short " +
+                        "searchable description of the event itself, e.g. 'Re:Zero Season 4 Recapture " +
+                        "Arc episode release'. Setting this means the countdown is treated as a " +
+                        "DEADLINE that survives a shutdown, and when it runs out I check whether the " +
+                        "event actually happened instead of just announcing it. Omit for ordinary " +
+                        "timers ('remind me in 10 minutes'), which are paused while the PC is off.",
                         Required: false)),
                 lower => lower.Contains("timer") ||
                          (lower.Contains("remind") && (lower.Contains(" in ") || lower.Contains("minute") ||
@@ -1358,12 +1406,25 @@ namespace Personal_Assistant
                                 .With("needs", "duration_seconds"));
                     }
                     string label = args.TryGetValue("label", out string l) ? l : null;
-                    ctx.Reminders.AddTimer(secs, label);
+                    string subject = args.TryGetValue("event_subject", out string sub) ? sub : null;
+                    ctx.Reminders.AddTimer(secs, label, subject);
+
                     string what = string.IsNullOrWhiteSpace(label) ? "" : $" to {label}";
+                    // Said differently on purpose: an event timer promises to go
+                    // and CHECK, and the user needs to know that is what they got
+                    // — it is the difference between being told a guess expired
+                    // and being told the thing happened.
+                    string speech = string.IsNullOrWhiteSpace(subject)
+                        ? $"Okay, I'll remind you{what} in {DescribeDuration(secs)}."
+                        : $"Okay — in {DescribeDuration(secs)} I'll check whether {subject} has happened " +
+                          "and let you know either way.";
+
                     return Task.FromResult(ToolResult
-                        .Speak($"Okay, I'll remind you{what} in {DescribeDuration(secs)}.")
+                        .Speak(speech)
                         .With("duration_seconds", secs.ToString())
                         .With("label", label ?? string.Empty)
+                        .With("event_subject", subject ?? string.Empty)
+                        .With("survives_restart", "true")
                         .With("fires_at_local", DateTime.Now.AddSeconds(secs).ToString("HH:mm")));
                 },
                 text =>
@@ -1442,10 +1503,28 @@ namespace Personal_Assistant
                 (ctx, args) =>
                 {
                     var pending = ctx.Reminders.Pending();
-                    if (pending.Count == 0)
+
+                    // Watches are listed alongside, because from the user's side
+                    // "the Re:Zero thing" is one of their pending items — the
+                    // fact that it graduated from a countdown into something
+                    // being checked is an implementation detail they never asked
+                    // about, and hiding it makes it look like it was forgotten.
+                    var watching = ctx.Watches?.Snapshot() ?? (IReadOnlyList<EventWatch>)new List<EventWatch>();
+
+                    if (pending.Count == 0 && watching.Count == 0)
                     {
                         return Task.FromResult(
                             ToolResult.Speak("You have no timers or alarms set.").With("count", "0"));
+                    }
+
+                    if (pending.Count == 0)
+                    {
+                        string subjects = string.Join(", ", watching.Select(w => w.Describe()));
+                        return Task.FromResult(ToolResult
+                            .Speak($"No timers, but I'm still checking on {subjects}.")
+                            .With("count", "0")
+                            .With("watching_count", watching.Count.ToString())
+                            .With("watching", subjects));
                     }
                     var sb = new System.Text.StringBuilder();
                     sb.Append($"You have {pending.Count} {(pending.Count == 1 ? "reminder" : "reminders")}: ");
@@ -1466,6 +1545,15 @@ namespace Personal_Assistant
                             .With($"reminder_{i + 1}_label", p.Label ?? string.Empty);
                     }
 
+                    if (watching.Count > 0)
+                    {
+                        string subjects = string.Join(", ", watching.Select(w => w.Describe()));
+                        sb.Append($" I'm also still checking on {subjects}.");
+                        result = result
+                            .With("watching_count", watching.Count.ToString())
+                            .With("watching", subjects);
+                    }
+
                     ToolResult spoken = ToolResult.Speak(sb.ToString());
                     foreach (KeyValuePair<string, string> kv in result.Data) spoken = spoken.With(kv.Key, kv.Value);
                     return Task.FromResult(spoken);
@@ -1479,11 +1567,18 @@ namespace Personal_Assistant
                 (ctx, args) =>
                 {
                     int n = ctx.Reminders.CancelAll();
+                    // Watches go too. "Cancel my reminders" means stop bothering
+                    // me about this stuff, and leaving something that still
+                    // speaks unprompted hours later would read as the cancel
+                    // having failed.
+                    int w = ctx.Watches?.CancelAll() ?? 0;
+                    int total = n + w;
                     return Task.FromResult(ToolResult
-                        .Speak(n == 0
+                        .Speak(total == 0
                             ? "There was nothing to cancel."
-                            : $"Cancelled {n} {(n == 1 ? "reminder" : "reminders")}.")
-                        .With("cancelled_count", n.ToString()));
+                            : $"Cancelled {total} {(total == 1 ? "reminder" : "reminders")}.")
+                        .With("cancelled_count", n.ToString())
+                        .With("cancelled_watches", w.ToString()));
                 }));
 
             // Answering "yes" to something the assistant offered on its own.
