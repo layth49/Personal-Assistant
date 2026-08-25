@@ -449,9 +449,11 @@
     <Compile Include="CallScreening\GoogleVoiceCallTransport.cs" />
     <Compile Include="CallScreening\PhoneLinkCallController.cs" />
     <Compile Include="CallScreening\PhoneLinkCallWatcher.cs" />
+    <Compile Include="ClipboardController.cs" />
     <Compile Include="ConversationMemory.cs" />
     <Compile Include="Downtime.cs" />
     <Compile Include="EventWatch.cs" />
+    <Compile Include="FileFinder.cs" />
     <Compile Include="GeminiClient.cs" />
     <Compile Include="FinishedFileWatcher.cs" />
     <Compile Include="Geolocator.cs" />
@@ -466,6 +468,7 @@
     <Compile Include="LiveSession.cs" />
     <Compile Include="VoiceClips.cs" />
     <Compile Include="MediaController.cs" />
+    <Compile Include="NotesService.cs" />
     <Compile Include="NowPlayingReader.cs" />
     <Compile Include="PlaystationController.cs" />
     <Compile Include="PrayerAnnouncer.cs" />
@@ -487,6 +490,7 @@
     <Compile Include="VoiceCommand.cs" />
     <Compile Include="VoiceTriggers.cs" />
     <Compile Include="WeatherService.cs" />
+    <Compile Include="WindowController.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="App.config" />

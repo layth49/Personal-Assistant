@@ -150,6 +150,10 @@ namespace Personal_Assistant.Dispatch
         public GetLocation Location { get; init; }
         public AudioController Audio { get; init; }
         public ScreenshotService Screenshot { get; init; }
+        public Personal_Assistant.ClipboardControl.ClipboardController Clipboard { get; init; }
+        public Personal_Assistant.FileFinding.FileFinder Files { get; init; }
+        public Personal_Assistant.WindowControl.WindowController Windows { get; init; }
+        public Personal_Assistant.Notes.NotesService Notes { get; init; }
         public ProcessController Processes { get; init; }
         public AppLauncher Apps { get; init; }
         public MediaController Media { get; init; }

@@ -178,6 +178,134 @@ namespace Personal_Assistant.GeminiClient
             }
         }
 
+        // Rewrites or answers about a block of text under an explicit
+        // instruction, and returns the result verbatim.
+        //
+        // Deliberately does NOT use SystemPrompt: that one is built for speech
+        // ("never use markdown", "default to one short sentence", 200 output
+        // tokens), which is exactly wrong for reorganising a markdown note —
+        // it would strip the formatting and truncate anything substantial.
+        public static async Task<string> TransformTextAsync(
+            string instruction, string content, int maxOutputTokens = 4096)
+        {
+            var requestBody = new Dictionary<string, object>
+            {
+                ["system_instruction"] = new
+                {
+                    parts = new[]
+                    {
+                        new { text =
+                            "You transform text exactly as instructed and return ONLY the " +
+                            "result — no preamble, no commentary, no markdown code fences " +
+                            "around the whole answer. Preserve the author's meaning, wording " +
+                            "and any facts; you are reorganising, not rewriting from scratch, " +
+                            "and you never invent content that wasn't there." }
+                    }
+                },
+                ["contents"] = new object[]
+                {
+                    new
+                    {
+                        role = "user",
+                        parts = new object[]
+                        {
+                            new { text = instruction + "\n\n---\n" + (content ?? string.Empty) }
+                        }
+                    }
+                },
+                ["generationConfig"] = new
+                {
+                    temperature = 0.2,
+                    maxOutputTokens = maxOutputTokens
+                }
+            };
+
+            var body = new StringContent(
+                JsonSerializer.Serialize(requestBody, JsonOpts),
+                Encoding.UTF8,
+                "application/json");
+
+            try
+            {
+                using (HttpResponseMessage response = await httpClient.PostAsync(Endpoint, body))
+                {
+                    string json = await response.Content.ReadAsStringAsync();
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        Console.WriteLine($"[gemini] transform HTTP {(int)response.StatusCode}: {json}");
+                        return null;
+                    }
+                    return ExtractText(json);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[gemini] transform failed: {ex.Message}");
+                return null;
+            }
+        }
+
+        // Answers a question about a single image (e.g. a screenshot) using the
+        // same model and endpoint as the text path, with an inlineData part
+        // alongside the question. No history, no tools, no grounding — this is a
+        // one-shot "what am I looking at" call.
+        public static async Task<string> AskAboutImageAsync(string question, byte[] pngBytes)
+        {
+            var requestBody = new Dictionary<string, object>
+            {
+                ["contents"] = new object[]
+                {
+                    new
+                    {
+                        role = "user",
+                        parts = new object[]
+                        {
+                            new { text = question },
+                            new
+                            {
+                                inlineData = new
+                                {
+                                    mimeType = "image/png",
+                                    data = Convert.ToBase64String(pngBytes)
+                                }
+                            }
+                        }
+                    }
+                },
+                ["generationConfig"] = new
+                {
+                    temperature = 0.2,
+                    maxOutputTokens = 300
+                }
+            };
+
+            var content = new StringContent(
+                JsonSerializer.Serialize(requestBody, JsonOpts),
+                Encoding.UTF8,
+                "application/json");
+
+            try
+            {
+                using (HttpResponseMessage response = await httpClient.PostAsync(Endpoint, content))
+                {
+                    string body = await response.Content.ReadAsStringAsync();
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        Console.WriteLine($"[gemini] vision call HTTP {(int)response.StatusCode}: {body}");
+                        return null;
+                    }
+
+                    return ExtractText(body);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[gemini] vision call failed: {ex.Message}");
+                return null;
+            }
+        }
+
         // Intent router for LLM-first dispatch. Sends the user input plus the tool
         // schemas (as Gemini function_declarations) and returns either a tool call
         // the model chose, a plain reply (no tool fit), or a Failure the dispatcher
