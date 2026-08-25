@@ -76,7 +76,27 @@ namespace Personal_Assistant.GeminiClient
         // How long to wait for the tool-detection call before giving up so the
         // dispatcher can fall back to keyword matching. Shorter than the general
         // HttpClient timeout because intent routing should feel instant.
+        //
+        // This budget covers the retry below as well, deliberately: an empty
+        // candidate should cost one more round trip, not a second full 15s.
         private static readonly TimeSpan DetectTimeout = TimeSpan.FromSeconds(15);
+
+        // Thinking-token allowance for the router. -1 leaves it to the model,
+        // which is the default and today's behaviour; 0 suppresses thinking.
+        //
+        // Measured on gemini-3.1-flash-lite 2026-08-25: `thinkingBudget` IS a
+        // real, validated field here — 0 returns 200, and -5 is rejected with
+        // "thinking_budget must be in the range [-1, 65535]" (and an unknown
+        // field name 400s too, so acceptance is meaningful, not the API
+        // shrugging). What could NOT be shown is that setting 0 helps: this
+        // model reports no `thoughtsTokenCount` at all, and a budget of 0 still
+        // came back carrying a `thoughtSignature`.
+        //
+        // So it ships OFF. Suppressing thinking on a 47-tool AUTO router is a
+        // change that could quietly degrade tool choice, and the empty-candidate
+        // cause is still a hypothesis. The plumbing is here to make the
+        // experiment one config edit; it is not a fix being applied blind.
+        private static int ThinkingBudget => LaithConfig.Int("ThinkingBudget", -1, -1, 65535);
 
         private static HttpClient CreateHttpClient()
         {
@@ -317,27 +337,46 @@ namespace Personal_Assistant.GeminiClient
         {
             object requestBody = BuildToolRequest(inputText, tools, history);
 
-            var content = new StringContent(
-                JsonSerializer.Serialize(requestBody, RawJsonOpts),
-                Encoding.UTF8,
-                "application/json");
-
             using (var cts = new CancellationTokenSource(DetectTimeout))
             {
                 try
                 {
-                    using (HttpResponseMessage response =
-                        await httpClient.PostAsync(Endpoint, content, cts.Token))
+                    // Two attempts, because the empty candidate is intermittent:
+                    // a byte-identical request has come back empty twice and then
+                    // answered correctly on the third try. One cheap retry turns
+                    // most of those into a working turn instead of a silent drop
+                    // to the keyword matcher.
+                    for (int attempt = 1; ; attempt++)
                     {
-                        string body = await response.Content.ReadAsStringAsync();
+                        // Rebuilt per attempt: a StringContent is consumed by the
+                        // send and cannot be posted twice.
+                        var content = new StringContent(
+                            JsonSerializer.Serialize(requestBody, RawJsonOpts),
+                            Encoding.UTF8,
+                            "application/json");
 
-                        if (!response.IsSuccessStatusCode)
+                        using (HttpResponseMessage response =
+                            await httpClient.PostAsync(Endpoint, content, cts.Token))
                         {
-                            Console.WriteLine($"[gemini] tool detect HTTP {(int)response.StatusCode}: {body}");
-                            return LlmDecision.Failure();
-                        }
+                            string body = await response.Content.ReadAsStringAsync();
 
-                        return ParseDecision(body);
+                            if (!response.IsSuccessStatusCode)
+                            {
+                                Console.WriteLine(
+                                    $"[gemini] tool detect HTTP {(int)response.StatusCode}: {DescribeError(body)}");
+                                return LlmDecision.Failure();
+                            }
+
+                            LlmDecision decision = ParseDecision(body, out bool emptyCandidate);
+                            if (!emptyCandidate) return decision;
+
+                            if (attempt >= 2)
+                            {
+                                Console.WriteLine("[gemini] tool detect empty on retry too -> keyword fallback");
+                                return LlmDecision.Failure();
+                            }
+                            Console.WriteLine("[gemini] tool detect retrying once");
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -489,7 +528,7 @@ namespace Personal_Assistant.GeminiClient
                 ["parts"] = new[] { new Dictionary<string, object> { ["text"] = inputText } }
             });
 
-            return new Dictionary<string, object>
+            var request = new Dictionary<string, object>
             {
                 ["system_instruction"] = new Dictionary<string, object>
                 {
@@ -518,10 +557,30 @@ namespace Personal_Assistant.GeminiClient
                     ["maxOutputTokens"] = 512
                 }
             };
+
+            // Only sent when explicitly configured. -1 is the model's own
+            // default, and omitting the field entirely is not the same request
+            // as sending -1, so the default path stays byte-identical to what
+            // shipped before this was added.
+            if (ThinkingBudget >= 0)
+            {
+                ((Dictionary<string, object>)request["generationConfig"])["thinkingConfig"] =
+                    new Dictionary<string, object> { ["thinkingBudget"] = ThinkingBudget };
+            }
+
+            return request;
         }
 
-        private static LlmDecision ParseDecision(string json)
+        // `emptyCandidate` reports the specific 200-but-nothing-generated case —
+        // HTTP 200, finishReason STOP, a candidate whose `content` has no `parts`
+        // key at all. That shape used to return a bare Failure() with no logging,
+        // so the turn silently fell through to the keyword matcher and the only
+        // console line came from the HTTP-error branch, which a 200 never takes.
+        // It is reported separately from a parse error because it is the one
+        // failure worth retrying.
+        private static LlmDecision ParseDecision(string json, out bool emptyCandidate)
         {
+            emptyCandidate = false;
             try
             {
                 using (JsonDocument doc = JsonDocument.Parse(json))
@@ -531,6 +590,8 @@ namespace Personal_Assistant.GeminiClient
                         !candidates[0].TryGetProperty("content", out var contentEl) ||
                         !contentEl.TryGetProperty("parts", out var parts))
                     {
+                        emptyCandidate = true;
+                        Console.WriteLine($"[gemini] tool detect got 200 with no parts — {DescribeEmptyResponse(json)}");
                         return LlmDecision.Failure();
                     }
 
@@ -684,6 +745,121 @@ namespace Personal_Assistant.GeminiClient
                 return EventVerdict.Unknown(ex.Message);
             }
         }
+
+        // Turns a 200 that produced nothing into one greppable line: why the model
+        // stopped, whether the prompt was blocked, and how the token budget was
+        // actually spent. Thinking tokens count against maxOutputTokens, so
+        // `thoughts` alone consuming the allowance is a real and otherwise
+        // invisible cause of an empty candidate — note that gemini-3.1-flash-lite
+        // does not currently report thoughtsTokenCount, so that field reads 0
+        // here rather than being absent.
+        private static string DescribeEmptyResponse(string json)
+        {
+            try
+            {
+                using (JsonDocument doc = JsonDocument.Parse(json))
+                {
+                    var root = doc.RootElement;
+                    var sb = new StringBuilder();
+
+                    if (root.TryGetProperty("candidates", out var candidates) &&
+                        candidates.GetArrayLength() > 0)
+                    {
+                        var c = candidates[0];
+                        sb.Append("finishReason=");
+                        sb.Append(c.TryGetProperty("finishReason", out var fr) ? fr.GetString() : "(none)");
+                        if (c.TryGetProperty("content", out var contentEl))
+                        {
+                            sb.Append(contentEl.TryGetProperty("parts", out _)
+                                ? ", parts present but unusable"
+                                : ", content has no parts");
+                        }
+                        else
+                        {
+                            sb.Append(", candidate has no content");
+                        }
+                    }
+                    else
+                    {
+                        sb.Append("no candidates");
+                    }
+
+                    if (root.TryGetProperty("promptFeedback", out var pf) &&
+                        pf.TryGetProperty("blockReason", out var br))
+                    {
+                        sb.Append($", blockReason={br.GetString()}");
+                    }
+
+                    if (root.TryGetProperty("usageMetadata", out var um))
+                    {
+                        sb.Append(", tokens: ");
+                        sb.Append($"prompt={ReadInt(um, "promptTokenCount")} ");
+                        sb.Append($"thoughts={ReadInt(um, "thoughtsTokenCount")} ");
+                        sb.Append($"output={ReadInt(um, "candidatesTokenCount")}");
+                    }
+
+                    return sb.ToString();
+                }
+            }
+            catch (JsonException)
+            {
+                return "unparseable body: " + Truncate(json, 300);
+            }
+        }
+
+        private static string ReadInt(JsonElement obj, string name) =>
+            obj.TryGetProperty(name, out var el) && el.ValueKind == JsonValueKind.Number
+                ? el.GetInt32().ToString()
+                : "0";
+
+        // Pulls the human-readable message out of an API error body, and calls out
+        // quota exhaustion by name with its retry delay — the free tier is small
+        // enough that a 429 is an ordinary, expected failure, not an anomaly, and
+        // the quotaId says WHICH limit was hit.
+        private static string DescribeError(string json)
+        {
+            try
+            {
+                using (JsonDocument doc = JsonDocument.Parse(json))
+                {
+                    if (!doc.RootElement.TryGetProperty("error", out var err))
+                        return Truncate(json, 300);
+
+                    string status = err.TryGetProperty("status", out var s) ? s.GetString() : null;
+                    string message = err.TryGetProperty("message", out var m) ? m.GetString() : "";
+
+                    if (status == "RESOURCE_EXHAUSTED")
+                    {
+                        string quota = null, retry = null;
+                        if (err.TryGetProperty("details", out var details))
+                        {
+                            foreach (var d in details.EnumerateArray())
+                            {
+                                if (d.TryGetProperty("violations", out var violations))
+                                {
+                                    foreach (var v in violations.EnumerateArray())
+                                    {
+                                        if (v.TryGetProperty("quotaId", out var qid)) quota = qid.GetString();
+                                    }
+                                }
+                                if (d.TryGetProperty("retryDelay", out var rd)) retry = rd.GetString();
+                            }
+                        }
+                        return $"QUOTA EXHAUSTED ({quota ?? "unknown quota"})" +
+                               (retry != null ? $", retry in {retry}" : "");
+                    }
+
+                    return $"{status ?? "error"}: {Truncate(message, 300)}";
+                }
+            }
+            catch (JsonException)
+            {
+                return Truncate(json, 300);
+            }
+        }
+
+        private static string Truncate(string s, int max) =>
+            string.IsNullOrEmpty(s) || s.Length <= max ? s : s.Substring(0, max) + "...";
 
         private static string ExtractText(string json)
         {
