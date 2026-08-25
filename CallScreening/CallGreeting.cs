@@ -1,8 +1,9 @@
-using Personal_Assistant.Configuration;
+﻿using Personal_Assistant.Configuration;
 using Personal_Assistant.Live;
 using Personal_Assistant.VoiceClips;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 
 namespace Personal_Assistant.CallScreening
@@ -108,6 +109,64 @@ namespace Personal_Assistant.CallScreening
         }
 
         /// <summary>
+        /// Relationship words that sit where a first name would.
+        /// </summary>
+        /// <remarks>
+        /// Much of this address book is filed by relation — "عمي Bashar",
+        /// "Khalte Gadir", "Sitee Monera" — and the transport reports Google's
+        /// display name VERBATIM, so the first word of it is a title rather than
+        /// a name. Taking it literally greets four uncles as "Hi عمي" and, worse,
+        /// looks up a clip nothing ever rendered, so they drop to the stock
+        /// recording with nothing in the log to say why.
+        /// </remarks>
+        private static readonly HashSet<string> Titles = new HashSet<string>(
+            StringComparer.OrdinalIgnoreCase)
+        {
+            "عمي", "عمتي", "خالي", "خالتي", "جدي", "جدتي",
+            "Amo", "Amto", "Amtee", "Abu", "Khalee", "Khalte", "Sitee", "Sido",
+        };
+
+        /// <summary>
+        /// Contacts whose whole name is a relationship word, and what to say
+        /// instead. Layth's parents are filed in Arabic with no given name.
+        /// </summary>
+        private static readonly Dictionary<string, string> TitleOnly =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "أبوي", "Dad" },
+            { "أمي", "Mom" },
+        };
+
+        /// <summary>
+        /// Google's spelling of a name on the left, how it should be SAID on
+        /// the right.
+        /// </summary>
+        /// <remarks>
+        /// Not cosmetic — the clip cache is keyed on the exact text, so two
+        /// spellings of one person are two renders, two cache entries, and two
+        /// chances for one of them to be the stale one. Folding them here means
+        /// one clip per human being. “Rayy🦇” reaches this table because the
+        /// emoji is stripped above; both Mohameds are the same name as the
+        /// Mohammad already rendered; Chanc is a truncated Chance.
+        /// </remarks>
+        private static readonly Dictionary<string, string> Aliases =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "Mohamed", "Mohammad" },
+            { "Rayy", "Rayvon" },
+            { "Chanc", "Chance" },
+
+            // Transliterations, where Google's spelling and the one that gets
+            // SAID better are both defensible. The renderer is reading English
+            // letters aloud, so the spelling is the pronunciation — these three
+            // point at clips that already existed under the older spelling.
+            { "Intisar", "Intasar" },
+            { "Moshahel", "Mashahel" },
+            { "Ibraheem", "Ibrahim" },
+            { "Abduallah", "Abdullah" },
+        };
+
+        /// <summary>
         /// The part of a caller's name worth saying out loud, or null.
         /// </summary>
         /// <remarks>
@@ -131,13 +190,45 @@ namespace Personal_Assistant.CallScreening
             if (trimmed.StartsWith("an unknown", StringComparison.OrdinalIgnoreCase))
                 return null;
 
-            string first = trimmed.Split(new[] { ' ', '\t' },
-                StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-            if (string.IsNullOrEmpty(first)) return null;
+            // Filed as nothing but a relationship word, with no given name to
+            // fall back to. Both parents are stored this way, so without the
+            // map the two likeliest callers of all get the stock recording.
+            if (TitleOnly.TryGetValue(trimmed, out string mapped)) return mapped;
 
-            // Must actually contain letters. A phone number, or a name rendered
-            // as digits by the caller-ID, is not something to greet by.
+            string[] words = trimmed.Split(new[] { ' ', '\t' },
+                StringSplitOptions.RemoveEmptyEntries);
+
+            // Skip a leading relationship word, so "Khalte Gadir" greets Gadir.
+            // Exactly one, and never the last word standing: a contact filed as
+            // only "Abu" is a title with nobody behind it, and greeting them
+            // "Hi Abu" is the same mistake as "Hi عمي".
+            int at = Titles.Contains(words[0]) ? 1 : 0;
+            if (at >= words.Length) return null;
+            string first = words[at];
+
+            // "Ibraheem’s Mom" describes someone by their relation to somebody
+            // else, so the first word of it is a possessive rather than a name
+            // and "Hi Ibraheem’s" is worse than the stock recording. Only the
+            // possessive ENDING is refused, so an O'Brien is still greeted.
+            if (first.EndsWith("'s", StringComparison.OrdinalIgnoreCase) ||
+                first.EndsWith("’s", StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            // An emoji in the display name would be handed to the renderer as
+            // text and spoken as whatever the model makes of it. Stripped
+            // rather than refused, because it is decoration ON a name rather
+            // than part of one: “Rayy🦇” is still Rayy.
+            first = new string(first.Where(c => !char.IsSurrogate(c) &&
+                CharUnicodeInfo.GetUnicodeCategory(c) != UnicodeCategory.OtherSymbol)
+                .ToArray());
+
+            // Must actually contain letters. A phone number, a name rendered as
+            // digits by the caller-ID, or a contact filed as nothing but an
+            // emoji is not something to greet by.
             if (!first.Any(char.IsLetter)) return null;
+
+            // How Layth says the name, when that is not how Google spells it.
+            if (Aliases.TryGetValue(first, out string preferred)) first = preferred;
 
             // Long enough to be a name, short enough not to be a sentence that
             // wandered in from a live region.
