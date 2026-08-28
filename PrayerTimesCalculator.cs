@@ -1,15 +1,11 @@
 ﻿using System;
-using System.Threading.Tasks;
 using PrayTimes;
-using Personal_Assistant.SpeechManager;
+using Personal_Assistant.Dispatch;
 
 namespace Personal_Assistant.PrayerTimesCalculator
 {
     public class GetPrayerTimes
     {
-        // The app's shared instance — never `new` one here. See SpeechService.Current.
-        private static SpeechService speechManager { get { return SpeechService.Current; } }
-
         private readonly double latitude;
         private readonly double longitude;
         private readonly CalculationMethods calculationMethod;
@@ -52,7 +48,22 @@ namespace Personal_Assistant.PrayerTimesCalculator
                 { "[isha]ʕiʃaːʔ",    "Isha" },
             };
 
-        public async Task AnnouncePrayerTimes(DateTime date)
+        // Today's prayer times as a result: the announcement as plain text, and
+        // every prayer as its own data key so a model holding the conversation can
+        // answer "when is Maghrib?" from the times rather than from memory.
+        //
+        // PLAIN TEXT ON PURPOSE. main wraps the same announcement in <speak> /
+        // <voice> and puts each name in an IPA <phoneme> tag, because Azure Neural
+        // TTS understands them. Kokoro does not — it would read the tags out loud —
+        // so pronunciation here stays the spelled-out transliteration in
+        // PrayerSpoken above, and ToolResult.Ssml is left unset. See CLAUDE.md.
+        //
+        // This used to speak the five prayers as five separate utterances, each
+        // with its own bubble. They are one utterance and one bubble now, because
+        // a result is voiced once by whoever is doing the voicing — the sequence
+        // was only possible while this method owned the speaker. The sentences
+        // themselves are unchanged.
+        public ToolResult DescribePrayerTimes(DateTime date)
         {
             Times prayerTimes = CalculatePrayerTimes(date);
             bool isFriday = date.DayOfWeek == DayOfWeek.Friday;
@@ -61,16 +72,28 @@ namespace Personal_Assistant.PrayerTimesCalculator
                 ? new[] { "Fajr", "Jumuah", "Asr", "Maghrib", "Isha" }
                 : new[] { "Fajr", "Dhuhr", "Asr", "Maghrib", "Isha" };
 
+            var plain = new System.Text.StringBuilder();
+            var facts = ToolResult.None;
+
             for (int i = 0; i < prayers.Length; i++)
             {
                 string name = prayers[i];
                 string time12h = Format12HourTime(GetPrayerTime(prayerTimes, name));
 
                 string spoken = PrayerSpoken.TryGetValue(name, out var hint) ? hint : name;
-                string bubbleText = "What are today's prayer times?";
 
-                await speechManager.Say(bubbleText, $"{spoken} is at {time12h}");
+                if (plain.Length > 0) plain.Append(' ');
+                plain.Append($"{spoken} is at {time12h}.");
+
+                facts = facts.With(name.ToLowerInvariant(), time12h);
             }
+
+            ToolResult result = ToolResult.Speak(plain.ToString());
+            foreach (System.Collections.Generic.KeyValuePair<string, string> kv in facts.Data)
+            {
+                result = result.With(kv.Key, kv.Value);
+            }
+            return result.With("date_local", date.ToString("yyyy-MM-dd"));
         }
 
         private static TimeSpan GetPrayerTime(Times times, string prayerName)

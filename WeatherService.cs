@@ -6,8 +6,8 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
+using Personal_Assistant.Dispatch;
 using Personal_Assistant.Geolocator;
-using Personal_Assistant.SpeechManager;
 
 namespace Personal_Assistant.WeatherService
 {
@@ -22,10 +22,14 @@ namespace Personal_Assistant.WeatherService
             this.apiKey = apiKey;
         }
 
-        public async Task GetWeatherData()
+        // Returns the conditions rather than announcing them. It used to build a
+        // sentence and speak it through a SpeechService of its own — which was
+        // both a second instance (the bug that once sent a real empty SMS) and,
+        // once the Live model started speaking too, the reason the model had to
+        // guess at the weather it was describing.
+        public async Task<ToolResult> GetWeatherData()
         {
             var location = new GetLocation();
-            var speechManager = SpeechService.Current;   // never `new` one here
 
             try
             {
@@ -45,7 +49,9 @@ namespace Personal_Assistant.WeatherService
                     if (!response.IsSuccessStatusCode)
                     {
                         Console.WriteLine($"Error: {response.StatusCode}");
-                        return;
+                        return ToolResult.Failed(
+                            "Sorry, I couldn't get the weather right now.",
+                            "weather API returned " + response.StatusCode);
                     }
 
                     string json = await response.Content.ReadAsStringAsync();
@@ -59,12 +65,26 @@ namespace Personal_Assistant.WeatherService
                         $"{(int)data.Main.Temp}°F and feels like {(int)data.Main.FeelsLike}°F. " +
                         $"The sun is setting at {sunset.ToShortTimeString()} and rising tomorrow at {sunrise.ToShortTimeString()}";
 
-                    await speechManager.Say(Program.recognizedText, text);
+                    // Units are named explicitly: the request asks for imperial,
+                    // and a bare "72" invites the model to convert something that
+                    // was never Celsius.
+                    return ToolResult.Speak(text)
+                        .With("condition", data.Weather[0].Main)
+                        .With("description", data.Weather[0].Description)
+                        .With("temp_f", ((int)data.Main.Temp).ToString())
+                        .With("feels_like_f", ((int)data.Main.FeelsLike).ToString())
+                        .With("humidity_percent", data.Main.Humidity.ToString())
+                        .With("city", city)
+                        .With("country", data.Sys.Country)
+                        .With("sunrise_local", sunrise.ToString("HH:mm"))
+                        .With("sunset_local", sunset.ToString("HH:mm"));
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"An error occurred: {ex.Message}");
+                return ToolResult.Failed(
+                    "Sorry, I ran into a problem getting the weather.", ex.Message);
             }
         }
 
@@ -72,10 +92,9 @@ namespace Personal_Assistant.WeatherService
         // (/data/2.5/forecast — same API key tier as current weather). The
         // 3-hourly entries are grouped into local days; each day is summarised
         // by its high/low and the condition around midday.
-        public async Task GetForecastData(int days = 3)
+        public async Task<ToolResult> GetForecastData(int days = 3)
         {
             var location = new GetLocation();
-            var speechManager = SpeechService.Current;   // never `new` one here
 
             try
             {
@@ -95,23 +114,26 @@ namespace Personal_Assistant.WeatherService
                     if (!response.IsSuccessStatusCode)
                     {
                         Console.WriteLine($"Error: {response.StatusCode}");
-                        await speechManager.Say(Program.recognizedText,
-                            "Sorry, I couldn't get the forecast right now.");
-                        return;
+                        return ToolResult.Failed(
+                            "Sorry, I couldn't get the forecast right now.",
+                            "forecast API returned " + response.StatusCode);
                     }
 
                     string json = await response.Content.ReadAsStringAsync();
                     var data = JsonSerializer.Deserialize<ForecastResponse>(json);
 
                     string text = BuildForecastSummary(data, city, days);
-                    await speechManager.Say(Program.recognizedText, text);
+                    return ToolResult.Speak(text)
+                        .With("city", city)
+                        .With("days", days.ToString())
+                        .With("units", "fahrenheit");
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"An error occurred: {ex.Message}");
-                await speechManager.Say(Program.recognizedText,
-                    "Sorry, I ran into a problem getting the forecast.");
+                return ToolResult.Failed(
+                    "Sorry, I ran into a problem getting the forecast.", ex.Message);
             }
         }
 

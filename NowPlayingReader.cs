@@ -28,14 +28,32 @@ namespace Personal_Assistant.MediaControl
     // surfaced as null (no current session / metadata unavailable).
     public class NowPlayingReader
     {
-        public async Task<NowPlaying> GetCurrentAsync()
+        // The one place that decides what "the current media session" means.
+        // MediaController needs the same session to issue play/pause, and two
+        // answers to that question is one too many — picking the wrong session
+        // sends a command to the wrong app.
+        internal static async Task<GlobalSystemMediaTransportControlsSession> TryGetCurrentSessionAsync()
         {
             try
             {
                 GlobalSystemMediaTransportControlsSessionManager manager =
                     await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
+                return manager?.GetCurrentSession();
+            }
+            catch (Exception ex)
+            {
+                // WinRT interop on .NET Framework: surface, don't throw.
+                Console.WriteLine($"[media] could not reach the media session: {ex.Message}");
+                return null;
+            }
+        }
 
-                GlobalSystemMediaTransportControlsSession session = manager?.GetCurrentSession();
+        public async Task<NowPlaying> GetCurrentAsync()
+        {
+            try
+            {
+                GlobalSystemMediaTransportControlsSession session =
+                    await TryGetCurrentSessionAsync();
                 if (session == null) return null;
 
                 GlobalSystemMediaTransportControlsSessionMediaProperties props =

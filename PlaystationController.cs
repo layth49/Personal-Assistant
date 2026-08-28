@@ -1,10 +1,11 @@
-using FlaUI.Core;
+﻿using FlaUI.Core;
 using FlaUI.Core.AutomationElements;
 using FlaUI.Core.Conditions;
 using FlaUI.Core.Input;
 using FlaUI.Core.Tools;
 using FlaUI.Core.WindowsAPI;
 using FlaUI.UIA3;
+using Personal_Assistant.Dispatch;
 using Personal_Assistant.SpeechManager;
 using Python.Runtime;
 using System;
@@ -18,7 +19,15 @@ namespace Personal_Assistant.PlaystationController
         // The app's shared instance — never `new` one here. See SpeechService.Current.
         private static SpeechService speechManager { get { return SpeechService.Current; } }
 
-        public async Task TurnOnPlaystation()
+        // Returns the last thing it has to say rather than saying it.
+        //
+        // The two prompts in the middle stay where they are: they are a
+        // sub-dialog, not the tool's answer — the assistant asks a question and
+        // waits, which is exactly the kind of ctx.Speech call that is NOT a
+        // result. (That dialog opens the mic mid-tool, which is its own problem;
+        // it is not this phase's.) Only "<game> is ready! Have fun!" is the
+        // answer, so only that comes back.
+        public async Task<ToolResult> TurnOnPlaystation()
         {
             await speechManager.Say(Program.recognizedText,
                 "Okay! Turning on your PlayStation 5 now. What game would you like to play?");
@@ -41,7 +50,10 @@ namespace Personal_Assistant.PlaystationController
                 if (processes.Length == 0)
                 {
                     Console.WriteLine("Could not find the running Remote Play process.");
-                    return;
+                    // Silent on purpose — this path said nothing before, and a new
+                    // sentence here would be a behaviour change, not a port. The
+                    // model still learns the tool failed.
+                    return ToolResult.Failed(null, "remote play process not found");
                 }
 
                 Process realRemotePlay = processes[0];
@@ -65,7 +77,7 @@ namespace Personal_Assistant.PlaystationController
                 if (window == null)
                 {
                     Console.WriteLine("Remote Play window did not appear within 30s.");
-                    return;
+                    return ToolResult.Failed(null, "remote play window did not appear within 30s");
                 }
 
                 window.Focus();
@@ -110,7 +122,9 @@ namespace Personal_Assistant.PlaystationController
                 window.Close();
                 Keyboard.Press(VirtualKeyShort.ENTER); // Confirm close if the disconnect dialog pops up
 
-                await speechManager.Say(userResponse, $"{userResponse} is ready! Have fun!");
+                return ToolResult
+                    .Speak($"{userResponse} is ready! Have fun!")
+                    .With("game", userResponse);
             }
         }
 

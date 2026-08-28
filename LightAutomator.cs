@@ -1,34 +1,49 @@
+using System;
 using System.Diagnostics;
-using System.Threading.Tasks;
-using Personal_Assistant.SpeechManager;
+using Personal_Assistant.Dispatch;
 
 namespace Personal_Assistant.LightAutomator
 {
     public class LightControl
     {
-        // The app's shared instance — never `new` one here. See SpeechService.Current.
-        private static SpeechService speechManager { get { return SpeechService.Current; } }
+        public ToolResult TurnOnLights(string lightName, string ipAddress) => Toggle(lightName, ipAddress, on: true);
 
-        public async Task TurnOnLights(string lightName, string ipAddress)
-        {
-            RunKasa(ipAddress, "on");
-            await speechManager.Say(Program.recognizedText, $"Okay! Turning your {lightName} lights on now.");
-        }
+        public ToolResult TurnOffLights(string lightName, string ipAddress) => Toggle(lightName, ipAddress, on: false);
 
-        public async Task TurnOffLights(string lightName, string ipAddress)
+        // Reports what it did instead of announcing it. The SpeechService this
+        // used to reach for was the app's shared one, so nothing was broken — but
+        // a handler that speaks its own answer leaves a model consuming the tool
+        // result with nothing to speak from, which is the whole point of the
+        // ToolResult channel.
+        private ToolResult Toggle(string lightName, string ipAddress, bool on)
         {
-            RunKasa(ipAddress, "off");
-            await speechManager.Say(Program.recognizedText, $"Okay! Turning your {lightName} lights off now.");
-        }
+            string verb = on ? "on" : "off";
 
-        private static void RunKasa(string ipAddress, string action)
-        {
-            var cmd = new Process();
-            cmd.StartInfo.CreateNoWindow = true;
-            cmd.StartInfo.UseShellExecute = false;
-            cmd.StartInfo.FileName = "cmd.exe";
-            cmd.StartInfo.Arguments = $"/c kasa --host {ipAddress} {action}";
-            cmd.Start();
+            try
+            {
+                // `kasa` directly rather than through cmd.exe: the wrapper bought
+                // nothing, hid the exit code, and made a missing kasa look like a
+                // silent success.
+                var psi = new ProcessStartInfo("kasa", $"--host {ipAddress} {verb}")
+                {
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                Process.Start(psi);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error toggling {lightName} lights: {ex.Message}");
+                return ToolResult.Failed(
+                    $"Sorry, I couldn't reach your {lightName} lights.", ex.Message);
+            }
+
+            return ToolResult
+                .Speak($"Okay! Turning your {lightName} lights {verb} now.")
+                .With("light", lightName)
+                .With("state", verb);
         }
     }
 }
