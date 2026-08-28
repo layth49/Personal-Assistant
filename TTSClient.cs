@@ -1,4 +1,4 @@
-using NAudio.Wave;
+﻿using NAudio.Wave;
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -217,7 +217,11 @@ namespace Personal_Assistant.TTSClient
         // One Kokoro synthesis round trip. Shared by the one-shot and streaming
         // paths so the payload/endpoint live in exactly one place. Returns null
         // if nothing speakable survives the strip.
-        private static async Task<byte[]> RequestWavAsync(string text, CancellationToken ct)
+        private static async Task<byte[]> RequestWavAsync(string text, CancellationToken ct) =>
+            await RequestWavAsync(text, null, ct).ConfigureAwait(false);
+
+        private static async Task<byte[]> RequestWavAsync(
+            string text, string voiceOverride, CancellationToken ct)
         {
             string spoken = StripUnspeakable(text);
             if (!HasSpeakable(spoken)) return null;
@@ -226,7 +230,7 @@ namespace Personal_Assistant.TTSClient
             {
                 model = "kokoro",
                 input = spoken,
-                voice = voice,
+                voice = string.IsNullOrWhiteSpace(voiceOverride) ? voice : voiceOverride,
                 response_format = "wav"
             };
             var json = JsonSerializer.Serialize(payload);
@@ -503,6 +507,39 @@ namespace Personal_Assistant.TTSClient
                 try { streamOutput.Stop(); } catch { }
             }
         }
+
+        // ── Synthesis without playback ──────────────────────────────────────
+        //
+        // Everything above ends at a WaveOutEvent, which plays on the machine's
+        // DEFAULT output — the speakers. A screened call must never do that: its
+        // mouth is a virtual cable, and audio that reaches the speakers instead
+        // is the exact failure main recorded (the caller heard silence while
+        // Layth heard the greeting). So the call path takes the WAV bytes and
+        // does its own routing.
+        //
+        // Deliberately routed through RequestWavAsync rather than around it, so
+        // StripUnspeakable still runs at the one chokepoint: Kokoro has no SSML
+        // and reads an emoji out loud as its CLDR name, and a caller hearing
+        // "smiling face with smiling eyes" down a phone line is worse than on
+        // speakers because there is nobody to explain it to them.
+        //
+        // The header fix is applied here too — Kokoro-FastAPI leaves the RIFF
+        // sizes as placeholders, and NAudio's WaveFileReader rejects that — so
+        // callers get bytes a WaveFileReader will actually open.
+        internal static async Task<byte[]> SynthesizeWavAsync(
+            string text, string voiceOverride = null, CancellationToken ct = default)
+        {
+            byte[] wav = await RequestWavAsync(text, voiceOverride, ct).ConfigureAwait(false);
+            if (wav == null) return null;
+            FixWavHeaderSizes(wav);
+            return wav;
+        }
+
+        // The voice this process synthesises in. THE ONE ACCESSOR for it outside
+        // this class: the call greeting cache is keyed on it, so a second copy of
+        // the KOKORO_VOICE expression that drifted would render every clip under
+        // a key nothing ever looks up, and the stock-WAV fallback would hide it.
+        internal static string ConfiguredVoice => voice;
 
         // Kokoro-FastAPI streams the WAV and leaves the RIFF/data chunk size
         // fields as placeholders, which NAudio's WaveFileReader rejects. Rewrite

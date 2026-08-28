@@ -198,10 +198,35 @@ namespace Personal_Assistant.Presence
             Console.WriteLine($"[presence] muted for {duration.TotalMinutes:F0}m");
         }
 
-        public void Unmute()
+        public void Unmute() => MuteUntil(null);
+
+        /// <summary>When the current mute ends, or null when nothing is muted.</summary>
+        public DateTime? MutedUntil
         {
-            lock (gate) { mutedUntil = null; }
-            Console.WriteLine("[presence] unmuted");
+            get
+            {
+                lock (gate)
+                {
+                    return mutedUntil.HasValue && DateTime.Now < mutedUntil.Value ? mutedUntil : null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Sets the mute deadline outright — null unmutes.
+        /// </summary>
+        /// <remarks>
+        /// The primitive behind MuteFor/Unmute, exposed so a temporary hold can put
+        /// back what it found rather than clearing it. A screened call mutes for its
+        /// own duration; if Layth had already asked for quiet until midnight, ending
+        /// that early because a stranger rang is not what he asked for.
+        /// </remarks>
+        public void MuteUntil(DateTime? until)
+        {
+            lock (gate) { mutedUntil = until; }
+            Console.WriteLine(until.HasValue
+                ? $"[presence] muted until {until.Value:HH:mm}"
+                : "[presence] unmuted");
         }
 
         // Time since the last keyboard or mouse input anywhere on the desktop.

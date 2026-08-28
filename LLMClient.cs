@@ -771,12 +771,19 @@ namespace Personal_Assistant.LLMClient
             }
         }
 
-        private static object BuildToolRequest(
-            string inputText,
-            IReadOnlyList<ToolDefinition> tools,
-            IReadOnlyList<ConversationTurn> history)
+        // The OpenAI `tools` array for a set of schemas.
+        //
+        // Split out of BuildToolRequest and made internal for the screened-call
+        // path, which builds its own request — a different message shape, a
+        // fail-closed four-tool list, and streamed rather than one-shot — but which
+        // must encode the SAME schemas. A second copy of this loop is a copy that
+        // can drift, and a drifted `required` list is a tool called with the wrong
+        // arguments on a call nobody is watching.
+        internal static List<object> ToolSchemas(IReadOnlyList<ToolDefinition> tools)
         {
             var toolList = new List<object>();
+            if (tools == null) return toolList;
+
             foreach (var tool in tools)
             {
                 var properties = new Dictionary<string, object>();
@@ -816,12 +823,20 @@ namespace Personal_Assistant.LLMClient
                 });
             }
 
+            return toolList;
+        }
+
+        private static object BuildToolRequest(
+            string inputText,
+            IReadOnlyList<ToolDefinition> tools,
+            IReadOnlyList<ConversationTurn> history)
+        {
             return new Dictionary<string, object>
             {
                 // Reuse the same message builder (tool actions -> system note,
                 // never assistant messages) as the conversational path.
                 ["messages"] = BuildMessages(ToolSystemPrompt, history, inputText),
-                ["tools"] = toolList,
+                ["tools"] = ToolSchemas(tools),
                 // "auto" lets the model pick a tool OR answer in text — the
                 // LLM-first behaviour we want (not forced to call a tool).
                 ["tool_choice"] = "auto",

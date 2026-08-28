@@ -1,4 +1,4 @@
-using NAudio.CoreAudioApi;
+﻿using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using System;
 using System.Threading;
@@ -465,7 +465,12 @@ namespace Personal_Assistant.CallScreening
         // this leg cannot be tested on a machine without the cable installed, so
         // a deterministic encoder that is obviously right beats a shorter one
         // whose behaviour has to be discovered on the day of a real call.
-        private sealed class CableWriter : IDisposable
+        // INTERNAL rather than private, and the one change 6b made to this file.
+        // CallAudioBridge's outbound leg is this class — it was a private nested
+        // type of CallAudioBridge upstream, and moving the preflight primitives
+        // here moved it with them. A second copy living in the bridge is exactly
+        // what these headers warn against, so the bridge borrows this one.
+        internal sealed class CableWriter : IDisposable
         {
             private readonly MMDeviceEnumerator enumerator = Enumerate();
             private readonly MMDevice device;

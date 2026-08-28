@@ -176,6 +176,14 @@ namespace Personal_Assistant.Dispatch
         // reminder-listing tools simply say nothing about watches when it is.
         public Personal_Assistant.Events.EventWatchService Watches { get; init; }
 
+        // Answering the phone. Null whenever CallScreening is off in App.config —
+        // which is the default — and BuildRegistry then does not offer
+        // screen_calls/end_call/list_calls AT ALL, rather than offering tools that
+        // refuse politely. A tool the model can see is a tool it will reach for,
+        // and "call screening is disabled in App.config" is not an answer anyone
+        // wants spoken back to them mid-sentence.
+        public Personal_Assistant.CallScreening.CallScreeningService CallScreening { get; init; }
+
         // Reads the battery. Defaulted rather than injected because get_battery
         // and the battery_below rules both want one and neither cares which.
         public Personal_Assistant.Power.BatteryReader Battery { get; init; }

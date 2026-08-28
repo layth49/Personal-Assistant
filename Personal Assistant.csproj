@@ -446,18 +446,23 @@
     <Compile Include="bakeoff\llm\BakeoffHarness.cs" />
     <Compile Include="AppLauncher.cs" />
     <Compile Include="Arduino.cs" />
-    <!-- Call screening, transport half. The conversation half — CallSession,
-         CallAudioBridge, CallGreeting, CallScreeningService — is not here yet, so
-         nothing below is reachable from the tool registry: this compiles the
-         machinery and waits. CallOutcome.cs and CallAudioPreflight.cs are this
-         branch's own files, holding the types those four would otherwise have
-         held hostage; their headers say why. -->
+    <!-- Call screening, both halves. The transport half came across near-verbatim;
+         CallSession, CallAudioBridge, CallGreeting and CallScreeningService were
+         rebuilt against the local stack (Parakeet, LM Studio, Kokoro), because the
+         originals drive a Gemini Live socket that does not exist here.
+         CallOutcome.cs and CallAudioPreflight.cs are this branch's own files,
+         holding the types the four would otherwise have held hostage while only
+         the transport half existed; their headers say why. -->
     <Compile Include="CallScreening\BluetoothHeadset.cs" />
+    <Compile Include="CallScreening\CallAudioBridge.cs" />
     <Compile Include="CallScreening\CallAudioPreflight.cs" />
     <Compile Include="CallScreening\CallAudioRouter.cs" />
+    <Compile Include="CallScreening\CallGreeting.cs" />
     <Compile Include="CallScreening\CallLog.cs" />
     <Compile Include="CallScreening\CallOutcome.cs" />
     <Compile Include="CallScreening\CallPersona.cs" />
+    <Compile Include="CallScreening\CallScreeningService.cs" />
+    <Compile Include="CallScreening\CallSession.cs" />
     <Compile Include="CallScreening\CallTools.cs" />
     <Compile Include="CallScreening\CallTransport.cs" />
     <Compile Include="CallScreening\CallWidgetHost.cs" />
