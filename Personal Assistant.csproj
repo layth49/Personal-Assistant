@@ -452,6 +452,7 @@
     <Compile Include="Downtime.cs" />
     <Compile Include="EchoGuard.cs" />
     <Compile Include="EventWatch.cs" />
+    <Compile Include="FileLog.cs" />
     <Compile Include="Geolocator.cs" />
     <Compile Include="IntentDispatcher.cs" />
     <Compile Include="IsExternalInit.cs" />

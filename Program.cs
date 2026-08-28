@@ -127,6 +127,33 @@ namespace Personal_Assistant
                 return;
             }
 
+            // First thing on the real path, ahead of the environment dump and the
+            // banner: anything written before the tee is installed is not
+            // captured, and the startup lines — which model, which endpoints,
+            // whether an env override beat App.config — are the ones most worth
+            // having. The app is a WinExe with no console, so without this every
+            // Console.WriteLine in the process goes nowhere.
+            //
+            // Below the bake-off return, deliberately. A harness run is watched
+            // live in a real console and sweeps a dozen models; teeing it would
+            // only churn the kept-run window and push the app's own logs out.
+            FileLog.Start();
+
+            // A crash on a background thread — an NAudio capture callback, the
+            // VAD/transcribe pump, the bubble pump — takes the process down with
+            // no console output at all, so it reads as "it just closed". Nothing
+            // here can prevent that; the point is purely that it leaves a stack
+            // trace in the log instead of requiring the debugger to have been
+            // watching.
+            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+            {
+                Console.WriteLine(new string('!', 72));
+                Console.WriteLine($"[crash] unhandled exception (terminating={e.IsTerminating})");
+                Console.WriteLine(e.ExceptionObject?.ToString() ?? "(no exception object)");
+                Console.WriteLine(new string('!', 72));
+                Console.Out.Flush();
+            };
+
             CheckEnvironmentVariables();
 
             // 49 (ASCII art)
@@ -610,8 +637,10 @@ namespace Personal_Assistant
                 }));
 
             registry.Add(new VoiceCommand(
-                ToolDefinition.Create("google_search",
-                    "Open a Google web search for what the user wants to look up.",
+                ToolDefinition.Create("open_web_search",
+                    "Open a Google web search in the browser for what the user wants to look " +
+                    "up. This only opens a tab — it does not read or speak the results. Use " +
+                    "web_search when the user wants an answer out loud.",
                     new ToolParameter("query", "string",
                         "The search terms to look up on Google.")),
                 lower => lower.StartsWith("search up") || lower.StartsWith("google"),
@@ -635,7 +664,7 @@ namespace Personal_Assistant
                     "Search the web and SPEAK the answer for anything needing current or " +
                     "external information you don't already know — news, prices, sports scores, " +
                     "recent events, weather in another city, or facts you're unsure about. Unlike " +
-                    "google_search (which just opens a browser tab), this reads results and answers " +
+                    "open_web_search (which just opens a browser tab), this reads results and answers " +
                     "out loud. Only use this when the request actually needs a search — don't use it " +
                     "for things another tool already handles, or for plain conversation.",
                     new ToolParameter("query", "string", "What to search for.")),
@@ -829,22 +858,36 @@ namespace Personal_Assistant
                 var contacts = context.Contacts;
                 registry.Add(new VoiceCommand(
                     ToolDefinition.Create("send_sms",
-                        "Send a text message to one of the user's known contacts.",
+                        "Send a text message to one of the user's known contacts. This really " +
+                        "sends to a real phone and cannot be undone. Give the exact words to " +
+                        "send; the assistant reads them back and waits for the user to say yes " +
+                        "before anything leaves the machine.",
                         new ToolParameter("contact", "string",
                             "Which contact to message.",
-                            AllowedValues: new List<string>(contacts.Keys))),
+                            AllowedValues: new List<string>(contacts.Keys)),
+                        new ToolParameter("message", "string",
+                            "The exact words to send. Never empty, and never invented — this is " +
+                            "what the contact will read.")),
                     lower => TryMatchContact(contacts, lower, out _, out _),
                     (ctx, args) =>
                     {
-                        string name = args["contact"];
-                        string number = ctx.Contacts[name];
-                        return ctx.Sms.SendSMS(name, number);
+                        args.TryGetValue("message", out string message);
+                        return HandleSendSmsAsync(ctx, args["contact"], message);
                     },
                     text =>
                     {
-                        if (TryMatchContact(contacts, text.ToLower(), out string name, out _))
-                            return new Dictionary<string, string> { ["contact"] = name };
-                        return VoiceCommand.EmptyArgs;
+                        if (!TryMatchContact(contacts, text.ToLower(), out string name, out _))
+                            return VoiceCommand.EmptyArgs;
+
+                        // The keyword path has no model to compose a body, so the
+                        // best it can do is carry across whatever the user already
+                        // said ("text mom I'll be late"). With nothing to send this
+                        // fails validation and falls through to conversation, which
+                        // is the right direction to fail in.
+                        var smsArgs = new Dictionary<string, string> { ["contact"] = name };
+                        string body = ExtractSmsBody(text, name);
+                        if (!string.IsNullOrWhiteSpace(body)) smsArgs["message"] = body;
+                        return smsArgs;
                     }));
             }
 
@@ -1091,40 +1134,42 @@ namespace Personal_Assistant
                     "Control the currently playing music or video: play/pause, skip to the " +
                     "next track, go back to the previous track, or stop.",
                     new ToolParameter("action", "string",
-                        "The media action to perform.",
+                        "The media action to perform. Use 'play' to resume (including for " +
+                        "\"unpause\") and 'pause' to pause — both are explicit and safe to repeat. " +
+                        "Only use 'playpause' when the user genuinely means \"toggle\".",
                         AllowedValues: new[] { "playpause", "play", "pause", "next", "previous", "stop" })),
                 lower => lower.Contains("music") || lower.Contains("song") || lower.Contains("track") ||
                          lower.Contains("play ") || lower == "play" || lower == "play." ||
                          lower.Contains("pause") || lower.Contains("resume") ||
                          lower.Contains("skip") || lower.Contains("next") || lower.Contains("previous"),
-                (ctx, args) =>
+                async (ctx, args) =>
                 {
-                    ToolResult result;
                     switch (args["action"])
                     {
                         case "next":
                             ctx.Media.Next();
-                            result = ToolResult.Speak("Skipping ahead.").With("action", "next");
-                            break;
+                            return ToolResult.Speak("Skipping ahead.").With("action", "next");
                         case "previous":
                             ctx.Media.Previous();
-                            result = ToolResult.Speak("Going back.").With("action", "previous");
-                            break;
+                            return ToolResult.Speak("Going back.").With("action", "previous");
                         case "stop":
                             ctx.Media.Stop();
-                            result = ToolResult.Speak("Stopped.").With("action", "stop");
-                            break;
-                        // play, pause, and playpause all map to the play/pause
-                        // toggle — the media key is a single toggle regardless.
-                        // That is wrong ("unpause" while playing pauses it) and
-                        // main fixed it, but the fix is its own change; this one
-                        // is only about where the answer comes from.
+                            return ToolResult.Speak("Stopped.").With("action", "stop");
+
+                        // play and pause are explicit and idempotent, NOT the
+                        // toggle they used to share. Asking to play something
+                        // already playing used to pause it, so repeated requests
+                        // fought each other and the video never resumed.
+                        case "play":
+                            return MediaOutcome(await ctx.Media.PlayAsync(), "Playing.", "play");
+                        case "pause":
+                            return MediaOutcome(await ctx.Media.PauseAsync(), "Paused.", "pause");
+
+                        // Only an explicit "playpause" still toggles.
                         default:
                             ctx.Media.PlayPause();
-                            result = ToolResult.Speak("Done.").With("action", "playpause");
-                            break;
+                            return ToolResult.Speak("Done.").With("action", "playpause");
                     }
-                    return Task.FromResult(result);
                 },
                 text =>
                 {
@@ -2070,6 +2115,218 @@ namespace Personal_Assistant
             {
                 await speechManager.Say(recognizedText, $"Ok. NOT {actionText}");
                 await Task.Delay(500);
+            }
+        }
+
+        // Sends a text, but only after reading it back and hearing a yes.
+        //
+        // The body arrives as a tool argument now. SMSControl used to dictate it
+        // itself through a SpeechService of its own making — a second instance,
+        // whose microphone was never opened, so every read came back "" and an
+        // empty text went to a real number. There is exactly one SpeechService in
+        // this process (Program.Main builds it) and this handler uses it.
+        //
+        // WHY THE GATE IS SPOKEN HERE RATHER THAN DELEGATED TO THE MODEL. main
+        // asks the model to put the question and pass the user's answer back in a
+        // `confirmed` parameter, guarded by a two-phase ConfirmationGate, because
+        // over there the model holds the conversation and a handler cannot take a
+        // turn. On this branch the handler CAN: the dispatch loop awaits
+        // DispatchAsync before it calls ListenForTurnAsync again, so while this
+        // runs nothing else is consuming utterances and the answer below is the
+        // user's own words, read straight off the one always-on listener. That
+        // removes the failure the gate exists to catch — a model writing
+        // confirmed:"yes" on the first call — rather than defending against it,
+        // so the gate's machinery would be ceremony here.
+        //
+        // It also cannot deadlock the listener. Nothing here opens a microphone;
+        // ListenForTurnAsync waits on the same queue the main loop waits on, and
+        // the assistant's own question is dropped by EchoGuard before it can be
+        // mistaken for an answer.
+        private static async Task<ToolResult> HandleSendSmsAsync(
+            CommandContext ctx, string contact, string message)
+        {
+            message = (message ?? string.Empty).Trim();
+            if (message.Length == 0)
+            {
+                return ToolResult.Failed(
+                    $"I don't have anything to send yet — what should I say to {contact}?",
+                    "empty_message");
+            }
+
+            // "text her to introduce yourself" is an instruction, not a body.
+            // Substituting the canned introduction has to happen HERE, above
+            // everything else: the read-back below quotes `message` and the result
+            // reports `message`. Doing the swap inside SMSControl.SendSMS — i.e.
+            // after the user had already said yes — meant the read-back quoted one
+            // text and a different one went to a real phone.
+            if (IsIntroductionRequest(message)) message = SMSControl.IntroductionText;
+
+            if (ctx.Contacts == null ||
+                !ctx.Contacts.TryGetValue(contact, out string number) ||
+                string.IsNullOrWhiteSpace(number))
+            {
+                return ToolResult.Failed($"I don't have a number for {contact}.", "unknown_contact");
+            }
+
+            // Always the shared instance, never a new one.
+            SpeechService speech = ctx.Speech ?? SpeechService.Current;
+            if (speech == null)
+            {
+                // No voice means no way to ask, and an unasked send is the whole
+                // bug. Refuse.
+                return ToolResult.Failed(
+                    $"I can't ask you about that right now, so I haven't sent it to {contact}.",
+                    "no_speech_service");
+            }
+
+            await speech.Say(ctx.RecognizedText,
+                $"You'd like to send \"{message}\" to {contact}. Should I send it?");
+
+            // ListenForTurnAsync, not RecognizeOnceAsync: the latter re-prompts on
+            // silence ("can you say it again?") without listening again, which
+            // would leave the user believing the question is still open when it is
+            // not. Silence here means nobody answered, and nobody answering means
+            // nothing is sent.
+            //
+            // A rule firing this tool unattended lands here with the listener
+            // disarmed, hears nothing, and takes the same path — fails closed.
+            string answer = await speech.ListenForTurnAsync(TimeSpan.FromSeconds(12));
+
+            if (!IsAffirmative(answer))
+            {
+                string heard = string.IsNullOrWhiteSpace(answer) ? "(silence)" : answer;
+                Console.WriteLine($"[sms] not sending — answer was \"{heard}\"");
+                await speech.Say(answer ?? string.Empty, $"Okay, I won't send that to {contact}.");
+                return ToolResult.None
+                    .With("status", "cancelled")
+                    .With("contact", contact)
+                    .With("heard", heard)
+                    .With("instruction",
+                        "NOT sent. The user did not say yes. Do not tell them it was sent.");
+            }
+
+            bool sent = await ctx.Sms.SendSMS(contact, number, message);
+            if (!sent)
+            {
+                return ToolResult.Failed(
+                    $"Sorry, I couldn't send that to {contact}.", "send_failed");
+            }
+
+            return ToolResult
+                .Speak($"Sent \"{message}\" to {contact}.")
+                .With("status", "sent")
+                .With("contact", contact)
+                .With("message", message);
+        }
+
+        // Whether a spoken answer is a yes. Deliberately lopsided: only a clear
+        // yes sends, anything else — a no, a correction, a half-answer, silence —
+        // does not. The cost of misreading "no" as "yes" is a text on a real phone
+        // that cannot be recalled; the cost of the reverse is being asked again.
+        private static bool IsAffirmative(string answer)
+        {
+            if (string.IsNullOrWhiteSpace(answer)) return false;
+
+            // Apostrophes are stripped rather than split on, so "don't" survives
+            // as one token instead of becoming "don" + "t".
+            var words = new List<string>();
+            var word = new StringBuilder();
+            foreach (char c in answer.ToLowerInvariant())
+            {
+                if (char.IsLetterOrDigit(c)) word.Append(c);
+                else if (c != '\'' && c != '’')
+                {
+                    if (word.Length > 0) { words.Add(word.ToString()); word.Clear(); }
+                }
+            }
+            if (word.Length > 0) words.Add(word.ToString());
+            if (words.Count == 0) return false;
+
+            // Checked over the WHOLE answer and first, so "yes — no, cancel that"
+            // and "yeah but make it shorter" don't send. A correction is not
+            // consent, and a second ask costs nothing.
+            string[] refusals =
+            {
+                "no", "nope", "nah", "dont", "not", "cancel", "cancelled", "stop",
+                "nevermind", "wait", "hold", "negative", "but", "instead", "change",
+            };
+            foreach (string w in words)
+            {
+                if (Array.IndexOf(refusals, w) >= 0) return false;
+            }
+
+            // Only the FIRST word can consent, so a yes has to be the answer to the
+            // question rather than a word that happened to occur in it.
+            string[] affirmations =
+            {
+                "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "affirmative",
+                "correct", "confirm", "confirmed", "send", "go", "please", "do",
+            };
+            return Array.IndexOf(affirmations, words[0]) >= 0;
+        }
+
+        // Whether the "body" is really the standing request to send the canned
+        // self-introduction, left over from when this flow dictated its own text.
+        //
+        // Matched whole, not scanned for. The substring test this replaces fired
+        // on any occurrence anywhere, so "text mom that I still need to introduce
+        // yourself to the new manager" had its entire body thrown away and
+        // replaced with the introduction.
+        private static bool IsIntroductionRequest(string message)
+        {
+            string t = message.Trim().TrimEnd('.', '!', '?').Trim();
+            return t.Equals("introduce yourself", StringComparison.OrdinalIgnoreCase)
+                || t.Equals("introduce yourself to them", StringComparison.OrdinalIgnoreCase)
+                || t.Equals("introduce yourself to her", StringComparison.OrdinalIgnoreCase)
+                || t.Equals("introduce yourself to him", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Pulls the message body out of "text mom I'll be late", for the keyword
+        // fallback path. Everything after the contact's name is the body; if that
+        // leaves nothing, the caller omits `message` and validation refuses the
+        // call rather than sending a blank text.
+        private static string ExtractSmsBody(string text, string contactName)
+        {
+            int at = text.IndexOf(contactName, StringComparison.OrdinalIgnoreCase);
+            if (at < 0) return null;
+
+            string rest = text.Substring(at + contactName.Length)
+                              .TrimStart(' ', ',', ':', '-')
+                              .Trim();
+
+            // Strip a lead-in the user may have said before the body itself
+            // ("text mom saying I'll be late" / "... that I'll be late").
+            string[] leadIns = { "saying ", "that ", "and say ", "say " };
+            foreach (string leadIn in leadIns)
+            {
+                if (rest.StartsWith(leadIn, StringComparison.OrdinalIgnoreCase))
+                {
+                    rest = rest.Substring(leadIn.Length).Trim();
+                    break;
+                }
+            }
+
+            return rest.Length == 0 ? null : rest;
+        }
+
+        // Maps a media command's outcome onto what to say about it.
+        //
+        // Refused gets its own sentence. It used to share "Nothing is playing right
+        // now" with NoSession, which was a plain untruth about a session that was
+        // playing and had simply declined the command — and it hid the case worth
+        // knowing about, because a session that refuses is a bug worth seeing.
+        private static ToolResult MediaOutcome(
+            MediaCommandResult outcome, string spoken, string action)
+        {
+            switch (outcome)
+            {
+                case MediaCommandResult.Done:
+                    return ToolResult.Speak(spoken).With("action", action);
+                case MediaCommandResult.NoSession:
+                    return ToolResult.Failed("Nothing is playing right now.", "no_media_session");
+                default:
+                    return ToolResult.Failed(
+                        $"I couldn't get it to {action}.", "media_command_refused");
             }
         }
     }
