@@ -194,7 +194,7 @@ namespace Personal_Assistant.Dispatch
                 }
 
                 Console.WriteLine($"[dispatch] tool '{command.Name}' args=[{Describe(cleanArgs)}]");
-                await command.Handler(context, cleanArgs);
+                await RunAsync(command, cleanArgs, speak: true);
                 if (!command.Ephemeral) memory.AddToolCall(command.Name, cleanArgs);
                 ran++;
             }
@@ -203,24 +203,79 @@ namespace Personal_Assistant.Dispatch
             return false;
         }
 
-        // Runs a single tool by name with the given args, validated — used by the
-        // `repeat` tool to execute the actions it loops over. Does not touch
-        // conversation memory (the top-level call already records what ran).
-        public async Task RunToolByNameAsync(string name, IReadOnlyDictionary<string, string> args)
+        // Runs a single tool by name with the given args, validated. Two callers
+        // with opposite needs:
+        //
+        //   the `repeat` tool and standing rules — speak:true, because on the
+        //       turn-based path the actions they run are the only thing the user
+        //       hears.
+        //   a model holding the conversation — speak:false, because it speaks.
+        //       It takes the returned ToolResult and answers from what the
+        //       handler actually found rather than inventing something plausible.
+        //
+        // Does not touch conversation memory (the top-level call already records
+        // what ran).
+        public async Task<ToolResult> RunToolByNameAsync(
+            string name,
+            IReadOnlyDictionary<string, string> args,
+            bool speak = true)
         {
             var command = registry.FindByName(name);
             if (command == null)
             {
                 Console.WriteLine($"[dispatch] RunTool: unknown tool '{name}'");
-                return;
+                return ToolResult.Failed(null, $"unknown tool '{name}'");
             }
             if (!TryValidate(command.Tool, args, out var cleanArgs, out string error))
             {
                 Console.WriteLine($"[dispatch] RunTool: invalid args for '{name}': {error}");
-                return;
+
+                // Tell the model what the parameters actually are, so a misnamed
+                // argument is a retry rather than a dead end — the bare error
+                // left it unable to tell a rejected call from an empty result.
+                string expected = command.Tool?.Parameters == null || command.Tool.Parameters.Count == 0
+                    ? "(none)"
+                    : string.Join(", ", System.Linq.Enumerable.Select(
+                        command.Tool.Parameters,
+                        p => p.Required ? p.Name + " (required)" : p.Name));
+
+                return ToolResult
+                    .Failed(null, error)
+                    .With("instruction",
+                        $"The call was REJECTED and '{name}' did not run — do not describe its " +
+                        $"result. Retry with the correct parameters: {expected}");
             }
             Console.WriteLine($"[dispatch] RunTool '{name}' args=[{Describe(cleanArgs)}]");
-            await command.Handler(context, cleanArgs);
+            return await RunAsync(command, cleanArgs, speak);
+        }
+
+        // The one place a tool actually runs, and the one place its answer gets
+        // voiced. Keeping both here is what stops the dispatch paths drifting into
+        // different ideas of what a tool result means — and it is why a handler
+        // no longer needs a SpeechService of its own.
+        //
+        // Through SpeechService.Current, never a fresh instance: a second one
+        // silently detaches the echo gate, and the last time that happened an
+        // empty SMS went to a real number.
+        //
+        // result.Ssml is ignored on purpose. Kokoro speaks plain text; see the
+        // note on ToolResult.Ssml.
+        private async Task<ToolResult> RunAsync(
+            VoiceCommand command,
+            IReadOnlyDictionary<string, string> cleanArgs,
+            bool speak)
+        {
+            ToolResult result = await command.Handler(context, cleanArgs) ?? ToolResult.None;
+
+            if (speak && !string.IsNullOrWhiteSpace(result.Speech))
+            {
+                // Null only in the bake-off harness, which drives the real
+                // registry without ever building a SpeechService.
+                SpeechService speech = SpeechService.Current;
+                if (speech != null) await speech.Say(context.RecognizedText, result.Speech);
+            }
+
+            return result;
         }
 
         // Legacy keyword path: first matching command wins, else conversational AI.
@@ -234,7 +289,7 @@ namespace Personal_Assistant.Dispatch
                 if (TryValidate(command.Tool, args, out var cleanArgs, out string error))
                 {
                     Console.WriteLine($"[dispatch] keyword match '{command.Name}' args=[{Describe(cleanArgs)}]");
-                    await command.Handler(context, cleanArgs);
+                    await RunAsync(command, cleanArgs, speak: true);
                     memory.AddToolCall(command.Name, cleanArgs);
                     return false;
                 }

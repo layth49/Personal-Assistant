@@ -44,6 +44,101 @@ namespace Personal_Assistant.Dispatch
             new ToolDefinition(name, description, parameters ?? Array.Empty<ToolParameter>());
     }
 
+    // What a handler produces: the sentence to voice, plus whatever structured
+    // facts that sentence was built from.
+    //
+    // Handlers used to speak for themselves. That worked only because the
+    // turn-based path was the only caller — the moment a model is also holding
+    // the conversation, a handler that swallows its own answer leaves the model
+    // nothing to speak FROM. It doesn't fall silent; it invents. A smoke run on
+    // main had the handler compute 2:20 AM local while the model announced
+    // "It's 7:20 AM UTC", because the tool result it received was
+    // {"result":"done"} with no payload.
+    //
+    // So a result carries both, for two consumers that need different things:
+    //
+    //   Speech — the finished sentence. IntentDispatcher speaks this on the
+    //            turn-based path, which is what keeps that path sounding exactly
+    //            as it did before.
+    //   Data   — the facts, for a model that has to answer FROM a tool rather
+    //            than relay it, and can then take a follow-up like "and in
+    //            Celsius?" without calling the tool again.
+    //
+    // Pure actions return None: nothing to say, nothing to report.
+    public sealed class ToolResult
+    {
+        public static readonly ToolResult None = new ToolResult(null, null);
+
+        // The sentence to say, or null for silence.
+        public string Speech { get; }
+
+        // Structured facts behind the sentence. Never null.
+        public IReadOnlyDictionary<string, string> Data { get; }
+
+        // Optional SSML to synthesise INSTEAD of Speech. Kept so that handler
+        // code written on main drops in here unedited — but NOTHING ON THIS
+        // BRANCH READS IT. Kokoro takes plain text: no SSML, no <phoneme>, no
+        // IPA, so the local dispatcher deliberately ignores this field and
+        // speaks Speech. Pronunciation control here is spelled-out
+        // transliteration instead — see PrayerTimesCalculator.PrayerSpoken and
+        // the editing notes in CLAUDE.md. If you want SSML, reword Speech.
+        public string Ssml { get; }
+
+        private ToolResult(string speech, IReadOnlyDictionary<string, string> data, string ssml = null)
+        {
+            Speech = speech;
+            // Allocated, never read from a shared static empty instance. A shared
+            // one declared after None left None.Data null — static initialisers
+            // run in declaration order, so None's constructor read the field
+            // before it was assigned. An allocation here cannot be got wrong by
+            // moving a line.
+            Data = data ?? new Dictionary<string, string>();
+            Ssml = ssml;
+        }
+
+        /// <summary>A spoken answer.</summary>
+        public static ToolResult Speak(string speech) => new ToolResult(speech, null);
+
+        /// <summary>A spoken answer whose pronunciation needs SSML. `speech` is the
+        /// plain-text equivalent, and on this branch it is the only half anyone
+        /// ever hears — see Ssml.</summary>
+        public static ToolResult SpeakSsml(string speech, string ssml) =>
+            new ToolResult(speech, null, ssml);
+
+        /// <summary>An action that succeeded with nothing to announce.</summary>
+        public static ToolResult Done() => None;
+
+        /// <summary>Something went wrong: said out loud, and reported to the model.</summary>
+        public static ToolResult Failed(string speech, string reason = null) =>
+            new ToolResult(speech, new Dictionary<string, string>
+            {
+                ["error"] = reason ?? speech ?? "failed"
+            });
+
+        // Attaches one fact. Chained off Speak, so a handler reads as the sentence
+        // it says followed by what that sentence was built from.
+        public ToolResult With(string key, string value)
+        {
+            if (string.IsNullOrEmpty(key)) return this;
+            var merged = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (KeyValuePair<string, string> kv in Data) merged[kv.Key] = kv.Value;
+            merged[key] = value ?? string.Empty;
+            return new ToolResult(Speech, merged, Ssml);
+        }
+
+        // What the model receives. The sentence rides along under `speech` so the
+        // model can simply relay a well-formed answer, while Data is there for
+        // when it needs to reason rather than repeat.
+        public IReadOnlyDictionary<string, string> ToResponse()
+        {
+            var response = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (KeyValuePair<string, string> kv in Data) response[kv.Key] = kv.Value;
+            if (!string.IsNullOrWhiteSpace(Speech)) response["speech"] = Speech;
+            if (response.Count == 0) response["result"] = "done";
+            return response;
+        }
+    }
+
     // Shared dependencies a command handler may need. Built once in Program.Main
     // and handed to every handler so the existing service instances are reused
     // rather than reconstructed per call.
@@ -88,7 +183,9 @@ namespace Personal_Assistant.Dispatch
 
         // Runs another tool by name (validated) — how the `repeat` tool executes
         // the actions it loops over. Wired from the dispatcher after construction.
-        public Func<string, IReadOnlyDictionary<string, string>, Task> RunTool { get; set; }
+        // Voices whatever the tool returns, because on the turn-based path the
+        // repeated actions are the only thing the user hears.
+        public Func<string, IReadOnlyDictionary<string, string>, Task<ToolResult>> RunTool { get; set; }
 
         // The raw text the user actually said for this turn. Handlers pass it to
         // SpeechService.Say so the on-screen bubble shows what was heard.
@@ -118,7 +215,9 @@ namespace Personal_Assistant.Dispatch
         public Func<string, IReadOnlyDictionary<string, string>> ExtractArgs { get; }
 
         // Executes the command. Args are already validated against Tool.Parameters.
-        public Func<CommandContext, IReadOnlyDictionary<string, string>, Task> Handler { get; }
+        // Returns what to say and what was found — see ToolResult for why a
+        // handler no longer speaks for itself.
+        public Func<CommandContext, IReadOnlyDictionary<string, string>, Task<ToolResult>> Handler { get; }
 
         // Ephemeral tools (wait, repeat) are control-flow primitives, not real
         // actions — they're skipped from conversation memory to avoid cluttering
@@ -128,7 +227,7 @@ namespace Personal_Assistant.Dispatch
         public VoiceCommand(
             ToolDefinition tool,
             Func<string, bool> matches,
-            Func<CommandContext, IReadOnlyDictionary<string, string>, Task> handler,
+            Func<CommandContext, IReadOnlyDictionary<string, string>, Task<ToolResult>> handler,
             Func<string, IReadOnlyDictionary<string, string>> extractArgs = null,
             bool ephemeral = false)
         {
@@ -138,6 +237,31 @@ namespace Personal_Assistant.Dispatch
             Handler = handler ?? throw new ArgumentNullException(nameof(handler));
             ExtractArgs = extractArgs ?? (_ => EmptyArgs);
             Ephemeral = ephemeral;
+        }
+
+        // For tools that just do a thing: flipping a switch, opening an app,
+        // waiting. There is no answer to voice and nothing for the model to
+        // reason over, so requiring them to write `return ToolResult.None` would
+        // be ceremony. They keep returning Task and this adapts them.
+        //
+        // It is also what makes the ToolResult change additive: every handler
+        // written before it keeps compiling through this overload, and gets
+        // converted when there is a reason to, not all at once.
+        public VoiceCommand(
+            ToolDefinition tool,
+            Func<string, bool> matches,
+            Func<CommandContext, IReadOnlyDictionary<string, string>, Task> handler,
+            Func<string, IReadOnlyDictionary<string, string>> extractArgs = null,
+            bool ephemeral = false)
+            : this(
+                tool,
+                matches,
+                handler == null
+                    ? (Func<CommandContext, IReadOnlyDictionary<string, string>, Task<ToolResult>>)null
+                    : async (ctx, args) => { await handler(ctx, args); return ToolResult.None; },
+                extractArgs,
+                ephemeral)
+        {
         }
 
         public static readonly IReadOnlyDictionary<string, string> EmptyArgs =

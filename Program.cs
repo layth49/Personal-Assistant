@@ -355,8 +355,11 @@ namespace Personal_Assistant
                 // non-streamed fallback.
                 LocalLLMService.StreamResponse);
 
-            // Let the `repeat` tool run other tools by name (validated).
-            context.RunTool = dispatcher.RunToolByNameAsync;
+            // Let the `repeat` tool run other tools by name (validated). A lambda
+            // rather than the method group: RunToolByNameAsync's `speak` is
+            // optional, and optional parameters don't survive a delegate
+            // conversion.
+            context.RunTool = (name, toolArgs) => dispatcher.RunToolByNameAsync(name, toolArgs, speak: true);
 
             // Close the cycle above, then arm whatever was set before the last
             // restart. Restore must come after BOTH assignments: a rule with a
