@@ -447,11 +447,13 @@
     <Compile Include="AppLauncher.cs" />
     <Compile Include="Arduino.cs" />
     <Compile Include="AudioController.cs" />
+    <Compile Include="ClipboardController.cs" />
     <Compile Include="ContinuousListener.cs" />
     <Compile Include="ConversationMemory.cs" />
     <Compile Include="Downtime.cs" />
     <Compile Include="EchoGuard.cs" />
     <Compile Include="EventWatch.cs" />
+    <Compile Include="FileFinder.cs" />
     <Compile Include="FileLog.cs" />
     <Compile Include="Geolocator.cs" />
     <Compile Include="IntentDispatcher.cs" />
@@ -460,6 +462,7 @@
     <Compile Include="LightAutomator.cs" />
     <Compile Include="LLMClient.cs" />
     <Compile Include="MediaController.cs" />
+    <Compile Include="NotesService.cs" />
     <Compile Include="NowPlayingReader.cs" />
     <Compile Include="PlaystationController.cs" />
     <Compile Include="PrayerTimesCalculator.cs" />
@@ -487,6 +490,7 @@
     <Compile Include="TTSClient.cs" />
     <Compile Include="VoiceCommand.cs" />
     <Compile Include="WeatherService.cs" />
+    <Compile Include="WindowController.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="App.config" />

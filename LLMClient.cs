@@ -171,6 +171,16 @@ namespace Personal_Assistant.LLMClient
         // load is much slower.
         private static readonly HttpClient httpClient = CreateHttpClient();
 
+        // TransformTextAsync gets its own client purely for the timeout. The
+        // shared one is bounded at 60s, which is right for a 200-token spoken
+        // answer and far too short for a note-length rewrite: reformat_note asks
+        // for up to 4096 tokens, and at the tens-of-tokens-a-second this box
+        // manages that is minutes rather than seconds. A rewrite aborted halfway
+        // is indistinguishable here from a refusal, so the note would be left
+        // alone every single time and nothing would say why.
+        private static readonly HttpClient transformClient =
+            CreateHttpClient(TimeSpan.FromMinutes(5));
+
         private const string BaseSystemPrompt =
             "You are L.A.I.T.H., Layth's personal voice assistant running on his computer. " +
             "Your responses are converted to speech, so: never use markdown, bullet points, " +
@@ -218,9 +228,9 @@ namespace Personal_Assistant.LLMClient
         // server is hung.
         private static readonly TimeSpan DetectTimeout = TimeSpan.FromSeconds(30);
 
-        private static HttpClient CreateHttpClient()
+        private static HttpClient CreateHttpClient(TimeSpan? timeout = null)
         {
-            var client = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+            var client = new HttpClient { Timeout = timeout ?? TimeSpan.FromSeconds(60) };
             client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
             return client;
         }
@@ -885,6 +895,122 @@ namespace Personal_Assistant.LLMClient
 
                 return contentEl.GetString() ?? string.Empty;
             }
+        }
+
+        // One-shot text transformation: reformat_note's rewrite, and the
+        // question read_notes answers FROM a note instead of reading it out.
+        // The local twin of GeminiService.TransformTextAsync, and deliberately
+        // NOT built on AnswerAsync:
+        //
+        //   * no history — the note is the whole input, and a prior turn about
+        //     the weather is one more thing a 4B model can drag into a rewrite;
+        //   * no BaseSystemPrompt — that one is written for SPEECH ("never use
+        //     markdown, default to one short sentence"), which is the exact
+        //     opposite of what a markdown note being reorganised needs;
+        //   * no search hits — this is a transformation of text the caller
+        //     already has, not a question about the world;
+        //   * not streamed — nothing here is spoken as it arrives, and the
+        //     result has to be checked for truncation before it is written over
+        //     a file the user typed by hand.
+        //
+        // Returns null on any failure, which every caller treats as "leave the
+        // note alone".
+        public static async Task<string> TransformTextAsync(
+            string instruction, string content, int maxOutputTokens = 4096)
+        {
+            var requestBody = new Dictionary<string, object>
+            {
+                ["messages"] = new List<object>
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["role"] = "system",
+                        ["content"] =
+                            "You transform text exactly as instructed and return ONLY the " +
+                            "result — no preamble, no commentary, no markdown code fences " +
+                            "around the whole answer. Preserve the author's meaning, wording " +
+                            "and any facts; you are reorganising, not rewriting from scratch, " +
+                            "and you never invent content that wasn't there."
+                    },
+                    new Dictionary<string, object>
+                    {
+                        ["role"] = "user",
+                        ["content"] = instruction + "\n\n---\n" + (content ?? string.Empty)
+                    }
+                },
+                // Matches main's 0.2. This is a reorganisation, and the failure
+                // mode to avoid is the model improving the user's wording.
+                ["temperature"] = 0.2,
+                ["max_tokens"] = maxOutputTokens,
+                // Non-negotiable here for the same reason it is on the router and
+                // the event judge: a model that spends its budget thinking
+                // returns empty `content`. That matters more in this method than
+                // anywhere else, because the caller's next move is to overwrite a
+                // note the user wrote by hand. "/no think" in the prompt does not
+                // do this reliably; reasoning_effort is the only thing that does.
+                // See BuildToolRequest for the measurements.
+                ["reasoning_effort"] = "none",
+                ["stream"] = false
+            };
+
+            try
+            {
+                var body = new StringContent(
+                    JsonSerializer.Serialize(requestBody, RawJsonOpts),
+                    Encoding.UTF8,
+                    "application/json");
+
+                using (HttpResponseMessage response = await transformClient
+                    .PostAsync($"{lmStudioUrl.TrimEnd('/')}/chat/completions", body)
+                    .ConfigureAwait(false))
+                {
+                    string json = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        Console.WriteLine($"[llm] transform HTTP {(int)response.StatusCode}: {json}");
+                        return null;
+                    }
+                    return StripWholeAnswerFence(ExtractText(json));
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[llm] transform failed: {ex.Message}");
+                return null;
+            }
+        }
+
+        // Small local models fence their whole answer in ```markdown ... ```
+        // however firmly the system prompt asks them not to. Left in place that
+        // fence is WRITTEN INTO the note by reformat_note, or read out a
+        // backtick at a time by read_notes, so it is removed here rather than at
+        // each call site. Only a fence wrapping the ENTIRE answer is touched — a
+        // code block inside a note is content and stays.
+        private static string StripWholeAnswerFence(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return text;
+
+            string trimmed = text.Trim();
+            if (trimmed.Length < 6 ||
+                !trimmed.StartsWith("```", StringComparison.Ordinal) ||
+                !trimmed.EndsWith("```", StringComparison.Ordinal))
+            {
+                return text;
+            }
+
+            int firstBreak = trimmed.IndexOf('\n');
+            if (firstBreak < 0) return text;
+
+            // A language tag is the only thing allowed on the opening line;
+            // anything else means the ``` was part of the content.
+            string tag = trimmed.Substring(3, firstBreak - 3).Trim();
+            if (tag.IndexOf(' ') >= 0) return text;
+
+            string inner = trimmed.Substring(firstBreak + 1, trimmed.Length - firstBreak - 4);
+
+            // A third fence in between means these two were opening and closing
+            // DIFFERENT blocks rather than wrapping the answer.
+            return inner.IndexOf("```", StringComparison.Ordinal) >= 0 ? text : inner.Trim();
         }
 
         /// <summary>

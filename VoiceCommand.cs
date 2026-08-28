@@ -158,6 +158,10 @@ namespace Personal_Assistant.Dispatch
         public MediaController Media { get; init; }
         public NowPlayingReader NowPlaying { get; init; }
         public ReminderService Reminders { get; init; }
+        public Personal_Assistant.ClipboardControl.ClipboardController Clipboard { get; init; }
+        public Personal_Assistant.FileFinding.FileFinder Files { get; init; }
+        public Personal_Assistant.WindowControl.WindowController Windows { get; init; }
+        public Personal_Assistant.Notes.NotesService Notes { get; init; }
 
         // Standing rules the user created by voice. Null when the trigger engine
         // isn't wired, and BuildRegistry then simply doesn't offer

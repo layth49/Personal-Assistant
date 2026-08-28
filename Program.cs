@@ -219,6 +219,10 @@ namespace Personal_Assistant
             var screenshot = new ScreenshotService();
             var processes = new ProcessController();
             var apps = new AppLauncher();
+            var clipboard = new Personal_Assistant.ClipboardControl.ClipboardController();
+            var fileFinder = new Personal_Assistant.FileFinding.FileFinder();
+            var windows = new Personal_Assistant.WindowControl.WindowController();
+            var notes = new Personal_Assistant.Notes.NotesService();
             var media = new MediaController();
             var nowPlaying = new NowPlayingReader();
             // Fires timers/alarms/reminders by speaking them. Say is serialised
@@ -354,6 +358,10 @@ namespace Personal_Assistant
                 Media = media,
                 NowPlaying = nowPlaying,
                 Reminders = reminders,
+                Clipboard = clipboard,
+                Files = fileFinder,
+                Windows = windows,
+                Notes = notes,
                 Contacts = contacts,
                 IpAddressPlug = ipAddressPlug,
                 IpAddressSwitch = ipAddressSwitch
@@ -1006,8 +1014,14 @@ namespace Personal_Assistant
             registry.Add(new VoiceCommand(
                 ToolDefinition.Create("take_screenshot",
                     "Capture a screenshot of the whole screen, save it, and open it."),
-                lower => lower.Contains("screenshot") || lower.Contains("screen shot") ||
-                         (lower.Contains("capture") && lower.Contains("screen")),
+                lower => (lower.Contains("screenshot") || lower.Contains("screen shot") ||
+                          (lower.Contains("capture") && lower.Contains("screen"))) &&
+                         // "where is the screenshot from yesterday" is a
+                         // find_file request. This tool is registered first, so
+                         // without excluding the locating verbs it would answer
+                         // by taking a brand new screenshot.
+                         !lower.Contains("where") && !lower.Contains("find") &&
+                         !lower.Contains("open") && !lower.Contains("show me"),
                 (ctx, args) =>
                 {
                     try
@@ -1024,6 +1038,583 @@ namespace Personal_Assistant
                         return Task.FromResult(ToolResult.Failed(
                             "Sorry, I couldn't take the screenshot.", ex.Message));
                     }
+                }));
+
+            registry.Add(new VoiceCommand(
+                // One tool with an action enum rather than five tools: the
+                // registry is already large, and the dispatcher validates
+                // AllowedValues before the handler runs, so an invalid action
+                // never reaches this code. Note there is no "close" action —
+                // closing stays with kill_process so the router has exactly one
+                // place to send it.
+                ToolDefinition.Create("manage_window",
+                    "Focus, minimize, maximize, restore or snap an application's WINDOW. " +
+                    "Use for 'switch to Spotify', 'minimize OBS', 'snap Chrome left'. " +
+                    "Does not launch anything (use open_app) and does not close anything " +
+                    "(use kill_process).",
+                    new ToolParameter("app", "string",
+                        "The application whose window to act on, e.g. 'Chrome' or 'VS Code'."),
+                    new ToolParameter("action", "string",
+                        "What to do with the window.",
+                        AllowedValues: new[]
+                        {
+                            "focus", "minimize", "maximize", "restore",
+                            "snap_left", "snap_right", "snap_top", "snap_bottom"
+                        })),
+                lower =>
+                    (lower.Contains("window") || lower.Contains("focus") || lower.Contains("switch to") ||
+                     lower.Contains("minimize") || lower.Contains("minimise") || lower.Contains("maximize") ||
+                     lower.Contains("maximise") || lower.Contains("snap") || lower.Contains("bring up")) &&
+                    // Never claim a phrasing that belongs to kill_process.
+                    // "close" is included because there is no close action
+                    // here: matching it would quietly focus the window instead.
+                    !lower.Contains("kill") && !lower.Contains("terminate") &&
+                    !lower.Contains("close") && !lower.Contains("quit"),
+                (ctx, args) =>
+                {
+                    string app = args.TryGetValue("app", out var a) ? a : string.Empty;
+                    string action = args.TryGetValue("action", out var act) ? act : "focus";
+
+                    try
+                    {
+                        Personal_Assistant.WindowControl.WindowActionResult r;
+                        switch (action.ToLowerInvariant())
+                        {
+                            case "minimize": r = ctx.Windows.Minimize(app); break;
+                            case "maximize": r = ctx.Windows.Maximize(app); break;
+                            case "restore": r = ctx.Windows.Restore(app); break;
+                            case "snap_left": r = ctx.Windows.Snap(app, "left"); break;
+                            case "snap_right": r = ctx.Windows.Snap(app, "right"); break;
+                            case "snap_top": r = ctx.Windows.Snap(app, "top"); break;
+                            case "snap_bottom": r = ctx.Windows.Snap(app, "bottom"); break;
+                            default: r = ctx.Windows.Focus(app); break;
+                        }
+
+                        if (r.Candidates == 0)
+                        {
+                            return Task.FromResult(ToolResult.Speak(
+                                $"I don't see an open window for {app}.")
+                                .With("found", "0"));
+                        }
+
+                        if (!r.Succeeded)
+                        {
+                            return Task.FromResult(ToolResult.Failed(
+                                $"I found {r.MatchedApp} but couldn't {action.Replace('_', ' ')} it.",
+                                r.Detail));
+                        }
+
+                        string said = action.StartsWith("snap")
+                            ? $"Snapped {r.MatchedApp} {action.Substring(5)}."
+                            : $"{char.ToUpper(action[0])}{action.Substring(1)}d {r.MatchedApp}.";
+
+                        return Task.FromResult(ToolResult.Speak(said)
+                            .With("app", r.MatchedApp)
+                            .With("action", action)
+                            .With("window_title", r.Title ?? string.Empty)
+                            .With("candidates", r.Candidates.ToString()));
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("manage_window failed: " + ex.Message);
+                        return Task.FromResult(ToolResult.Failed(
+                            "Sorry, I couldn't do that to the window.", ex.Message));
+                    }
+                },
+                text =>
+                {
+                    string lower = text.ToLower();
+                    string action = "focus";
+                    if (lower.Contains("minimi")) action = "minimize";
+                    else if (lower.Contains("maximi")) action = "maximize";
+                    else if (lower.Contains("restore")) action = "restore";
+                    else if (lower.Contains("snap"))
+                    {
+                        if (lower.Contains("right")) action = "snap_right";
+                        else if (lower.Contains("top")) action = "snap_top";
+                        else if (lower.Contains("bottom")) action = "snap_bottom";
+                        else action = "snap_left";
+                    }
+
+                    // Strip the verb and any positional words to leave the app.
+                    string app = text.TrimEnd('.', '!', '?');
+                    foreach (var verb in new[] { "switch to", "bring up", "focus on", "focus",
+                                                 "minimize", "minimise", "maximize", "maximise",
+                                                 "restore", "snap" })
+                    {
+                        int i = app.ToLower().IndexOf(verb);
+                        if (i >= 0) { app = app.Substring(i + verb.Length); break; }
+                    }
+                    foreach (var noise in new[] { "to the left", "to the right", "the window",
+                                                  "window", "left", "right", "top", "bottom", "the" })
+                        app = System.Text.RegularExpressions.Regex.Replace(
+                            app, @"\b" + System.Text.RegularExpressions.Regex.Escape(noise) + @"\b",
+                            " ", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+                    return new Dictionary<string, string>
+                    {
+                        ["app"] = System.Text.RegularExpressions.Regex.Replace(app, @"\s+", " ").Trim(),
+                        ["action"] = action
+                    };
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("find_file",
+                    "Find a FILE or DOCUMENT on disk from a loose description and open it, " +
+                    "e.g. 'that PDF I downloaded earlier', 'the screenshot from yesterday'. " +
+                    "This is for documents and files the user has saved — to launch an " +
+                    "installed application instead, use open_app.",
+                    new ToolParameter("description", "string",
+                        "What the user said about the file, including any type ('PDF', " +
+                        "'screenshot') and timing ('yesterday', 'newest') words."),
+                    new ToolParameter("action", "string",
+                        "'open' to open the best match, 'tell_me' to just report what was found.",
+                        Required: false,
+                        AllowedValues: new[] { "open", "tell_me" })),
+                lower =>
+                    // Deliberately narrower than open_app's bare "open ...":
+                    // this must only claim the phrasing when something in it
+                    // actually signals a file on disk, or "open Chrome" would
+                    // start hunting the filesystem for a document.
+                    (lower.Contains("file") || lower.Contains("document") || lower.Contains("pdf") ||
+                     lower.Contains("screenshot") || lower.Contains("photo") || lower.Contains("picture") ||
+                     lower.Contains("spreadsheet") || lower.Contains("download")) &&
+                    (lower.Contains("open") || lower.Contains("find") || lower.Contains("where") ||
+                     lower.Contains("show") || lower.Contains("newest") || lower.Contains("latest")),
+                (ctx, args) =>
+                {
+                    string description = args.TryGetValue("description", out var d) ? d : string.Empty;
+                    bool tellOnly = args.TryGetValue("action", out var a) &&
+                                    string.Equals(a, "tell_me", StringComparison.OrdinalIgnoreCase);
+                    try
+                    {
+                        var found = ctx.Files.Find(description);
+                        var best = found.Best;
+
+                        if (best == null)
+                        {
+                            return Task.FromResult(ToolResult.Speak(
+                                "I couldn't find any file like that.")
+                                .With("found", "0"));
+                        }
+
+                        // A confident-sounding wrong answer is the failure mode
+                        // here: asked for a resume that doesn't exist, the
+                        // ranker will still surface the most recent download.
+                        // Say so rather than opening it.
+                        if (!found.Confident)
+                        {
+                            string terms = string.Join(", ", found.Terms);
+                            return Task.FromResult(ToolResult.Speak(
+                                $"I couldn't find anything matching {terms}. " +
+                                $"The closest recent file is {best.Name} in {best.Where}.")
+                                .With("confident", "false")
+                                .With("searched_for", terms)
+                                .With("closest", best.Name));
+                        }
+
+                        ToolResult result = ToolResult.Speak(tellOnly
+                                ? $"I found {best.Name} in {best.Where}."
+                                : $"Opening {best.Name} from {best.Where}.")
+                            .With("name", best.Name)
+                            .With("where", best.Where)
+                            .With("path", best.Path)
+                            .With("modified", best.Modified.ToString("yyyy-MM-dd HH:mm"))
+                            .With("match_count", found.Matches.Count.ToString());
+
+                        if (!tellOnly) ctx.Files.Open(best.Path);
+                        return Task.FromResult(result);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("find_file failed: " + ex.Message);
+                        return Task.FromResult(ToolResult.Failed(
+                            "Sorry, I couldn't search for that file.", ex.Message));
+                    }
+                },
+                text => new Dictionary<string, string>
+                {
+                    ["description"] = text.Trim(),
+                    ["action"] = text.ToLower().Contains("where") || text.ToLower().Contains("what")
+                        ? "tell_me"
+                        : "open"
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("add_note",
+                    "Write something down in the user's notes. Creates the note if it " +
+                    "doesn't exist yet. Use for 'add milk to my groceries', " +
+                    "'note that the router password is X', 'write this down'.",
+                    new ToolParameter("text", "string", "What to write down."),
+                    new ToolParameter("note", "string",
+                        "Which note to add it to, e.g. 'groceries' or 'ideas'. " +
+                        "Omit for the general notes file.",
+                        Required: false)),
+                lower => (lower.Contains("note") || lower.Contains("write down") ||
+                          lower.Contains("write this down") || lower.Contains("jot") ||
+                          // "add milk to my groceries" names no note at all, so
+                          // the shape has to carry it. Excludes the objects that
+                          // belong to other tools, or this would swallow
+                          // "add ten minutes to my timer".
+                          (lower.Contains("add ") && lower.Contains(" to my ") &&
+                           !lower.Contains("timer") && !lower.Contains("alarm") &&
+                           !lower.Contains("reminder") && !lower.Contains("calendar") &&
+                           !lower.Contains("playlist") && !lower.Contains("queue"))) &&
+                         !lower.Contains("read") && !lower.Contains("what") &&
+                         !lower.Contains("reformat") && !lower.Contains("clean up") &&
+                         !lower.Contains("tidy"),
+                (ctx, args) =>
+                {
+                    string text = args.TryGetValue("text", out var t) ? t : string.Empty;
+                    string note = args.TryGetValue("note", out var n) && !string.IsNullOrWhiteSpace(n)
+                        ? n
+                        : "notes";
+
+                    if (string.IsNullOrWhiteSpace(text))
+                    {
+                        return Task.FromResult(ToolResult.Speak(
+                            "What would you like me to write down?").With("wrote", "false"));
+                    }
+
+                    try
+                    {
+                        string path = ctx.Notes.Append(note, text);
+                        return Task.FromResult(
+                            ToolResult.Speak($"Added it to your {System.IO.Path.GetFileNameWithoutExtension(path)} note.")
+                                .With("note", System.IO.Path.GetFileNameWithoutExtension(path))
+                                .With("text", text)
+                                .With("path", path));
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("add_note failed: " + ex.Message);
+                        return Task.FromResult(ToolResult.Failed(
+                            "Sorry, I couldn't write that down.", ex.Message));
+                    }
+                },
+                text =>
+                {
+                    string body = text.TrimEnd('.', '!', '?');
+                    foreach (var verb in new[] { "write down that", "write this down", "write down",
+                                                 "make a note that", "make a note", "note that",
+                                                 "add a note", "jot down", "note" })
+                    {
+                        int i = body.ToLower().IndexOf(verb);
+                        if (i >= 0) { body = body.Substring(i + verb.Length); break; }
+                    }
+
+                    // "add milk to my groceries" -> text "add milk", note "groceries"
+                    string note = null;
+                    foreach (var marker in new[] { " to my ", " in my ", " to the ", " on my " })
+                    {
+                        int i = body.ToLower().LastIndexOf(marker);
+                        if (i >= 0)
+                        {
+                            note = body.Substring(i + marker.Length).Trim();
+                            body = body.Substring(0, i);
+                            break;
+                        }
+                    }
+                    if (note != null)
+                    {
+                        foreach (var tail in new[] { " note", " notes", " list" })
+                            if (note.EndsWith(tail, StringComparison.OrdinalIgnoreCase))
+                                note = note.Substring(0, note.Length - tail.Length).Trim();
+                    }
+
+                    var d = new Dictionary<string, string> { ["text"] = body.Trim() };
+                    if (!string.IsNullOrWhiteSpace(note)) d["note"] = note;
+                    return d;
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("read_notes",
+                    "Read back the user's notes, or answer a question about what's in them. " +
+                    "Use for 'what's on my grocery list', 'read my ideas note', " +
+                    "'what notes do I have'.",
+                    new ToolParameter("note", "string",
+                        "Which note to read. Omit to list what notes exist.",
+                        Required: false),
+                    new ToolParameter("question", "string",
+                        "A specific question to answer from the note rather than reading " +
+                        "it all back, e.g. 'is milk on there'.",
+                        Required: false)),
+                lower => (lower.Contains("note") || lower.Contains("list")) &&
+                         (lower.Contains("read") || lower.Contains("what") ||
+                          lower.Contains("check") || lower.Contains("on my")),
+                async (ctx, args) =>
+                {
+                    string note = args.TryGetValue("note", out var n) ? n : null;
+                    string question = args.TryGetValue("question", out var q) ? q : null;
+
+                    try
+                    {
+                        // No note named and nothing asked: report what exists.
+                        if (string.IsNullOrWhiteSpace(note) && string.IsNullOrWhiteSpace(question))
+                        {
+                            var all = ctx.Notes.List();
+                            if (all.Count == 0)
+                            {
+                                return ToolResult.Speak("You don't have any notes yet.")
+                                    .With("count", "0");
+                            }
+                            string names = string.Join(", ", all.Take(8).Select(x => x.Name));
+                            return ToolResult.Speak($"You have {all.Count} notes: {names}.")
+                                .With("count", all.Count.ToString())
+                                .With("names", names);
+                        }
+
+                        var target = ctx.Notes.Resolve(note);
+                        if (target == null)
+                        {
+                            return ToolResult.Speak(
+                                string.IsNullOrWhiteSpace(note)
+                                    ? "You don't have any notes yet."
+                                    : $"I couldn't find a note called {note}.")
+                                .With("found", "false");
+                        }
+
+                        string content = ctx.Notes.Read(target.Name) ?? string.Empty;
+
+                        // A question gets answered FROM the note rather than by
+                        // reading the whole thing out; the note is the grounding.
+                        if (!string.IsNullOrWhiteSpace(question))
+                        {
+                            string answer = await LocalLLMService.TransformTextAsync(
+                                "Answer this question using ONLY the note below. " +
+                                "Answer in one or two plain spoken sentences, no markdown. " +
+                                "If the note doesn't say, say so.\n\nQuestion: " + question,
+                                content,
+                                300);
+
+                            return string.IsNullOrWhiteSpace(answer)
+                                ? ToolResult.Failed("Sorry, I couldn't read that note.")
+                                : ToolResult.Speak(answer.Trim())
+                                    .With("note", target.Name)
+                                    .With("question", question);
+                        }
+
+                        // Spoken and stored halves differ ON PURPOSE. Notes are
+                        // markdown by construction — NotesService writes "# Title"
+                        // and "- item" — and Kokoro reads that scaffolding out:
+                        // "hash groceries dash milk dash bread". Emoji it already
+                        // drops (TTSClient.StripUnspeakable), but the markers are
+                        // plain ASCII and survive, so the speech gets flattened
+                        // here. The model still receives the note verbatim under
+                        // "content", because that is what it has to reason over.
+                        return ToolResult.Speak(
+                                content.Trim().Length == 0
+                                    ? $"Your {target.Name} note is empty."
+                                    : $"Your {target.Name} note says: {SpokenNoteText(content)}")
+                            .With("note", target.Name)
+                            .With("content", content)
+                            .With("lines", target.Lines.ToString());
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("read_notes failed: " + ex.Message);
+                        return ToolResult.Failed("Sorry, I couldn't read your notes.", ex.Message);
+                    }
+                },
+                text =>
+                {
+                    var d = new Dictionary<string, string>();
+                    string lower = text.ToLower();
+                    foreach (var marker in new[] { "on my ", "in my ", "read my ", "my " })
+                    {
+                        int i = lower.LastIndexOf(marker);
+                        if (i >= 0)
+                        {
+                            string note = text.Substring(i + marker.Length).TrimEnd('.', '!', '?').Trim();
+                            foreach (var tail in new[] { " note", " notes", " list" })
+                                if (note.EndsWith(tail, StringComparison.OrdinalIgnoreCase))
+                                    note = note.Substring(0, note.Length - tail.Length).Trim();
+                            if (note.Length > 0) d["note"] = note;
+                            break;
+                        }
+                    }
+                    return d;
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("reformat_note",
+                    "Reorganise, tidy up or restructure an existing note — grouping related " +
+                    "items, removing duplicates, adding headings. Keeps a backup. " +
+                    "Use for 'clean up my groceries note', 'organise my ideas'.",
+                    new ToolParameter("note", "string", "Which note to reformat."),
+                    new ToolParameter("instruction", "string",
+                        "How to reformat it, e.g. 'group by aisle', 'sort by priority'. " +
+                        "Omit for a general tidy-up.",
+                        Required: false)),
+                lower => (lower.Contains("note") || lower.Contains("list")) &&
+                         (lower.Contains("reformat") || lower.Contains("clean up") ||
+                          lower.Contains("tidy") || lower.Contains("organise") ||
+                          lower.Contains("organize") || lower.Contains("reorganise") ||
+                          lower.Contains("reorganize") || lower.Contains("restructure")),
+                async (ctx, args) =>
+                {
+                    string note = args.TryGetValue("note", out var n) ? n : null;
+                    string instruction = args.TryGetValue("instruction", out var i) &&
+                                         !string.IsNullOrWhiteSpace(i)
+                        ? i
+                        : "Tidy this note up: group related items under headings, remove exact " +
+                          "duplicates, and fix obvious formatting inconsistencies.";
+
+                    try
+                    {
+                        var target = ctx.Notes.Resolve(note);
+                        if (target == null)
+                        {
+                            return ToolResult.Speak(
+                                string.IsNullOrWhiteSpace(note)
+                                    ? "You don't have any notes to reformat."
+                                    : $"I couldn't find a note called {note}.")
+                                .With("found", "false");
+                        }
+
+                        string before = ctx.Notes.Read(target.Name) ?? string.Empty;
+                        if (before.Trim().Length == 0)
+                        {
+                            return ToolResult.Speak($"Your {target.Name} note is empty, so there's nothing to reformat.")
+                                .With("changed", "false");
+                        }
+
+                        string after = await LocalLLMService.TransformTextAsync(
+                            instruction + " Keep every item's meaning and wording; do not add " +
+                            "or invent anything. Return the complete reformatted note as markdown.",
+                            before);
+
+                        if (string.IsNullOrWhiteSpace(after))
+                        {
+                            return ToolResult.Failed(
+                                "Sorry, I couldn't reformat that note.", "empty model response");
+                        }
+
+                        after = after.Trim();
+
+                        // Never overwrite with something suspiciously smaller: a
+                        // truncated or refused response would otherwise silently
+                        // eat most of a note the user wrote by hand. The backup
+                        // makes it recoverable; this makes it not happen.
+                        if (after.Length < before.Trim().Length / 2)
+                        {
+                            return ToolResult.Failed(
+                                $"I didn't change your {target.Name} note — the reformatted version " +
+                                "came back much shorter than the original, so I left it alone.",
+                                $"rewrite {after.Length} chars vs original {before.Trim().Length}");
+                        }
+
+                        ctx.Notes.RewriteWithBackup(target.Path, after + Environment.NewLine,
+                                                    out string backup);
+
+                        return ToolResult.Speak($"Reformatted your {target.Name} note. The old version is backed up.")
+                            .With("note", target.Name)
+                            .With("changed", "true")
+                            .With("backup", backup)
+                            .With("before_chars", before.Trim().Length.ToString())
+                            .With("after_chars", after.Length.ToString());
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("reformat_note failed: " + ex.Message);
+                        return ToolResult.Failed("Sorry, I couldn't reformat that note.", ex.Message);
+                    }
+                },
+                text =>
+                {
+                    var d = new Dictionary<string, string>();
+                    string lower = text.ToLower();
+                    foreach (var marker in new[] { "my ", "the " })
+                    {
+                        int i = lower.LastIndexOf(marker);
+                        if (i >= 0)
+                        {
+                            string note = text.Substring(i + marker.Length).TrimEnd('.', '!', '?').Trim();
+                            foreach (var tail in new[] { " note", " notes", " list" })
+                                if (note.EndsWith(tail, StringComparison.OrdinalIgnoreCase))
+                                    note = note.Substring(0, note.Length - tail.Length).Trim();
+                            if (note.Length > 0) d["note"] = note;
+                            break;
+                        }
+                    }
+                    return d;
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("read_clipboard",
+                    "Read what's currently on the Windows clipboard and report it."),
+                lower => (lower.Contains("clipboard") || lower.Contains("clip board")) &&
+                         !lower.Contains("copy ") && !lower.Contains("put ") && !lower.Contains("set "),
+                (ctx, args) =>
+                {
+                    try
+                    {
+                        string text = ctx.Clipboard.GetText();
+                        if (!string.IsNullOrEmpty(text))
+                        {
+                            return Task.FromResult(
+                                ToolResult.Speak($"Your clipboard has: {text}")
+                                    .With("text", text)
+                                    .With("length", text.Length.ToString()));
+                        }
+
+                        // Nothing to read isn't a failure, and saying only
+                        // "nothing" would be wrong when the clipboard holds an
+                        // image or files — the user copied SOMETHING.
+                        string other = ctx.Clipboard.DescribeNonText();
+                        return Task.FromResult(other != null
+                            ? ToolResult.Speak($"Your clipboard has {other} on it, not text.")
+                                .With("content_kind", other)
+                            : ToolResult.Speak("Your clipboard is empty.")
+                                .With("content_kind", "empty"));
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("read_clipboard failed: " + ex.Message);
+                        return Task.FromResult(ToolResult.Failed(
+                            "Sorry, I couldn't read your clipboard.", ex.Message));
+                    }
+                }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("set_clipboard",
+                    "Put text onto the Windows clipboard so the user can paste it.",
+                    new ToolParameter("text", "string", "The text to place on the clipboard.")),
+                lower => (lower.Contains("clipboard") || lower.Contains("clip board")) &&
+                         (lower.Contains("copy") || lower.Contains("put") || lower.Contains("set")),
+                (ctx, args) =>
+                {
+                    string text = args.TryGetValue("text", out var t) ? t : null;
+                    try
+                    {
+                        ctx.Clipboard.SetText(text);
+                        return Task.FromResult(
+                            ToolResult.Speak("Copied to your clipboard.")
+                                .With("text", text ?? string.Empty));
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("set_clipboard failed: " + ex.Message);
+                        return Task.FromResult(ToolResult.Failed(
+                            "Sorry, I couldn't set your clipboard.", ex.Message));
+                    }
+                },
+                text =>
+                {
+                    // "copy hello world to my clipboard" -> "hello world"
+                    string s = text.TrimEnd('.', '!', '?');
+                    foreach (var verb in new[] { "copy ", "put ", "set " })
+                    {
+                        int i = s.ToLower().IndexOf(verb);
+                        if (i >= 0) { s = s.Substring(i + verb.Length); break; }
+                    }
+                    foreach (var tail in new[] { "to my clipboard", "on my clipboard", "to the clipboard",
+                                                 "on the clipboard", "to clipboard", "clipboard" })
+                    {
+                        int i = s.ToLower().IndexOf(tail);
+                        if (i >= 0) { s = s.Substring(0, i); break; }
+                    }
+                    return new Dictionary<string, string> { ["text"] = s.Trim() };
                 }));
 
             registry.Add(new VoiceCommand(
@@ -1936,6 +2527,70 @@ namespace Personal_Assistant
                 // Malformed actions -> nothing to run.
             }
             return result;
+        }
+
+        // Flattens a markdown note into something Kokoro can read.
+        //
+        // Kokoro has no SSML and no markdown handling: handed a note verbatim it
+        // says "hash groceries dash milk dash bread". Emoji are already gone by
+        // the time it synthesises (TTSClient.StripUnspeakable), but the markdown
+        // markers are plain ASCII and survive, and a note's body is whatever the
+        // user or a model put in it. main's read_notes speaks the note verbatim
+        // because it never has to: its voice reads markdown as prose already.
+        //
+        // Only the scaffolding goes. The words are untouched, and the raw note
+        // still reaches the model under the result's "content" fact.
+        private static string SpokenNoteText(string markdown)
+        {
+            if (string.IsNullOrWhiteSpace(markdown)) return string.Empty;
+
+            var spoken = new List<string>();
+            string[] lines = markdown.Replace("\r\n", "\n").Split('\n');
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i].Trim();
+                if (line.Length == 0) continue;
+
+                // A rule ("---", "***") is punctuation on the page and nothing
+                // at all out loud.
+                if (line.TrimEnd('-', '*', '_', ' ').Length == 0 && line.Length >= 3) continue;
+
+                // The first heading is the note's own title, which the sentence
+                // around this has already said.
+                bool heading = line.StartsWith("#", StringComparison.Ordinal);
+                line = line.TrimStart('#', '>', ' ');
+                if (heading && spoken.Count == 0) continue;
+
+                // List markers: "- ", "* ", "+ ", "1. ", and a "[ ]"/"[x]" box.
+                if (line.StartsWith("- ", StringComparison.Ordinal) ||
+                    line.StartsWith("* ", StringComparison.Ordinal) ||
+                    line.StartsWith("+ ", StringComparison.Ordinal))
+                {
+                    line = line.Substring(2);
+                }
+                else
+                {
+                    var numbered = System.Text.RegularExpressions.Regex.Match(line, @"^\d+[.)]\s+");
+                    if (numbered.Success) line = line.Substring(numbered.Length);
+                }
+                line = System.Text.RegularExpressions.Regex.Replace(line, @"^\[[ xX]\]\s*", string.Empty);
+
+                // Inline emphasis and code, and links down to their text.
+                line = System.Text.RegularExpressions.Regex.Replace(line, @"\[([^\]]+)\]\([^)]*\)", "$1");
+                line = line.Replace("**", string.Empty).Replace("__", string.Empty).Replace("`", string.Empty);
+                line = System.Text.RegularExpressions.Regex.Replace(line, @"(?<=\s|^)[*_](\S[^*_]*)[*_](?=\s|$|[.,;:!?])", "$1");
+
+                line = line.Trim();
+                if (line.Length == 0) continue;
+
+                // Items run together without this: each line is its own thought,
+                // and a terminator is what makes the chunker pause between them.
+                if (".!?:;,".IndexOf(line[line.Length - 1]) < 0) line += ".";
+                spoken.Add(line);
+            }
+
+            return spoken.Count == 0 ? string.Empty : string.Join(" ", spoken);
         }
 
         // Human-friendly spoken duration, e.g. "5 minutes", "1 hour and 30 minutes".
