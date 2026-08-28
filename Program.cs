@@ -1,8 +1,10 @@
-using Personal_Assistant.AppLaunching;
+﻿using Personal_Assistant.AppLaunching;
 using Personal_Assistant.Arduino;
+using Personal_Assistant.Bakeoff;
 using Personal_Assistant.AudioControl;
 using Personal_Assistant.Diagnostics;
 using Personal_Assistant.Dispatch;
+using Personal_Assistant.Events;
 using Personal_Assistant.Geolocator;
 using Personal_Assistant.LightAutomator;
 using Personal_Assistant.LLMClient;
@@ -10,7 +12,13 @@ using Personal_Assistant.MediaControl;
 using Personal_Assistant.PlaystationController;
 using Personal_Assistant.PrayerTimesCalculator;
 using Personal_Assistant.ProcessControl;
+using Personal_Assistant.Power;
+using Personal_Assistant.Presence;
+using Personal_Assistant.Suggestions;
+using Personal_Assistant.Triggers;
+using Personal_Assistant.Configuration;
 using Personal_Assistant.Reminders;
+using Personal_Assistant.Resume;
 using Personal_Assistant.ScreenCapture;
 using Personal_Assistant.SearxNGClient;
 using Personal_Assistant.SMSController;
@@ -21,12 +29,14 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace Personal_Assistant
 {
-    class Program
+    public class Program
     {
         public static readonly string weatherAPIKey = Environment.GetEnvironmentVariable("WEATHERAPI_KEY");
 
@@ -106,6 +116,17 @@ namespace Personal_Assistant
 
         public static async Task Main(string[] args)
         {
+            // Score whichever model LM Studio has loaded against the real tool
+            // catalogue, then exit. Deliberately the FIRST thing in Main: the
+            // harness needs no microphone, no Python, no Kokoro and no audio
+            // device, and standing all of that up costs about a minute per
+            // candidate in a sweep that loads a dozen models.
+            if (BakeoffHarness.IsRequested(args))
+            {
+                await BakeoffHarness.RunAsync(BuildBakeoffRegistry(), args);
+                return;
+            }
+
             CheckEnvironmentVariables();
 
             // 49 (ASCII art)
@@ -115,10 +136,20 @@ namespace Personal_Assistant
             PythonEngine.Initialize();
             PythonEngine.BeginAllowThreads();
 
+            // Python modules ship next to the exe, so each deployed copy imports its
+            // own. This used to point at a single shared folder, which meant a .py
+            // deployed while working on one branch silently rebound the other
+            // branch's imports. The shared folder stays on the path *after* the app
+            // directory purely as a fallback, so an output dir missing a module
+            // still starts.
             using (Py.GIL())
             {
                 dynamic sys = Py.Import("sys");
-                sys.path.append(@"C:\Users\layth\LAITH\local");
+                sys.path.append(AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\'));
+
+                string extra = Environment.GetEnvironmentVariable("LAITH_PYTHON_MODULE_PATH");
+                if (string.IsNullOrWhiteSpace(extra)) extra = @"C:\Users\layth\LAITH\local";
+                sys.path.append(extra.TrimEnd('\\'));
             }
 
             // Tracks per-turn stt/llm/tts latency so we can see what's actually
@@ -171,14 +202,118 @@ namespace Personal_Assistant
             // A fired reminder has no user utterance, so use a clock as the
             // bubble's "you said" label — a nice reminder indicator now that the
             // bubble renders emoji. It's only shown, never spoken.
+            // How long the assistant was off, read BEFORE the heartbeat starts.
+            // Start() overwrites the single value this reads, so reversing these
+            // two lines reports "no downtime" for every restart, forever, and
+            // every paused timer silently degrades to wall-clock.
+            DateTime? lastSeen = Downtime.ReadLastSeen();
+            TimeSpan downtime = Downtime.GapSince(lastSeen);
+            var heartbeat = new Downtime();
+            heartbeat.Start();
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => heartbeat.Dispose();
+            Console.WriteLine(lastSeen.HasValue
+                ? $"[resume] last seen {lastSeen:ddd HH:mm} — off for {Downtime.Describe(downtime)}"
+                : "[resume] no heartbeat from a previous run");
+
+            // Set below, once the trigger engine and the suggestion service it
+            // needs exist. Captured by reference for the same reason dispatcherRef
+            // is: reminders are constructed first, but an anchored one coming due
+            // has to reach the watcher, and nothing can come due before Restore.
+            EventWatchService watcherRef = null;
+
             var reminders = new ReminderService(
                 message => speechManager.Say("⏰", message),
-                timerWidgets);
+                timerWidgets,
+                // persist:true only here, like ConversationMemory. Every harness
+                // gets the default false so it cannot write over real timers.
+                persist: true,
+                // A timer tied to a real event hands itself to the watcher
+                // instead of announcing. Null-safe because the watcher is
+                // assigned below and nothing can fire before Restore.
+                onEventDue: item =>
+                {
+                    watcherRef?.Begin(item.Subject, item.Label, item.FireAt);
+                    return Task.CompletedTask;
+                });
+
+            // Everything LAITH does without being asked. The gate decides whether
+            // an unprompted announcement is welcome (is anyone here? is it the
+            // middle of the night? are they mid-conversation?); the trigger
+            // service decides when one is due. Both run off their own tickers and
+            // neither touches the wake-word loop below.
+            //
+            // Declared up here rather than beside the loop because the gate closes
+            // over it: an announcement fired while a conversation is open talks
+            // over the reply the user is waiting for, and lands in the microphone
+            // still listening for their next turn.
+            bool conversationOpen = false;
+
+            var presence = new PresenceGate(isBusy: () => conversationOpen);
+            var triggers = new TriggerService(presence);
+
+            PrayerAnnouncer prayerAnnouncer = null;
+            if (LaithConfig.Bool("PrayerAnnouncements", true))
+            {
+                // 🕌 as the bubble's "you said" label, the way a fired reminder
+                // uses ⏰: there is no user utterance behind this one either.
+                // Straight through Say — this branch synthesises with Kokoro on
+                // demand and has no pre-rendered clip cache to keep in voice.
+                prayerAnnouncer = new PrayerAnnouncer(
+                    triggers,
+                    location,
+                    message => speechManager.Say("🕌", message));
+
+                // Not awaited: planning the day needs a location lookup over the
+                // network, and startup must not sit behind it.
+                _ = prayerAnnouncer.StartAsync();
+            }
+
+            // The same construction cycle main has: rules and suggestions need the
+            // dispatcher to run tools, the dispatcher needs the registry, the
+            // registry needs the context, and the context needs both of these.
+            // Broken by capturing these by reference and assigning them below.
+            IntentDispatcher dispatcherRef = null;
+            ToolRegistry registryRef = null;
+            ConversationMemory conversationMemoryRef = null;
+
+            var suggestions = new SuggestionService(
+                triggers,
+                message => speechManager.Say("💡", message),
+                // Recorded as a model turn so the dispatcher hands it to the model
+                // as history — which is how "yeah, go on" resolves to the offer.
+                // Main needs a system-instruction hint for this because its Live
+                // sessions start with no history at all; here the turn-based path
+                // already carries it.
+                remember: offer => conversationMemoryRef?.AddModel(offer));
+
+            // Things the user is waiting on that the world decides rather than
+            // the clock. 🔔 as the bubble label, alongside ⏰ / 🕌 / 📌 / 💡.
+            //
+            // Given `suggestions` so a confirmed event becomes an OFFER ("it's
+            // out — want me to open it?") rather than a browser window appearing
+            // on its own. Nothing here opens a link without a spoken yes, and the
+            // link itself always came from SearxNG rather than from the model.
+            var watcher = new EventWatchService(
+                triggers,
+                message => speechManager.Say("🔔", message),
+                suggestions,
+                persist: true);
+            watcherRef = watcher;
+
+            var voiceTriggers = new VoiceTriggers(
+                triggers,
+                processes,
+                message => speechManager.Say("📌", message),
+                runTool: (name, toolArgs) => dispatcherRef.RunToolByNameAsync(name, toolArgs),
+                isKnownTool: name => registryRef?.FindByName(name) != null);
 
             // Shared dependencies handed to every command handler.
             var context = new CommandContext
             {
                 Speech = speechManager,
+                VoiceTriggers = voiceTriggers,
+                Suggestions = suggestions,
+                Watches = watcher,
                 Lights = lightControl,
                 Playstation = playstationControl,
                 Sms = smsControl,
@@ -202,7 +337,12 @@ namespace Personal_Assistant
             // matcher in the registry is only used as a fallback if Gemini is
             // unavailable / malformed / times out.
             var registry = BuildRegistry(context);
-            var conversationMemory = new ConversationMemory();
+
+            // persist:true only here. Every other ConversationMemory in the
+            // codebase is one a harness constructed to satisfy a parameter, and
+            // those must not write over the real conversation.
+            var conversationMemory = new ConversationMemory(persist: true);
+            conversationMemory.Restore();
             var dispatcher = new IntentDispatcher(
                 registry,
                 context,
@@ -218,10 +358,64 @@ namespace Personal_Assistant
             // Let the `repeat` tool run other tools by name (validated).
             context.RunTool = dispatcher.RunToolByNameAsync;
 
+            // Close the cycle above, then arm whatever was set before the last
+            // restart. Restore must come after BOTH assignments: a rule with a
+            // run_tool fires through dispatcherRef, and a rule due the moment it is
+            // armed would otherwise hit a null on the trigger ticker — a background
+            // thread, i.e. the failure that takes the process down silently.
+            dispatcherRef = dispatcher;
+            registryRef = registry;
+            conversationMemoryRef = conversationMemory;
+
+            // Everything that was pending when the assistant last stopped, picked
+            // back up in one pass.
+            //
+            // Each service reports what it found rather than announcing it, so
+            // the whole restart produces ONE sentence instead of four services
+            // talking over each other at the moment the desktop finishes loading.
+            var resumed = new ResumeSummary();
+            resumed.Absorb(voiceTriggers.Restore(lastSeen));
+            resumed.Absorb(watcher.Restore());
+            // Reminders last of the three: an anchored one whose moment passed
+            // during downtime hands itself to the watcher, which must already
+            // have loaded its own store or the new watch is written into a list
+            // that Restore is about to clear.
+            resumed.Absorb(reminders.Restore(lastSeen));
+            watcher.Start();
+
+            Console.WriteLine($"[resume] {resumed.LogLine()}");
+
+            // Said through the trigger engine rather than straight out, so it
+            // gets the presence gate and quiet hours like every other unprompted
+            // line. Booting at 3am for a reboot and walking away should not mean
+            // the catch-up is spoken to an empty room and then lost — a generous
+            // grace keeps it waiting until somebody is actually there.
+            string catchUp = resumed.SpokenLine();
+            if (!string.IsNullOrWhiteSpace(catchUp))
+            {
+                triggers.AddOneShot(
+                    "resume:report",
+                    // Far enough after the startup greeting that the two don't
+                    // land on top of each other.
+                    DateTime.Now.AddSeconds(20),
+                    () => speechManager.Say("↩️", catchUp),
+                    grace: TimeSpan.FromHours(8));
+            }
+
+            // Suggestions last, for the same reason: every accept action runs a
+            // tool through the dispatcher, and Start() arms an evaluator that
+            // could fire within the minute.
+            SuggestionCatalogue.Register(
+                suggestions,
+                context,
+                prayerAnnouncer,
+                PresenceGate.IdleTime,
+                (name, toolArgs) => dispatcher.RunToolByNameAsync(name, toolArgs));
+            suggestions.Start();
+
             // A conversation stays open after the wakeword so follow-ups don't
             // need re-waking; it closes when the user goes quiet this long.
             var followUpWindow = TimeSpan.FromSeconds(12);
-            bool conversationOpen = false;
 
             while (true)
             {
@@ -266,11 +460,87 @@ namespace Personal_Assistant
             }
         }
 
+        // The catalogue the bake-off scores against: the SHIPPING one, not a
+        // convenient subset.
+        //
+        // Three tool groups only register when their service is non-null
+        // (set_trigger/list_triggers/cancel_trigger behind VoiceTriggers,
+        // accept_suggestion/adjust_suggestions behind Suggestions, send_sms behind
+        // Contacts). A harness that leaves any of them out still runs, still
+        // prints a score, and is quietly answering a different question — an
+        // easier one, since the hardest schema in the app is the one that goes
+        // missing. Hence the assertion at the bottom.
+        //
+        // Nothing here is ever executed: the harness scores what the model CHOSE
+        // and drops the decision. The services exist so the schemas exist.
+        private static ToolRegistry BuildBakeoffRegistry()
+        {
+            // Belt and braces. Nothing below calls Restore() or writes the store,
+            // but a scratch path means a mistake here can't rewrite the user's
+            // real standing rules in %APPDATA%\LAITH\triggers.json.
+            Environment.SetEnvironmentVariable("LAITH_TRIGGERS_PATH",
+                Path.Combine(Path.GetTempPath(), "laith-bakeoff-triggers.json"));
+
+            // idleSource is dictated rather than read: the real one would make the
+            // catalogue depend on how long ago somebody touched the mouse.
+            var presence = new PresenceGate(idleSource: () => TimeSpan.Zero);
+            var triggers = new TriggerService(presence);
+
+            var voiceTriggers = new VoiceTriggers(
+                triggers,
+                new ProcessController(),
+                _ => Task.CompletedTask,
+                (name, toolArgs) => Task.CompletedTask,
+                isKnownTool: _ => true,
+                idle: () => TimeSpan.Zero);
+
+            var contacts = LoadContacts();
+
+            var context = new CommandContext
+            {
+                VoiceTriggers = voiceTriggers,
+                Suggestions = new SuggestionService(triggers, _ => Task.CompletedTask),
+                Processes = new ProcessController(),
+                Battery = new BatteryReader(),
+                // send_sms is part of the shipped catalogue on this machine
+                // (CONTACTS_PATH resolves), and its contact enum is one more thing
+                // competing for an utterance. A stub keeps the tool count honest
+                // if the file is ever missing; the case only asserts `contact:any`.
+                Contacts = contacts != null && contacts.Count > 0
+                    ? contacts
+                    : new Dictionary<string, string> { ["mum"] = "+10000000000" }
+            };
+
+            var registry = BuildRegistry(context);
+
+            // Fail loudly rather than score a smaller catalogue. Every name here
+            // is conditionally registered, so a null service silently removes it.
+            string[] mustExist =
+            {
+                "set_trigger", "list_triggers", "cancel_trigger",
+                "accept_suggestion", "adjust_suggestions",
+                "get_battery", "send_sms"
+            };
+            var missing = mustExist.Where(n => registry.FindByName(n) == null).ToList();
+            if (missing.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    "bake-off registry is incomplete — missing " + string.Join(", ", missing) +
+                    ". Scoring this would answer a different question than the app asks.");
+            }
+
+            return registry;
+        }
+
         // Builds the command catalogue. Each VoiceCommand carries its LLM tool
         // schema (for Gemini dispatch) plus a keyword predicate + arg extractor
         // (for the fallback path). Registration order == the original if/else
         // order, so "first keyword match wins" is preserved on fallback.
-        private static ToolRegistry BuildRegistry(CommandContext context)
+        // Public so a harness can drive the REAL tool catalogue. A harness that
+        // builds its own stub registry is only ever exercising its own fakes — on
+        // main that produced a test which reported a working tool round trip while
+        // the shipping handlers were still returning nothing.
+        public static ToolRegistry BuildRegistry(CommandContext context)
         {
             var registry = new ToolRegistry();
 
@@ -454,6 +724,15 @@ namespace Personal_Assistant
                         ? new Dictionary<string, string> { ["days"] = m.Value }
                         : VoiceCommand.EmptyArgs;
                 }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("get_battery",
+                    "How much battery is left. Answers in TIME remaining where Windows will " +
+                    "say — that's what the user actually wants to know — and falls back to a " +
+                    "percentage when it won't."),
+                lower => lower.Contains("battery") ||
+                         (lower.Contains("how long") && lower.Contains("charge")),
+                (ctx, args) => ctx.Speech.Say(ctx.RecognizedText, ctx.Battery.Read().Spoken())));
 
             registry.Add(new VoiceCommand(
                 ToolDefinition.Create("get_prayer_times",
@@ -792,6 +1071,16 @@ namespace Personal_Assistant
                         "e.g. 10 minutes = 600)."),
                     new ToolParameter("label", "string",
                         "What to remind the user about when it fires, if they said. Omit for a plain timer.",
+                        Required: false),
+                    new ToolParameter("event_subject", "string",
+                        "ONLY when the countdown is until a real-world event that either happens or " +
+                        "doesn't — a game or episode release, a match kickoff, a launch. Give a short " +
+                        "searchable description of the event itself, e.g. 'Re:Zero Season 4 Recapture " +
+                        "Arc episode release'. Setting this means the countdown is treated as a " +
+                        "DEADLINE that survives a shutdown, and when it runs out I search the web to " +
+                        "check whether the event actually happened instead of just announcing it. " +
+                        "Omit for ordinary timers ('remind me in 10 minutes'), which are paused while " +
+                        "the PC is off.",
                         Required: false)),
                 lower => lower.Contains("timer") ||
                          (lower.Contains("remind") && (lower.Contains(" in ") || lower.Contains("minute") ||
@@ -805,10 +1094,19 @@ namespace Personal_Assistant
                         return;
                     }
                     string label = args.TryGetValue("label", out string l) ? l : null;
-                    ctx.Reminders.AddTimer(secs, label);
+                    string subject = args.TryGetValue("event_subject", out string sub) ? sub : null;
+                    ctx.Reminders.AddTimer(secs, label, subject);
+
                     string what = string.IsNullOrWhiteSpace(label) ? "" : $" to {label}";
+                    // Said differently on purpose: an event timer promises to go
+                    // and CHECK, and the user needs to know that is what they got
+                    // — it is the difference between being told a guess expired
+                    // and being told the thing happened.
                     await ctx.Speech.Say(ctx.RecognizedText,
-                        $"Okay, I'll remind you{what} in {DescribeDuration(secs)}.");
+                        string.IsNullOrWhiteSpace(subject)
+                            ? $"Okay, I'll remind you{what} in {DescribeDuration(secs)}."
+                            : $"Okay — in {DescribeDuration(secs)} I'll check whether {subject} has " +
+                              "happened and let you know either way.");
                 },
                 text =>
                 {
@@ -882,11 +1180,29 @@ namespace Personal_Assistant
                 async (ctx, args) =>
                 {
                     var pending = ctx.Reminders.Pending();
-                    if (pending.Count == 0)
+
+                    // Watches are listed alongside, because from the user's side
+                    // "the Re:Zero thing" is one of their pending items — the
+                    // fact that it graduated from a countdown into something
+                    // being checked is an implementation detail they never asked
+                    // about, and hiding it makes it look like it was forgotten.
+                    var watching = ctx.Watches?.Snapshot()
+                        ?? (IReadOnlyList<EventWatch>)new List<EventWatch>();
+
+                    if (pending.Count == 0 && watching.Count == 0)
                     {
                         await ctx.Speech.Say(ctx.RecognizedText, "You have no timers or alarms set.");
                         return;
                     }
+
+                    if (pending.Count == 0)
+                    {
+                        await ctx.Speech.Say(ctx.RecognizedText,
+                            "No timers, but I'm still checking on " +
+                            string.Join(", ", watching.Select(w => w.Describe())) + ".");
+                        return;
+                    }
+
                     var sb = new System.Text.StringBuilder();
                     sb.Append($"You have {pending.Count} {(pending.Count == 1 ? "reminder" : "reminders")}: ");
                     for (int i = 0; i < pending.Count; i++)
@@ -897,6 +1213,12 @@ namespace Personal_Assistant
                             : $"tomorrow at {p.FireAt:t}";
                         sb.Append(string.IsNullOrWhiteSpace(p.Label) ? when : $"{p.Label} at {when}");
                         sb.Append(i < pending.Count - 1 ? "; " : ".");
+                    }
+                    if (watching.Count > 0)
+                    {
+                        sb.Append(" I'm also still checking on ");
+                        sb.Append(string.Join(", ", watching.Select(w => w.Describe())));
+                        sb.Append(".");
                     }
                     await ctx.Speech.Say(ctx.RecognizedText, sb.ToString());
                 }));
@@ -909,11 +1231,230 @@ namespace Personal_Assistant
                 async (ctx, args) =>
                 {
                     int n = ctx.Reminders.CancelAll();
+                    // Watches go too. "Cancel my reminders" means stop bothering
+                    // me about this stuff, and leaving something that still
+                    // speaks unprompted hours later would read as the cancel
+                    // having failed.
+                    int total = n + (ctx.Watches?.CancelAll() ?? 0);
                     await ctx.Speech.Say(ctx.RecognizedText,
-                        n == 0
+                        total == 0
                             ? "There was nothing to cancel."
-                            : $"Cancelled {n} {(n == 1 ? "reminder" : "reminders")}.");
+                            : $"Cancelled {total} {(total == 1 ? "reminder" : "reminders")}.");
                 }));
+
+            // Answering "yes" to something the assistant offered on its own.
+            //
+            // Unlike main, no system-instruction hint is needed: this branch's
+            // dispatcher hands ConversationMemory to the model as history, and the
+            // offer was recorded there when it was spoken, so "yeah, go on" has
+            // something to refer to already.
+            if (context.Suggestions != null)
+            {
+                var suggestions = context.Suggestions;
+
+                registry.Add(new VoiceCommand(
+                    ToolDefinition.Create("accept_suggestion",
+                        "Call this ONLY when the user agrees to something you offered them " +
+                        "unprompted — \"yes\", \"go on\", \"do it\", \"sure\". Never call it for " +
+                        "an ordinary request; use the tool that does the thing instead. If they " +
+                        "decline or change the subject, do not call it at all."),
+                    lower => false, // no keyword path — "yes" alone is far too broad
+                    async (ctx, args) =>
+                    {
+                        string said = await suggestions.AcceptPendingAsync();
+                        // Saying so beats silently doing nothing, which reads as
+                        // the assistant ignoring you.
+                        await ctx.Speech.Say(ctx.RecognizedText,
+                            said ?? "Sorry, I'm not sure what you're saying yes to.");
+                    }));
+
+                registry.Add(new VoiceCommand(
+                    ToolDefinition.Create("adjust_suggestions",
+                        "Change how often the assistant volunteers things on its own — use this " +
+                        "when the user says it's being annoying, too quiet, or to stop " +
+                        "suggesting things. Takes effect immediately and lasts until the app " +
+                        "restarts; the Suggestions setting in the config decides the level it " +
+                        "starts at.",
+                        new ToolParameter("level", "string",
+                            "off = never volunteer anything. rare = a few times a day at most. " +
+                            "normal = the default. chatty = surface things readily.",
+                            AllowedValues: new List<string> { "off", "rare", "normal", "chatty" })),
+                    lower => lower.Contains("stop suggesting") ||
+                             lower.Contains("suggest less") || lower.Contains("suggest more"),
+                    async (ctx, args) =>
+                    {
+                        args.TryGetValue("level", out string level);
+                        if (!Enum.TryParse(level, ignoreCase: true, out SuggestionLevel parsed))
+                        {
+                            await ctx.Speech.Say(ctx.RecognizedText,
+                                "I'm not sure how often you want me to speak up.");
+                            return;
+                        }
+
+                        SuggestionBudget.SetLevelForThisRun(parsed);
+
+                        // A pending offer belongs to the old setting. Being told to
+                        // shut up and then acting on the thing you were told to
+                        // shut up about is the wrong way round.
+                        if (parsed == SuggestionLevel.Off) suggestions.DeclinePending();
+
+                        string said;
+                        switch (parsed)
+                        {
+                            case SuggestionLevel.Off: said = "Alright, I'll keep quiet."; break;
+                            case SuggestionLevel.Rare: said = "Okay, I'll only mention the big things."; break;
+                            case SuggestionLevel.Chatty: said = "Okay, I'll speak up more often."; break;
+                            default: said = "Okay, back to normal."; break;
+                        }
+                        await ctx.Speech.Say(ctx.RecognizedText, said);
+                    }));
+            }
+
+            // --- Standing rules (LLM-only; the phrasing is too open for keywords) ----
+
+            if (context.VoiceTriggers != null)
+            {
+                var voiceTriggers = context.VoiceTriggers;
+
+                registry.Add(new VoiceCommand(
+                    ToolDefinition.Create("set_trigger",
+                        "Create a STANDING RULE that keeps working in the background — " +
+                        "'tell me when Discord closes', 'every weekday at 8 turn on the bedroom " +
+                        "light', 'remind me to stretch every 30 minutes until 6'. Use this only " +
+                        "for an ongoing rule; a one-off countdown is set_timer and a single " +
+                        "clock-time reminder is set_alarm. Give `message`, or `run_tool`, or both.",
+                        new ToolParameter("condition", "string",
+                            "What makes it fire. at_time = a clock time. every = a repeating " +
+                            "interval. app_starts / app_stops = a program opening or closing. " +
+                            "file_appears = a download or file finishes arriving in a folder. " +
+                            "idle_for = the user has been away a while (use this for DOING " +
+                            "something while they're out, like turning lights off — they won't " +
+                            "hear a message). on_return = they come back after being away. " +
+                            "battery_below = running on battery and low.",
+                            AllowedValues: new List<string>
+                            {
+                                "at_time", "every", "app_starts", "app_stops",
+                                "file_appears", "idle_for", "on_return", "battery_below"
+                            }),
+                        new ToolParameter("message", "string",
+                            "The announcement to speak AT THE MOMENT the rule fires, later — not " +
+                            "a confirmation that you have set it up. For 'tell me when Discord " +
+                            "closes' this is \"Discord has closed\", never \"I'll tell you when " +
+                            "Discord closes\". Omit only if run_tool is self-explanatory.",
+                            Required: false),
+                        new ToolParameter("time", "string",
+                            "For at_time: 24-hour HH:mm, e.g. 08:00 or 17:30.",
+                            Required: false),
+                        new ToolParameter("repeat", "string",
+                            "For at_time: how often it comes round. Defaults to once.",
+                            Required: false,
+                            AllowedValues: new List<string> { "once", "daily", "weekdays", "weekends" }),
+                        new ToolParameter("interval_minutes", "integer",
+                            "For every: how many minutes between runs, 1 to 1440. For idle_for " +
+                            "and on_return: how many minutes away counts as away.",
+                            Required: false),
+                        new ToolParameter("until", "string",
+                            "For every: stop for the day after this 24-hour HH:mm time.",
+                            Required: false),
+                        new ToolParameter("app", "string",
+                            "For app_starts / app_stops: the program name, e.g. Discord or chrome.",
+                            Required: false),
+                        new ToolParameter("folder", "string",
+                            "For file_appears: which folder to watch. Defaults to Downloads.",
+                            Required: false),
+                        new ToolParameter("pattern", "string",
+                            "For file_appears: which files count, as a glob like *.pdf. " +
+                            "Omit for any file.",
+                            Required: false),
+                        new ToolParameter("percent", "integer",
+                            "For battery_below: the charge percentage to warn at, 1 to 100.",
+                            Required: false),
+                        new ToolParameter("minutes_left", "integer",
+                            "For battery_below: warn when this many minutes of battery remain. " +
+                            "Prefer this over percent when the user talks in time (\"when I'm " +
+                            "down to half an hour\").",
+                            Required: false),
+                        // Deliberately does NOT say which tools are disallowed. It
+                        // used to, and the model routed around the prohibition:
+                        // "text my mum every morning" came back as a rule that SAYS
+                        // "good morning" out loud, silently turning a request to
+                        // message someone into a different feature.
+                        new ToolParameter("run_tool", "string",
+                            "OMIT THIS unless the user asked for an ACTION as well as being told. " +
+                            "\"Tell me when X\" and \"let me know when X\" are notifications and " +
+                            "need only a message — adding a tool to those is wrong and the rule " +
+                            "will be rejected. Use it only for \"when X, DO Y\", and then name the " +
+                            "tool the user actually asked for, e.g. control_lights, send_sms. " +
+                            "Never substitute a different action from the one they asked for.",
+                            Required: false),
+                        new ToolParameter("run_tool_args", "string",
+                            "Optional JSON object of arguments for run_tool, " +
+                            "e.g. {\"state\":\"on\",\"room\":\"bedroom\"}.",
+                            Required: false)),
+                    lower => false, // no keyword path — see the note above
+                    (ctx, args) => HandleSetTriggerAsync(ctx, voiceTriggers, args)));
+
+                registry.Add(new VoiceCommand(
+                    ToolDefinition.Create("list_triggers",
+                        "List the standing rules the user has set up (things that fire on their " +
+                        "own, like 'when Discord closes'). Not timers or alarms — that's " +
+                        "list_reminders."),
+                    lower => false,
+                    async (ctx, args) =>
+                    {
+                        IReadOnlyList<TriggerSpec> rules = voiceTriggers.Snapshot();
+                        if (rules.Count == 0)
+                        {
+                            await ctx.Speech.Say(ctx.RecognizedText,
+                                "You don't have any standing rules set up.");
+                            return;
+                        }
+
+                        var sb = new StringBuilder();
+                        sb.Append($"You have {rules.Count} standing {(rules.Count == 1 ? "rule" : "rules")}: ");
+                        for (int i = 0; i < rules.Count; i++)
+                        {
+                            // Numbered so "cancel the second one" has a referent,
+                            // matching how list_reminders numbers its own.
+                            sb.Append($"{i + 1}. {rules[i].Describe()}");
+                            sb.Append(i < rules.Count - 1 ? "; " : ".");
+                        }
+                        await ctx.Speech.Say(ctx.RecognizedText, sb.ToString());
+                    }));
+
+                registry.Add(new VoiceCommand(
+                    ToolDefinition.Create("cancel_trigger",
+                        "Cancel a standing rule. Give `which` as the number from list_triggers, " +
+                        "or \"all\".",
+                        new ToolParameter("which", "string",
+                            "The rule's number as listed, e.g. \"2\", or \"all\" for every rule.")),
+                    lower => false,
+                    async (ctx, args) =>
+                    {
+                        args.TryGetValue("which", out string which);
+                        which = (which ?? string.Empty).Trim();
+
+                        if (string.Equals(which, "all", StringComparison.OrdinalIgnoreCase))
+                        {
+                            int n = voiceTriggers.CancelAll();
+                            await ctx.Speech.Say(ctx.RecognizedText, n == 0
+                                ? "There were no standing rules to cancel."
+                                : $"Cancelled {n} standing {(n == 1 ? "rule" : "rules")}.");
+                            return;
+                        }
+
+                        if (!int.TryParse(which, out int index))
+                        {
+                            await ctx.Speech.Say(ctx.RecognizedText, "Which one did you mean?");
+                            return;
+                        }
+
+                        TriggerSpec removed = voiceTriggers.CancelAt(index);
+                        await ctx.Speech.Say(ctx.RecognizedText, removed == null
+                            ? "I don't have a rule with that number."
+                            : $"Cancelled: {removed.Describe()}.");
+                    }));
+            }
 
             // --- Composition primitives (LLM-only; no keyword path) ------------------
 
@@ -972,6 +1513,181 @@ namespace Personal_Assistant
                 ephemeral: true));
 
             return registry;
+        }
+
+        // Turns set_trigger's arguments into a TriggerSpec and arms it.
+        //
+        // The schema can't express "time is required, but only when condition is
+        // at_time", so that shape is enforced here. On this branch the handler
+        // speaks the outcome itself rather than returning it, so a rejection is
+        // said out loud in the same breath as it is decided.
+        private static async Task HandleSetTriggerAsync(
+            CommandContext ctx, VoiceTriggers voiceTriggers, IReadOnlyDictionary<string, string> args)
+        {
+            args.TryGetValue("condition", out string condition);
+            if (!TryParseCondition(condition, out TriggerWhen when))
+            {
+                await ctx.Speech.Say(ctx.RecognizedText,
+                    "I'm not sure when you want that to happen.");
+                return;
+            }
+
+            var spec = new TriggerSpec { When = when, Repeat = TriggerRepeat.Once };
+
+            if (args.TryGetValue("message", out string message) && !string.IsNullOrWhiteSpace(message))
+            {
+                spec.Message = message.Trim();
+            }
+            if (args.TryGetValue("run_tool", out string runTool) && !string.IsNullOrWhiteSpace(runTool))
+            {
+                spec.RunTool = runTool.Trim();
+            }
+            if (args.TryGetValue("run_tool_args", out string toolArgs) && !string.IsNullOrWhiteSpace(toolArgs))
+            {
+                spec.RunToolArgs = ParseToolArgs(toolArgs);
+            }
+
+            switch (when)
+            {
+                case TriggerWhen.AtTime:
+                    if (!args.TryGetValue("time", out string timeText) ||
+                        !ReminderService.TryParseTimeOfDay(timeText, out TimeSpan tod))
+                    {
+                        await ctx.Speech.Say(ctx.RecognizedText, "What time should that be?");
+                        return;
+                    }
+                    spec.TimeOfDay = tod;
+                    if (args.TryGetValue("repeat", out string repeat) &&
+                        Enum.TryParse(repeat, ignoreCase: true, out TriggerRepeat parsedRepeat))
+                    {
+                        spec.Repeat = parsedRepeat;
+                    }
+                    break;
+
+                case TriggerWhen.Every:
+                    if (!args.TryGetValue("interval_minutes", out string every) ||
+                        !int.TryParse(every, out int minutes))
+                    {
+                        await ctx.Speech.Say(ctx.RecognizedText, "How often should I do that?");
+                        return;
+                    }
+                    spec.IntervalMinutes = minutes;
+                    if (args.TryGetValue("until", out string until) &&
+                        ReminderService.TryParseTimeOfDay(until, out TimeSpan untilTod))
+                    {
+                        spec.Until = untilTod;
+                    }
+                    break;
+
+                case TriggerWhen.AppStarts:
+                case TriggerWhen.AppStops:
+                    if (!args.TryGetValue("app", out string app) || string.IsNullOrWhiteSpace(app))
+                    {
+                        await ctx.Speech.Say(ctx.RecognizedText, "Which app should I watch for?");
+                        return;
+                    }
+                    spec.App = app.Trim();
+                    break;
+
+                case TriggerWhen.FileAppears:
+                    // Both optional: the default is "any file in Downloads",
+                    // which is what "tell me when my download finishes" means.
+                    if (args.TryGetValue("folder", out string folder) &&
+                        !string.IsNullOrWhiteSpace(folder))
+                    {
+                        spec.Folder = folder.Trim();
+                    }
+                    if (args.TryGetValue("pattern", out string pattern) &&
+                        !string.IsNullOrWhiteSpace(pattern))
+                    {
+                        spec.Pattern = pattern.Trim();
+                    }
+                    break;
+
+                case TriggerWhen.IdleFor:
+                case TriggerWhen.OnReturn:
+                    if (!args.TryGetValue("interval_minutes", out string away) ||
+                        !int.TryParse(away, out int awayMinutes))
+                    {
+                        await ctx.Speech.Say(ctx.RecognizedText,
+                            "How long away should I count as away?");
+                        return;
+                    }
+                    spec.AwayMinutes = awayMinutes;
+                    break;
+
+                case TriggerWhen.BatteryBelow:
+                    if (args.TryGetValue("percent", out string pct) && int.TryParse(pct, out int percent))
+                    {
+                        spec.Percent = percent;
+                    }
+                    if (args.TryGetValue("minutes_left", out string left) &&
+                        int.TryParse(left, out int minutesLeft))
+                    {
+                        spec.MinutesLeft = minutesLeft;
+                    }
+                    if (spec.Percent == 0 && spec.MinutesLeft == 0)
+                    {
+                        await ctx.Speech.Say(ctx.RecognizedText,
+                            "At what battery level should I tell you?");
+                        return;
+                    }
+                    break;
+            }
+
+            TriggerSpec added = voiceTriggers.Add(spec, out TriggerRejection rejected);
+            if (added == null)
+            {
+                await ctx.Speech.Say(ctx.RecognizedText, rejected.Spoken);
+                return;
+            }
+
+            // Read the whole rule back. It is a standing instruction that will act
+            // on its own later, so "okay" is not enough — the user has to be able
+            // to hear that it was understood the way they meant it.
+            await ctx.Speech.Say(ctx.RecognizedText, $"Right — I'll {added.Describe()}.");
+        }
+
+        private static bool TryParseCondition(string raw, out TriggerWhen when)
+        {
+            switch ((raw ?? string.Empty).Trim().ToLowerInvariant())
+            {
+                case "at_time": when = TriggerWhen.AtTime; return true;
+                case "every": when = TriggerWhen.Every; return true;
+                case "app_starts": when = TriggerWhen.AppStarts; return true;
+                case "app_stops": when = TriggerWhen.AppStops; return true;
+                case "file_appears": when = TriggerWhen.FileAppears; return true;
+                case "idle_for": when = TriggerWhen.IdleFor; return true;
+                case "on_return": when = TriggerWhen.OnReturn; return true;
+                case "battery_below": when = TriggerWhen.BatteryBelow; return true;
+                default: when = TriggerWhen.AtTime; return false;
+            }
+        }
+
+        // set_trigger's run_tool_args is a JSON object, where `repeat`'s actions
+        // are a JSON array — same defensive treatment, different shape, so it does
+        // not go through ParseRepeatActions.
+        private static Dictionary<string, string> ParseToolArgs(string json)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                using (var doc = JsonDocument.Parse(json))
+                {
+                    if (doc.RootElement.ValueKind != JsonValueKind.Object) return result;
+                    foreach (JsonProperty p in doc.RootElement.EnumerateObject())
+                    {
+                        result[p.Name] = p.Value.ValueKind == JsonValueKind.String
+                            ? p.Value.GetString()
+                            : p.Value.GetRawText();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[triggers] could not read run_tool_args: {ex.Message}");
+            }
+            return result;
         }
 
         private sealed class RepeatStep

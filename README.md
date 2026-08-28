@@ -101,10 +101,47 @@ service bind IPv4 only, so the connect waits for the IPv6 refusal — measured a
 
 `SPEECH_KEY`, `SPEECH_REGION`, `GEMINIAPI_KEY` are **not used** on this branch.
 
+Docker compose also reads `.env` (gitignored) for `CONTACTS_FILE` — the host path
+the STT container mounts to build its decoder boosting tree. Copy `.env.example`.
+Compose interpolates the whole file even when you bring up a single service, so
+without it `docker compose up -d searxng` fails outright.
+
+## It picks up where it left off
+
+Shut it down, reboot, pull the plug — nothing pending is lost. A heartbeat records
+when it was last alive, and on the next start everything still outstanding is
+worked out from that. What "resuming" means depends on what the thing is:
+
+| | across a shutdown |
+|---|---|
+| a plain timer — *"ten minutes"* | **pauses**, and comes back with the time that was left |
+| an alarm — *"wake me at 7"* | keeps its moment; 7am is still 7am |
+| an event timer — *"a timer for that release"* | keeps its deadline, **and gets checked** |
+| standing rules | re-armed; ones that came due while it was off are reported instead of silently binned |
+
+Anything missed arrives as **one** sentence, held until you're actually at the
+desk. Things too stale to be worth saying are logged rather than spoken, and never
+just dropped.
+
+**Waiting for things that haven't happened yet.** A countdown expiring proves
+nothing — the episode might have shipped early, slipped, or been pulled. So a
+timer tied to a real event is a deadline to go and *look*: when it runs out, even
+across several reboots, LAITH searches SearxNG and asks the local model to judge
+**only what came back**. Confirmed, it offers (*"it's out — want me to open it?"*)
+and opens the browser only if you say yes, at a URL taken from the search results
+rather than from the model. Not confirmed, it says so once and keeps checking,
+backing off as it goes.
+
+With no search results it **refuses to answer** rather than falling back on what
+the model remembers — release dates are exactly what training data gets wrong.
+So if a watch never resolves, check SearxNG's JSON API before anything else
+(`curl 'http://localhost:8080/search?q=test&format=json'`).
+
 ## Roadmap
 
 - [x] Ability to interrupt L.A.I.T.H
 - [x] Multi-turn context/memory
+- [x] Interrupted work resumed after a restart, including waiting on real events
 - [ ] Give L.A.I.T.H. computer control
 - [ ] True end-to-end speech-to-speech — blocked until an open STS model does tool
       calling in 6 GB; the cascade simulates it for now (low latency, barge-in)

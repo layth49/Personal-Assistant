@@ -1,3 +1,4 @@
+using Personal_Assistant.Events;
 using Personal_Assistant.Dispatch;
 using Personal_Assistant.SearxNGClient;
 using System;
@@ -328,6 +329,11 @@ namespace Personal_Assistant.LLMClient
                 max_tokens = 200,
                 temperature = 0.5,
                 top_p = 0.5,
+                // See BuildToolRequest. Matters even more here than there: the
+                // answer budget is 200 tokens, and a model that spends them
+                // thinking returns empty `content` — the assistant says nothing
+                // at all, which is exactly how gemma-4-e2b behaved.
+                reasoning_effort = "none",
                 stream = true
             };
 
@@ -533,6 +539,7 @@ namespace Personal_Assistant.LLMClient
                 max_tokens = 200,
                 temperature = 0.5,
                 top_p = 0.5,
+                reasoning_effort = "none",   // see BuildToolRequest
                 stream = false
             };
 
@@ -734,6 +741,18 @@ namespace Personal_Assistant.LLMClient
                 ["temperature"] = 0.3,
                 // Headroom for several tool calls in one compound request.
                 ["max_tokens"] = 400,
+                // Reasoning is pure latency on the router: it happens before the
+                // user has heard anything, and nobody ever sees the thinking.
+                //
+                // "/no think" in a system prompt is a QWEN convention and does
+                // nothing for other families — and measured 2026-08-10 it doesn't
+                // even work for all Qwens: qwen3.5-4b and nemotron-3-nano-4b
+                // ignore it (and ignore chat_template_kwargs) and keep thinking.
+                // reasoning_effort is the only method that silenced every model
+                // that could be silenced at all, and it is inert on models with
+                // no reasoning mode, so it is applied unconditionally rather than
+                // per-family.
+                ["reasoning_effort"] = "none",
                 ["stream"] = false
             };
         }
@@ -866,6 +885,169 @@ namespace Personal_Assistant.LLMClient
 
                 return contentEl.GetString() ?? string.Empty;
             }
+        }
+
+        /// <summary>
+        /// Asks whether <paramref name="subject"/> has happened yet, from live
+        /// search results rather than from what the model remembers.
+        ///
+        /// This is the local half of what `main` gets from Gemini's Google Search
+        /// grounding, and the shape is deliberately the same: SEARCH FIRST, then
+        /// judge only what came back. It is arguably the stronger arrangement of
+        /// the two, because here the retrieval step is ours — the model is never
+        /// trusted to decide whether it looked something up.
+        ///
+        /// Never throws: every failure becomes an Unknown carrying the reason.
+        /// The caller decides whether to re-check, and "the lookup broke" and
+        /// "the event hasn't happened" must never look the same to it.
+        /// </summary>
+        public static async Task<EventVerdict> VerifyEventAsync(
+            string subject, CancellationToken cancel = default(CancellationToken))
+        {
+            if (string.IsNullOrWhiteSpace(subject))
+            {
+                return EventVerdict.Unknown("no subject to check");
+            }
+
+            List<SearchHit> hits;
+            try
+            {
+                hits = await SearxNGService.SearchAsync(subject, topN: 5).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                return EventVerdict.Unknown($"the search failed: {ex.Message}");
+            }
+
+            // THE refusal, and the reason this method exists rather than a call to
+            // AnswerWithSearchResults.
+            //
+            // SearxNGService is deliberately best-effort everywhere else: an
+            // outage returns an empty list and the model answers from its own
+            // knowledge, which for ordinary chat is the right trade. Here it is
+            // exactly wrong. With no results, "has this happened yet" can only be
+            // answered from training data — confidently, about a release date,
+            // which is the one thing this whole feature exists to stop. No search,
+            // no answer.
+            if (hits == null || hits.Count == 0)
+            {
+                return EventVerdict.Unknown("no search results came back, and I won't guess at this");
+            }
+
+            return await JudgeEventAsync(subject, hits, cancel).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// The judging half, over results someone else fetched.
+        ///
+        /// Split from the retrieval half because they fail for different reasons
+        /// and are worth exercising apart: a SearxNG outage and a model that
+        /// answers in the wrong shape both surface as Unknown, and telling them
+        /// apart is most of debugging a watch that never resolves. It is also the
+        /// only way to test the prompt without the search stack up.
+        /// </summary>
+        public static async Task<EventVerdict> JudgeEventAsync(
+            string subject, List<SearchHit> hits, CancellationToken cancel = default(CancellationToken))
+        {
+            if (hits == null || hits.Count == 0)
+            {
+                return EventVerdict.Unknown("nothing to judge from");
+            }
+
+            var sources = new StringBuilder();
+            for (int i = 0; i < hits.Count; i++)
+            {
+                sources.AppendLine($"[{i + 1}] {hits[i].Title}");
+                if (!string.IsNullOrWhiteSpace(hits[i].Snippet)) sources.AppendLine($"    {hits[i].Snippet}");
+            }
+
+            string instruction =
+                "You decide whether a real-world event has already happened, using ONLY the search " +
+                $"results given to you. Today is {DateTime.Now:dddd d MMMM yyyy}, local time {DateTime.Now:HH:mm}. " +
+                "If the results do not clearly settle it, answer UNKNOWN. Never answer from your own " +
+                "knowledge — your training data is older than these results and release dates move.";
+
+            string question =
+                $"Event: {subject}\n\n" +
+                $"Search results:\n{sources}\n" +
+                "Has it happened yet? Reply with EXACTLY one line, nothing else, in this format:\n" +
+                "STATUS | one short sentence | source number\n" +
+                "STATUS is HAPPENED, NOT_YET, or UNKNOWN. " +
+                "The sentence is spoken aloud, so: under 20 words, no markdown, no asterisks. " +
+                "The source number is the [n] of the best result to open, or NONE. " +
+                "Do not write a URL — just the number.";
+
+            var requestBody = new Dictionary<string, object>
+            {
+                ["messages"] = new List<object>
+                {
+                    new Dictionary<string, object> { ["role"] = "system", ["content"] = instruction },
+                    new Dictionary<string, object> { ["role"] = "user", ["content"] = question }
+                },
+                // Low, not zero: this is a judgement over text, and the failure
+                // mode to avoid is creative rephrasing of a date.
+                ["temperature"] = 0.1,
+                ["max_tokens"] = 200,
+                // Non-negotiable on this branch. A model that spends its budget
+                // thinking returns empty `content`, which parses as Unknown — so
+                // the watch would re-check forever and never resolve, and the log
+                // would blame the search. "/no think" in the prompt does NOT do
+                // this reliably; reasoning_effort is the only thing that does.
+                // See BuildToolRequest for the measurements.
+                ["reasoning_effort"] = "none",
+                ["stream"] = false
+            };
+
+            try
+            {
+                var content = new StringContent(
+                    JsonSerializer.Serialize(requestBody, RawJsonOpts), Encoding.UTF8, "application/json");
+
+                using (HttpResponseMessage response = await httpClient
+                    .PostAsync($"{lmStudioUrl.TrimEnd('/')}/chat/completions", content, cancel)
+                    .ConfigureAwait(false))
+                {
+                    string body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        return EventVerdict.Unknown($"{(int)response.StatusCode} {response.ReasonPhrase}");
+                    }
+
+                    // The model names a source NUMBER and we resolve it against
+                    // the hits, so the URL that eventually reaches Process.Start
+                    // always came from SearxNG and never from the model. A 4B
+                    // model asked for a URL will happily invent a plausible one.
+                    return EventVerdict.Parse(ResolveSource(ExtractText(body), hits));
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                return EventVerdict.Unknown("the check was cancelled");
+            }
+            catch (Exception ex)
+            {
+                return EventVerdict.Unknown(ex.Message);
+            }
+        }
+
+        // Swaps a trailing "[n]"/"n" source reference for that hit's real URL, so
+        // the shared EventVerdict.Parse — including its http(s)-only check — sees
+        // the same shape it sees on main. Anything that isn't a number in range is
+        // left alone, which means NONE stays NONE and an invented URL still has to
+        // survive Parse's validation.
+        private static string ResolveSource(string reply, List<SearchHit> hits)
+        {
+            if (string.IsNullOrWhiteSpace(reply)) return reply;
+
+            int lastBar = reply.LastIndexOf('|');
+            if (lastBar < 0) return reply;
+
+            string tail = reply.Substring(lastBar + 1).Trim().Trim('[', ']', '.', '"', '*', '`');
+            if (!int.TryParse(tail, out int index) || index < 1 || index > hits.Count) return reply;
+
+            string url = hits[index - 1].Url;
+            if (string.IsNullOrWhiteSpace(url)) return reply.Substring(0, lastBar + 1) + " NONE";
+            return reply.Substring(0, lastBar + 1) + " " + url;
         }
     }
 }

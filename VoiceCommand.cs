@@ -63,6 +63,25 @@ namespace Personal_Assistant.Dispatch
         public MediaController Media { get; init; }
         public NowPlayingReader NowPlaying { get; init; }
         public ReminderService Reminders { get; init; }
+
+        // Standing rules the user created by voice. Null when the trigger engine
+        // isn't wired, and BuildRegistry then simply doesn't offer
+        // set_trigger/list_triggers/cancel_trigger.
+        public Personal_Assistant.Triggers.VoiceTriggers VoiceTriggers { get; init; }
+
+        // Things the assistant has offered on its own initiative. Null when
+        // suggestions are off or in a harness.
+        public Personal_Assistant.Suggestions.SuggestionService Suggestions { get; init; }
+
+        // Real-world events the user is waiting on. Null in a harness, and the
+        // reminder-listing tools simply say nothing about watches when it is.
+        public Personal_Assistant.Events.EventWatchService Watches { get; init; }
+
+        // Reads the battery. Defaulted rather than injected because get_battery
+        // and the battery_below rules both want one and neither cares which.
+        public Personal_Assistant.Power.BatteryReader Battery { get; init; }
+            = new Personal_Assistant.Power.BatteryReader();
+
         public IReadOnlyDictionary<string, string> Contacts { get; init; }
         public string IpAddressPlug { get; init; }
         public string IpAddressSwitch { get; init; }
