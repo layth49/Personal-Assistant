@@ -451,6 +451,24 @@ namespace Personal_Assistant
                 (name, toolArgs) => dispatcher.RunToolByNameAsync(name, toolArgs));
             suggestions.Start();
 
+            // Every setting, and where each one actually came from. main prints
+            // this as the second line of Main; on this branch it never printed at
+            // all, which meant the one line App.config keeps telling people to
+            // read did not exist. It goes HERE rather than at the top because
+            // LaithConfig only reports what has resolved so far, and on this
+            // branch almost nothing resolves early: the notes directory arrives
+            // with NotesService, the presence thresholds with PresenceGate, the
+            // prayer keys with the announcer. Printed at line two it would have
+            // said "all settings at their defaults" and been worse than silence.
+            //
+            // Everything above has now been constructed, including the vision
+            // settings (LocalLLMService's statics resolve at WarmUpAsync), so
+            // this is the first point where the line is complete. An environment
+            // variable of the same name beats App.config, and the "(env)" marker
+            // is how that gets caught — it has silently changed the running model
+            // for weeks before now.
+            LaithConfig.Dump();
+
             // A conversation stays open after the wakeword so follow-ups don't
             // need re-waking; it closes when the user goes quiet this long.
             var followUpWindow = TimeSpan.FromSeconds(12);
@@ -1039,6 +1057,171 @@ namespace Personal_Assistant
                             "Sorry, I couldn't take the screenshot.", ex.Message));
                     }
                 }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("look_at_screen",
+                    "Look at what's currently on screen and answer a question about it — " +
+                    "reading text, translating something visible, describing an image, or " +
+                    "identifying what's shown. Use this whenever the user asks about something " +
+                    "visible on screen right now, not the take_screenshot tool.",
+                    new ToolParameter("question", "string",
+                        "What to answer about the screen, e.g. 'what does the binary on screen say' " +
+                        "or 'what error is shown'."),
+                    new ToolParameter("monitor", "string",
+                        "Which monitor to look at. Leave unset for the one in use; " +
+                        "'all' only when the user means every screen at once.",
+                        Required: false)),
+                lower => (lower.Contains("screen") || lower.Contains("on my monitor")) &&
+                         (lower.Contains("what") || lower.Contains("read") || lower.Contains("translate") ||
+                          lower.Contains("say") || lower.Contains("mean") || lower.Contains("tell me")),
+                async (ctx, args) =>
+                {
+                    string question = args.TryGetValue("question", out var q) && !string.IsNullOrWhiteSpace(q)
+                        ? q
+                        : "Describe what's on screen.";
+                    string monitor = args.TryGetValue("monitor", out var m) && !string.IsNullOrWhiteSpace(m)
+                        ? m
+                        : "focused";
+                    try
+                    {
+                        byte[] png = ctx.Screenshot.CaptureBytes(monitor);
+
+                        // main sends the bare question, because over there the
+                        // answer goes back to a model that is holding the
+                        // conversation and knows it is being spoken. Here the
+                        // answer IS the speech, and a small VLM asked "what's on
+                        // screen" with no framing writes a bulleted inventory of
+                        // every window on it. So the shape is asked for
+                        // explicitly — and the markdown that arrives anyway is
+                        // flattened below rather than read out as punctuation.
+                        VisionAnswer vision = await LocalLLMService.AskAboutImageAsync(
+                            question +
+                            "\n\nAnswer in one or two short plain spoken sentences. " +
+                            "No markdown, no bullet points, no headings — this is read aloud.",
+                            png);
+
+                        // Fails LOUDLY and specifically. "The model isn't
+                        // downloaded", "LM Studio isn't running" and "it's still
+                        // loading, try again" are three different things to do
+                        // next, and the sentence says which.
+                        if (!vision.Ok)
+                        {
+                            return ToolResult.Failed(vision.Error, vision.Detail);
+                        }
+
+                        string answer = vision.Text;
+                        return string.IsNullOrWhiteSpace(answer)
+                            ? ToolResult.Failed("Sorry, I couldn't make sense of what's on screen.")
+                            // Speech is flattened, Data is verbatim: Kokoro has
+                            // no markdown handling, so "**Error:** foo" is read
+                            // as "star star Error colon", while the model
+                            // reasoning about a follow-up wants what was
+                            // actually said. Emoji need no help here —
+                            // StripUnspeakable drops those inside Kokoro's
+                            // RequestWavAsync on both synthesis paths.
+                            : ToolResult.Speak(FlattenMarkdownForSpeech(answer, dropLeadingHeading: false))
+                                .With("answer", answer)
+                                .With("monitor", monitor)
+                                .With("monitor_count", ScreenshotService.MonitorCount.ToString());
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("look_at_screen failed: " + ex.Message);
+                        return ToolResult.Failed("Sorry, I couldn't look at the screen.", ex.Message);
+                    }
+                },
+                text => new Dictionary<string, string> { ["question"] = text.Trim() }));
+
+            registry.Add(new VoiceCommand(
+                ToolDefinition.Create("copy_from_screen",
+                    "Read text off the screen and put it on the clipboard, so the user can " +
+                    "paste it. Use for 'copy the error on screen', 'copy that code'. " +
+                    "Reports what was copied but does not read a long block aloud.",
+                    new ToolParameter("what", "string",
+                        "Which text to copy, e.g. 'the error message' or 'the command'. " +
+                        "Use 'all visible text' if the user didn't narrow it down.",
+                        Required: false),
+                    new ToolParameter("monitor", "string",
+                        "Which monitor to read. Leave unset for the one in use.",
+                        Required: false)),
+                lower => lower.Contains("copy") &&
+                         (lower.Contains("screen") || lower.Contains("monitor")) &&
+                         !lower.Contains("clipboard"),
+                async (ctx, args) =>
+                {
+                    string what = args.TryGetValue("what", out var w) && !string.IsNullOrWhiteSpace(w)
+                        ? w
+                        : "all visible text";
+                    string monitor = args.TryGetValue("monitor", out var m) && !string.IsNullOrWhiteSpace(m)
+                        ? m
+                        : "focused";
+                    try
+                    {
+                        byte[] png = ctx.Screenshot.CaptureBytes(monitor);
+
+                        // The instruction is explicit about returning ONLY the
+                        // text: anything conversational the model adds ("Sure,
+                        // here is the error:") would be pasted along with it.
+                        // Kept word for word from main — and the fence clause in
+                        // it is not enough on its own here, which is why
+                        // AskAboutImageAsync strips a whole-answer fence as well.
+                        string prompt =
+                            "Extract " + what + " from this screenshot. " +
+                            "Reply with the extracted text VERBATIM and nothing else - " +
+                            "no preamble, no explanation, no markdown fences, no quotes. " +
+                            "Preserve line breaks. If the requested text is not visible, " +
+                            "reply with exactly: NOT_FOUND";
+
+                        // A bigger budget than main's 300: an exception on screen
+                        // is routinely longer than that, and a truncated paste is
+                        // the one failure this tool must not produce quietly,
+                        // since it looks exactly like a correct short answer.
+                        VisionAnswer vision =
+                            await LocalLLMService.AskAboutImageAsync(prompt, png, maxOutputTokens: 1536);
+
+                        if (!vision.Ok)
+                        {
+                            return ToolResult.Failed(vision.Error, vision.Detail);
+                        }
+
+                        string text = vision.Text;
+
+                        if (string.IsNullOrWhiteSpace(text) ||
+                            text.Trim().Equals("NOT_FOUND", StringComparison.OrdinalIgnoreCase))
+                        {
+                            return ToolResult.Speak($"I couldn't find {what} on screen.")
+                                .With("copied", "false");
+                        }
+
+                        text = text.Trim();
+                        ctx.Clipboard.SetText(text);
+
+                        // Deliberately keeps the text OUT of Speech: this can be
+                        // a stack trace, and the turn-based path speaks Speech
+                        // verbatim. The text rides in Data instead, so the model
+                        // can still reason about it if asked a follow-up. It is
+                        // also NOT flattened the way look_at_screen's answer is —
+                        // this tool's whole contract is that the characters on
+                        // the clipboard are the characters on the screen.
+                        int lines = text.Split('\n').Length;
+                        string summary = text.Length <= 60
+                            ? $"Copied: {text}"
+                            : $"Copied {text.Length} characters" +
+                              (lines > 1 ? $" over {lines} lines." : ".");
+
+                        return ToolResult.Speak(summary)
+                            .With("copied", "true")
+                            .With("text", text)
+                            .With("length", text.Length.ToString());
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("copy_from_screen failed: " + ex.Message);
+                        return ToolResult.Failed(
+                            "Sorry, I couldn't copy that off the screen.", ex.Message);
+                    }
+                },
+                text => new Dictionary<string, string> { ["what"] = text.Trim() }));
 
             registry.Add(new VoiceCommand(
                 // One tool with an action enum rather than five tools: the
@@ -2540,7 +2723,20 @@ namespace Personal_Assistant
         //
         // Only the scaffolding goes. The words are untouched, and the raw note
         // still reaches the model under the result's "content" fact.
-        private static string SpokenNoteText(string markdown)
+        private static string SpokenNoteText(string markdown) =>
+            FlattenMarkdownForSpeech(markdown, dropLeadingHeading: true);
+
+        // The same flattening, for anything else whose text is written by a model
+        // and then spoken — look_at_screen's answer, which is markdown often
+        // enough on a small VLM that leaving it raw means hearing "star star" out
+        // loud.
+        //
+        // `dropLeadingHeading` is the one thing that differs. A note's first
+        // heading is its own title, which read_notes has already said in the
+        // sentence around it, so repeating it is stutter. A vision answer has no
+        // title: a leading "# 404 Not Found" is the answer, and dropping it would
+        // leave the assistant saying nothing at all.
+        private static string FlattenMarkdownForSpeech(string markdown, bool dropLeadingHeading)
         {
             if (string.IsNullOrWhiteSpace(markdown)) return string.Empty;
 
@@ -2557,10 +2753,11 @@ namespace Personal_Assistant
                 if (line.TrimEnd('-', '*', '_', ' ').Length == 0 && line.Length >= 3) continue;
 
                 // The first heading is the note's own title, which the sentence
-                // around this has already said.
+                // around this has already said. Not true of a model's answer —
+                // see dropLeadingHeading.
                 bool heading = line.StartsWith("#", StringComparison.Ordinal);
                 line = line.TrimStart('#', '>', ' ');
-                if (heading && spoken.Count == 0) continue;
+                if (heading && dropLeadingHeading && spoken.Count == 0) continue;
 
                 // List markers: "- ", "* ", "+ ", "1. ", and a "[ ]"/"[x]" box.
                 if (line.StartsWith("- ", StringComparison.Ordinal) ||

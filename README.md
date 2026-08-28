@@ -37,6 +37,7 @@ This branch runs entirely on-device — no Azure / Gemini keys required:
 | Service | Replaces | Default port |
 |---|---|---|
 | LM Studio — `qwen/qwen3-4b-2507` | Gemini 2.5 Flash | 1234 |
+| LM Studio — `qwen/qwen3-vl-4b` (optional, screen vision) | Gemini 2.5 Flash vision | 1234 |
 | SearxNG (Docker) | Gemini search grounding | 8080 |
 | Parakeet STT — [`stt-server/`](stt-server/) (Docker, CPU) | Azure Speech-to-Text | 8001 |
 | Kokoro-FastAPI (Docker) | Azure Neural TTS | 8880 |
@@ -56,6 +57,12 @@ Wake-word detection (`Hey 49`) still uses the on-device Azure `KeywordRecognizer
 - Docker Desktop (WSL 2 backend) + NVIDIA Container Toolkit for GPU passthrough
 - LM Studio with `qwen/qwen3-4b-2507` downloaded (avoid `-thinking` / `-reasoning`
   variants — reasoning tokens wreck voice latency for no gain at this size)
+- **For the screen-vision tools only** (`look_at_screen`, `copy_from_screen`): a
+  vision model in LM Studio as well — `qwen/qwen3-vl-4b` by default. It is a
+  second model on a ~6 GB card, so expect LM Studio to swap it against the
+  router. Without it those two tools say out loud that the model isn't
+  downloaded and do nothing else; everything else is unaffected. Point
+  `LocalVisionModel` in [App.config](App.config) at whatever `lms ls` reports.
 - Python 3.12 + the packages in [requirements.txt](requirements.txt)
 - A `.env` with `CONTACTS_FILE` set — see [.env.example](.env.example)
 

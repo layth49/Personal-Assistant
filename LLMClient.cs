@@ -1,3 +1,4 @@
+using Personal_Assistant.Configuration;
 using Personal_Assistant.Events;
 using Personal_Assistant.Dispatch;
 using Personal_Assistant.SearxNGClient;
@@ -150,6 +151,44 @@ namespace Personal_Assistant.LLMClient
         }
     }
 
+    /// <summary>
+    /// What a vision call came back with: either the model's text, or a reason
+    /// the assistant can say out loud.
+    ///
+    /// main's AskAboutImageAsync returns a bare string and null on failure, which
+    /// works there because there is exactly one way for it to fail (Gemini said
+    /// no). Locally there are four that mean four different things to whoever is
+    /// standing in front of the machine — the model isn't downloaded, LM Studio
+    /// isn't running, the load is still going, the request was rejected — and
+    /// collapsing them into "sorry, I couldn't look at the screen" is how a
+    /// one-line fix turns into an evening. So the reason travels with the result.
+    /// </summary>
+    public sealed class VisionAnswer
+    {
+        /// <summary>The model's reply. Null when <see cref="Ok"/> is false.</summary>
+        public string Text { get; }
+
+        /// <summary>A speakable sentence explaining the failure, or null on success.</summary>
+        public string Error { get; }
+
+        /// <summary>The underlying detail, for the log and the model's grounding.</summary>
+        public string Detail { get; }
+
+        public bool Ok => Error == null;
+
+        private VisionAnswer(string text, string error, string detail)
+        {
+            Text = text;
+            Error = error;
+            Detail = detail;
+        }
+
+        public static VisionAnswer Success(string text) => new VisionAnswer(text, null, null);
+
+        public static VisionAnswer Failure(string spoken, string detail) =>
+            new VisionAnswer(null, spoken, detail ?? spoken);
+    }
+
     public class LocalLLMService
     {
         // 127.0.0.1, not "localhost" — the same trap the STT client documents, and
@@ -180,6 +219,48 @@ namespace Personal_Assistant.LLMClient
         // alone every single time and nothing would say why.
         private static readonly HttpClient transformClient =
             CreateHttpClient(TimeSpan.FromMinutes(5));
+
+        // ===== Vision =====
+        //
+        // The vision model is NOT the router model, and AskAboutImageAsync is the
+        // only request in this file that names a model at all. Everything else
+        // omits `model`, so LM Studio answers with whatever is currently loaded —
+        // which is the router, and the router cannot see. Naming it here is what
+        // makes LM Studio load the VLM just-in-time, and that is also the whole
+        // cost of it: this box has ~6 GB of VRAM, which is the same reason a true
+        // speech-to-speech model was ruled out, and a VLM sitting alongside a 4B
+        // router does not comfortably fit. Expect LM Studio to EVICT one to load
+        // the other — which is why the first look_at_screen in a while is slow,
+        // and why the first spoken answer after it can be slow too.
+        //
+        // These resolve when the type is first touched (WarmUpAsync, early in
+        // Program.Main), so all three appear in the startup [config] line like
+        // every other setting. If a vision tool behaves oddly, read that line
+        // FIRST: a stale LAITH_LOCAL_VISION_MODEL in HKCU:\Environment beats
+        // App.config, and that exact trap has silently run this app on the wrong
+        // model for weeks.
+        private static readonly string VisionModel =
+            LaithConfig.Text("LocalVisionModel", "qwen/qwen3-vl-4b");
+
+        // Longest edge, in pixels, a screenshot may reach before it is resampled
+        // down. See DownscaleForVision for why the default is 1920.
+        private static readonly int VisionMaxDimension =
+            LaithConfig.Int("LocalVisionMaxDimension", 1920, 480, 4096);
+
+        // Bounded, but generously. A cold just-in-time load has to page both the
+        // weights and the vision tower in, and a screenshot is a far larger
+        // prompt than a spoken turn, so a first call over a minute is normal here
+        // while a warm one is seconds. It is bounded AT ALL because
+        // ContinuousListener is sitting on this turn: an unbounded wait is dead
+        // air with the microphone held open, which is worse than a spoken
+        // failure. Whatever this is set to is what the failure sentence quotes.
+        private static readonly TimeSpan VisionTimeout =
+            LaithConfig.Seconds("LocalVisionTimeoutSeconds", 180, 15, 600);
+
+        // Declared after VisionTimeout on purpose: static field initialisers run
+        // in textual order, so reading it from above would hand CreateHttpClient
+        // a zero TimeSpan, which HttpClient rejects at construction.
+        private static readonly HttpClient visionClient = CreateHttpClient(VisionTimeout);
 
         private const string BaseSystemPrompt =
             "You are L.A.I.T.H., Layth's personal voice assistant running on his computer. " +
@@ -1011,6 +1092,247 @@ namespace Personal_Assistant.LLMClient
             // A third fence in between means these two were opening and closing
             // DIFFERENT blocks rather than wrapping the answer.
             return inner.IndexOf("```", StringComparison.Ordinal) >= 0 ? text : inner.Trim();
+        }
+
+        /// <summary>
+        /// Answers a question about a single image (a screenshot), the local twin
+        /// of GeminiService.AskAboutImageAsync. One-shot: no history, no tools,
+        /// no search hits, not streamed.
+        ///
+        /// NEVER THROWS AND NEVER HANGS. Every failure comes back as a
+        /// <see cref="VisionAnswer"/> carrying a sentence the handler can say out
+        /// loud, because the alternatives here are both worse than a spoken "no":
+        /// an exception out of a tool handler is a dropped turn, and a silent
+        /// empty string makes the assistant announce that it looked at a screen
+        /// it never saw. The turn-based loop is holding the microphone while this
+        /// runs, so the bounded timeout is part of the contract, not a detail.
+        /// </summary>
+        public static async Task<VisionAnswer> AskAboutImageAsync(
+            string question, byte[] pngBytes, int maxOutputTokens = 512)
+        {
+            if (pngBytes == null || pngBytes.Length == 0)
+            {
+                return VisionAnswer.Failure(
+                    "I couldn't get a picture of the screen.", "empty capture");
+            }
+
+            byte[] image;
+            string sizeNote;
+            try
+            {
+                image = DownscaleForVision(pngBytes, out sizeNote);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[vision] downscale failed: {ex.Message}");
+                return VisionAnswer.Failure(
+                    "I couldn't prepare the screenshot for the vision model.", ex.Message);
+            }
+
+            Console.WriteLine(
+                $"[vision] {VisionModel}, {sizeNote}, {image.Length / 1024}KB, " +
+                $"timeout {VisionTimeout.TotalSeconds:F0}s");
+
+            var requestBody = new Dictionary<string, object>
+            {
+                // The one place a model is named. See the VisionModel field.
+                ["model"] = VisionModel,
+                ["messages"] = new List<object>
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["role"] = "user",
+                        // OpenAI-compatible multimodal shape: `content` is an
+                        // ARRAY of parts rather than a string. LM Studio accepts
+                        // a data: URI in image_url, so nothing is written to disk
+                        // and nothing has to be served over HTTP.
+                        ["content"] = new List<object>
+                        {
+                            new Dictionary<string, object>
+                            {
+                                ["type"] = "text",
+                                ["text"] = question ?? "Describe what's on screen."
+                            },
+                            new Dictionary<string, object>
+                            {
+                                ["type"] = "image_url",
+                                ["image_url"] = new Dictionary<string, object>
+                                {
+                                    ["url"] = "data:image/png;base64," +
+                                              Convert.ToBase64String(image)
+                                }
+                            }
+                        }
+                    }
+                },
+                // main's value. This is a reading task, not a creative one, and
+                // copy_from_screen's whole contract is that the words come back
+                // unchanged.
+                ["temperature"] = 0.2,
+                ["max_tokens"] = maxOutputTokens,
+                // Same reason as the router, the event judge and TransformTextAsync:
+                // a model that spends its budget thinking returns empty `content`,
+                // and "/no think" in the prompt does not stop it on half of these
+                // models. See BuildToolRequest for the measurements.
+                ["reasoning_effort"] = "none",
+                ["stream"] = false
+            };
+
+            try
+            {
+                var body = new StringContent(
+                    JsonSerializer.Serialize(requestBody, RawJsonOpts),
+                    Encoding.UTF8,
+                    "application/json");
+
+                using (HttpResponseMessage response = await visionClient
+                    .PostAsync($"{lmStudioUrl.TrimEnd('/')}/chat/completions", body)
+                    .ConfigureAwait(false))
+                {
+                    string json = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        Console.WriteLine(
+                            $"[vision] HTTP {(int)response.StatusCode}: {Truncate(json, 400)}");
+
+                        // 404 from LM Studio means "I have never heard of that
+                        // model id", which is by far the likeliest failure here
+                        // and the only one the user can fix. Say the id out loud
+                        // — a typo in App.config and a model that was never
+                        // downloaded look identical from in here, and both are
+                        // answered by looking at what LM Studio actually lists.
+                        if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                        {
+                            return VisionAnswer.Failure(
+                                $"L M Studio doesn't have a model called {SpokenModelName(VisionModel)}. " +
+                                "It needs downloading before I can look at the screen.",
+                                $"404 for model '{VisionModel}': {Truncate(json, 400)}");
+                        }
+
+                        return VisionAnswer.Failure(
+                            $"The vision model returned an error, {(int)response.StatusCode}.",
+                            Truncate(json, 400));
+                    }
+
+                    // Fenced for the same reason a rewritten note is: small local
+                    // models wrap a whole answer in ``` however firmly they are
+                    // told not to, and copy_from_screen would put those backticks
+                    // straight onto the clipboard.
+                    string text = StripWholeAnswerFence(ExtractText(json));
+                    return VisionAnswer.Success(text ?? string.Empty);
+                }
+            }
+            catch (TaskCanceledException)
+            {
+                // HttpClient surfaces its own timeout as a cancellation, and
+                // nothing here passes a token, so this is always the timeout.
+                Console.WriteLine($"[vision] timed out after {VisionTimeout.TotalSeconds:F0}s");
+                return VisionAnswer.Failure(
+                    $"The vision model didn't answer within {VisionTimeout.TotalSeconds:F0} seconds. " +
+                    "It's probably still loading — try again in a moment.",
+                    $"timeout after {VisionTimeout.TotalSeconds:F0}s");
+            }
+            catch (HttpRequestException ex)
+            {
+                Console.WriteLine($"[vision] request failed: {ex.Message}");
+                return VisionAnswer.Failure(
+                    "I couldn't reach L M Studio to look at the screen.", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[vision] failed: {ex.Message}");
+                return VisionAnswer.Failure(
+                    "Something went wrong looking at the screen.", ex.Message);
+            }
+        }
+
+        // A model id read out loud. "qwen/qwen3-vl-4b" as written is a slash and
+        // a string of hyphens; the slash in particular is silence, so the two
+        // halves run together into one nonsense word.
+        private static string SpokenModelName(string id) =>
+            (id ?? string.Empty).Replace("/", " ").Replace("-", " ").Replace("_", " ");
+
+        private static string Truncate(string text, int max) =>
+            string.IsNullOrEmpty(text) || text.Length <= max
+                ? text
+                : text.Substring(0, max) + "…";
+
+        // Resamples a screenshot down so its longest edge is at most
+        // VisionMaxDimension, preserving aspect ratio. Returns the original bytes
+        // untouched when it already fits.
+        //
+        // WHY THERE IS A CAP AT ALL. main hands Gemini the raw PNG, which is fine
+        // against a hosted model. A local VLM on ~6 GB is a different
+        // proposition: image tokens scale with area, so a 4K capture is several
+        // times the prompt of a 1080p one, and the failure mode is not "slower",
+        // it is the model spilling out of VRAM or the server refusing the
+        // request outright.
+        //
+        // WHY 1920, AND THE TENSION. copy_from_screen exists to return text
+        // VERBATIM, and downscaling is exactly what destroys small text — a cap
+        // chosen for token cost alone would quietly corrupt the one tool whose
+        // whole contract is that it doesn't. 1920 is picked so the common case is
+        // the IDENTITY transform: a 1080p monitor (which is what
+        // ScreenshotService.CaptureBytes hands over by default, since it captures
+        // the focused monitor rather than the desktop) passes through with no
+        // resampling at all, so this cap cannot be blamed for a misread character
+        // there. A 4K capture halves to 1920x1080, which is roughly what that
+        // display shows at its usual 150% scaling anyway — legible, but this is
+        // the case to suspect first if extraction starts dropping characters.
+        //
+        // The bad case is monitor:"all": two 1080p screens side by side are
+        // 3840x1080, and capping the LONGEST edge takes that to 1920x540, i.e.
+        // half-height text. That is a further reason "focused" is the default and
+        // "all" is documented as only-when-the-user-means-it. If verbatim
+        // extraction matters more than the load, raise LocalVisionMaxDimension.
+        private static byte[] DownscaleForVision(byte[] png, out string sizeNote)
+        {
+            using (var input = new MemoryStream(png))
+            using (var original = System.Drawing.Image.FromStream(input))
+            {
+                int width = original.Width;
+                int height = original.Height;
+                int longest = Math.Max(width, height);
+
+                if (longest <= VisionMaxDimension)
+                {
+                    sizeNote = $"{width}x{height}";
+                    return png;
+                }
+
+                double scale = (double)VisionMaxDimension / longest;
+                int newWidth = Math.Max(1, (int)Math.Round(width * scale));
+                int newHeight = Math.Max(1, (int)Math.Round(height * scale));
+
+                using (var resized = new System.Drawing.Bitmap(newWidth, newHeight))
+                {
+                    using (var g = System.Drawing.Graphics.FromImage(resized))
+                    {
+                        // Bicubic, not the default: nearest-neighbour on UI text
+                        // at these ratios drops whole stems off letters, which is
+                        // the difference between an "l" and a "1" on a clipboard.
+                        g.InterpolationMode =
+                            System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                        g.PixelOffsetMode =
+                            System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                        g.SmoothingMode =
+                            System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+                        g.CompositingQuality =
+                            System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+                        g.DrawImage(original, 0, 0, newWidth, newHeight);
+                    }
+
+                    using (var output = new MemoryStream())
+                    {
+                        // PNG, not JPEG: JPEG's ringing around high-contrast
+                        // edges is worst on exactly the thing being read here.
+                        resized.Save(output, System.Drawing.Imaging.ImageFormat.Png);
+                        sizeNote = $"{width}x{height} -> {newWidth}x{newHeight}";
+                        return output.ToArray();
+                    }
+                }
+            }
         }
 
         /// <summary>
