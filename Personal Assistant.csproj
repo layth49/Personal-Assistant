@@ -446,6 +446,29 @@
     <Compile Include="bakeoff\llm\BakeoffHarness.cs" />
     <Compile Include="AppLauncher.cs" />
     <Compile Include="Arduino.cs" />
+    <!-- Call screening, transport half. The conversation half — CallSession,
+         CallAudioBridge, CallGreeting, CallScreeningService — is not here yet, so
+         nothing below is reachable from the tool registry: this compiles the
+         machinery and waits. CallOutcome.cs and CallAudioPreflight.cs are this
+         branch's own files, holding the types those four would otherwise have
+         held hostage; their headers say why. -->
+    <Compile Include="CallScreening\BluetoothHeadset.cs" />
+    <Compile Include="CallScreening\CallAudioPreflight.cs" />
+    <Compile Include="CallScreening\CallAudioRouter.cs" />
+    <Compile Include="CallScreening\CallLog.cs" />
+    <Compile Include="CallScreening\CallOutcome.cs" />
+    <Compile Include="CallScreening\CallPersona.cs" />
+    <Compile Include="CallScreening\CallTools.cs" />
+    <Compile Include="CallScreening\CallTransport.cs" />
+    <Compile Include="CallScreening\CallWidgetHost.cs" />
+    <Compile Include="CallScreening\CdpPage.cs" />
+    <Compile Include="CallScreening\GoogleVoiceBrowserHost.cs" />
+    <Compile Include="CallScreening\GoogleVoiceCallTransport.cs" />
+    <Compile Include="CallScreening\GoogleVoiceTextSender.cs" />
+    <Compile Include="CallScreening\MessageDelivery.cs" />
+    <Compile Include="CallScreening\PhoneLinkCallController.cs" />
+    <Compile Include="CallScreening\PhoneLinkCallTransport.cs" />
+    <Compile Include="CallScreening\PhoneLinkCallWatcher.cs" />
     <Compile Include="AudioController.cs" />
     <Compile Include="ClipboardController.cs" />
     <Compile Include="ContinuousListener.cs" />

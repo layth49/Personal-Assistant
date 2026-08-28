@@ -5,6 +5,18 @@ using NAudio.CoreAudioApi;
 
 namespace Personal_Assistant.AudioControl
 {
+    // Which of the three Windows endpoint roles a caller means.
+    //
+    // Public mirror of the private ERole inside AudioController, so callers can
+    // name a role without the undocumented interop enum leaking out of this file.
+    // The values must keep matching ERole — they are cast across directly.
+    public enum AudioRole
+    {
+        Console = 0,
+        Multimedia = 1,
+        Communications = 2
+    }
+
     // System audio control for L.A.I.T.H.: master-volume up/down/mute/set on the
     // default playback device, plus switching which output device is the default
     // (speakers <-> headphones).
@@ -142,18 +154,128 @@ namespace Personal_Assistant.AudioControl
 
         private static void SetDefaultEndpoint(string deviceId)
         {
+            // Set for every role so audio, comms, and system sounds all move.
+            // This is what "switch to my headphones" means — the user is not
+            // thinking about roles, they want everything to follow.
+            SetDefaultEndpoint(deviceId, AudioRole.Console);
+            SetDefaultEndpoint(deviceId, AudioRole.Multimedia);
+            SetDefaultEndpoint(deviceId, AudioRole.Communications);
+        }
+
+        // --- Role-scoped routing (call screening) ------------------------------------
+
+        // Points a single role at a device, leaving the other two alone.
+        //
+        // Call screening needs exactly this: Phone Link follows the
+        // *Communications* role, so moving only that role sends call audio down a
+        // virtual cable while music, system sounds and L.A.I.T.H.'s own voice stay
+        // on the real speakers. Moving all three (what SwitchOutputDevice does)
+        // would drag the whole desktop onto a cable nobody can hear.
+        public static void SetDefaultEndpoint(string deviceId, AudioRole role)
+        {
+            if (string.IsNullOrWhiteSpace(deviceId))
+                throw new ArgumentException("device id is required", nameof(deviceId));
+
             var policyConfig = (IPolicyConfig)new CPolicyConfigClient();
             try
             {
-                // Set for every role so audio, comms, and system sounds all move.
-                policyConfig.SetDefaultEndpoint(deviceId, ERole.eConsole);
-                policyConfig.SetDefaultEndpoint(deviceId, ERole.eMultimedia);
-                policyConfig.SetDefaultEndpoint(deviceId, ERole.eCommunications);
+                policyConfig.SetDefaultEndpoint(deviceId, (ERole)role);
             }
             finally
             {
                 Marshal.ReleaseComObject(policyConfig);
             }
+        }
+
+        // The device currently serving `role`, or null if Windows has none (no
+        // audio hardware, or every endpoint disabled).
+        //
+        // This is what gets written down before a call so the originals can be put
+        // back afterwards. Leaving the Communications role on a virtual cable is
+        // the worst failure this feature has: the next real call or meeting is
+        // silently broken with nothing on screen to explain why.
+        public string GetDefaultEndpointId(bool capture, AudioRole role)
+        {
+            try
+            {
+                using (var device = enumerator.GetDefaultAudioEndpoint(
+                    capture ? DataFlow.Capture : DataFlow.Render, (Role)role))
+                {
+                    return device?.ID;
+                }
+            }
+            catch (Exception ex)
+            {
+                // Genuinely happens on a machine with no default for the role.
+                // Null means "there was nothing to restore", which is a real
+                // answer, not an error.
+                Console.WriteLine($"[audio] no default {(capture ? "capture" : "render")} device for {role}: {ex.Message}");
+                return null;
+            }
+        }
+
+        // Friendly names of the active recording devices, mirroring
+        // ListOutputDevices. Needed because the inbound leg of a call is a
+        // *capture* endpoint, and nothing in this class could see one before.
+        public IReadOnlyList<string> ListInputDevices()
+        {
+            var names = new List<string>();
+            foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Capture, DeviceState.Active))
+            {
+                using (device) names.Add(device.FriendlyName);
+            }
+            return names;
+        }
+
+        // Resolves a configured device name to its endpoint id, or null.
+        //
+        // Deliberately stricter than SwitchOutputDevice's matching. That one is
+        // driven by speech ("switch to my headphones") where a loose substring is
+        // the point. This one is driven by a config key naming a specific virtual
+        // cable, on a machine that also has a Voicemod virtual device and two
+        // Steam ones — so an exact friendly-name match is tried first, and a
+        // substring match is only accepted when it is *unambiguous*. Routing a
+        // call into the wrong virtual device is silent, and silence is exactly
+        // what it looks like when it works.
+        public string FindEndpointId(string name, bool capture)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return null;
+            string needle = name.Trim();
+
+            var exact = new List<KeyValuePair<string, string>>();   // id -> friendly name
+            var partial = new List<KeyValuePair<string, string>>();
+
+            foreach (var device in enumerator.EnumerateAudioEndPoints(
+                capture ? DataFlow.Capture : DataFlow.Render, DeviceState.Active))
+            {
+                using (device)
+                {
+                    if (string.Equals(device.FriendlyName, needle, StringComparison.OrdinalIgnoreCase))
+                        exact.Add(new KeyValuePair<string, string>(device.ID, device.FriendlyName));
+                    else if (Contains(device.FriendlyName, needle))
+                        partial.Add(new KeyValuePair<string, string>(device.ID, device.FriendlyName));
+                }
+            }
+
+            string kind = capture ? "recording" : "playback";
+
+            if (exact.Count == 1) return exact[0].Key;
+            if (partial.Count == 1) return partial[0].Key;
+
+            if (partial.Count > 1)
+            {
+                Console.WriteLine(
+                    $"[audio] '{needle}' matches {partial.Count} active {kind} devices; " +
+                    "refusing to guess. Use the full device name:");
+                foreach (var entry in partial)
+                    Console.WriteLine($"[audio]   {entry.Value}");
+            }
+            else
+            {
+                Console.WriteLine($"[audio] no active {kind} device matches '{needle}'.");
+            }
+
+            return null;
         }
 
         private static float Clamp01(float v) => v < 0f ? 0f : (v > 1f ? 1f : v);
